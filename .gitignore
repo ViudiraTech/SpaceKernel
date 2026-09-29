@@ -1,0 +1,15 @@
+# Local Kconfig choices; Kconfig and .config-default belong in the repository.
+/.config
+/.config.old
+
+# Rust objects and generated bootable ISO trees.
+/target/
+/build/
+
+# Optional local bootloader checkout. The build downloads Limine into build/.
+/vendor/limine/
+
+# Python helper bytecode and OS metadata.
+__pycache__/
+*.py[cod]
+.DS_Store

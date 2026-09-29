@@ -1,0 +1,7 @@
+timeout: 0
+
+/SpaceKernel
+protocol: limine
+path: boot():/kernel.elf
+kaslr: @KASLR@
+kernel_cmdline: @KERNEL_CMDLINE@

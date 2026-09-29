@@ -1,0 +1,58 @@
+mainmenu "SpaceKernel configuration"
+
+choice
+    prompt "Target architecture"
+    default ARCH_X86_64
+
+config ARCH_X86_64
+    bool "x86_64"
+
+config ARCH_AARCH64
+    bool "aarch64"
+
+config ARCH_RISCV64
+    bool "RISC-V 64"
+endchoice
+
+choice
+    prompt "Build profile"
+    default PROFILE_DEBUG
+
+config PROFILE_DEBUG
+    bool "Debug"
+
+config PROFILE_RELEASE
+    bool "Release"
+endchoice
+
+menu "Boot and test"
+config KERNEL_CMDLINE
+    string "Limine kernel command line"
+    default "console=tty0 console=ttyS0"
+    help
+      Select the kernel console with console=ttyS0 or console=tty0..tty8.
+      Multiple console= arguments enable multiple outputs.
+
+config KASLR
+    bool "Enable Limine KASLR"
+    default y
+    help
+      Ask Limine to randomize the position of the relocatable kernel and HHDM.
+
+config QEMU_CPUS
+    int "QEMU virtual CPUs"
+    range 1 64
+    default 4
+    help
+      SMP startup is not enabled yet; additional VCPUs exercise the firmware
+      environment without being brought online by the kernel.
+
+config QEMU_MEMORY_MIB
+    int "QEMU memory (MiB)"
+    range 128 8192
+    default 512
+
+config BOOT_SELF_TEST
+    bool "Run memory-management smoke tests at boot"
+    default y
+endmenu

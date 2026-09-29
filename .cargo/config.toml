@@ -1,0 +1,32 @@
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+
+[target.x86_64-unknown-none]
+linker = "rust-lld"
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-pie",
+    "-C", "link-arg=-Tarch/x86_64/linker.ld",
+    "-C", "link-arg=--no-dynamic-linker",
+    "-C", "link-arg=-zmax-page-size=0x1000",
+]
+
+[target.aarch64-unknown-none-softfloat]
+linker = "rust-lld"
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-pie",
+    "-C", "link-arg=-Tarch/aarch64/linker.ld",
+    "-C", "link-arg=--no-dynamic-linker",
+    "-C", "link-arg=-zmax-page-size=0x1000",
+]
+
+[target.riscv64gc-unknown-none-elf]
+linker = "rust-lld"
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-pie",
+    "-C", "link-arg=-Tarch/riscv64/linker.ld",
+    "-C", "link-arg=--no-dynamic-linker",
+    "-C", "link-arg=-zmax-page-size=0x1000",
+]
