@@ -2,12 +2,15 @@
 """Render the checked-in Limine template from a Kconfig generated .config."""
 
 import ast
+import os
 import pathlib
 import re
 import sys
 
 
 def configured_cmdline() -> str:
+    if "CMDLINE" in os.environ and os.environ["CMDLINE"]:
+        return os.environ["CMDLINE"]
     config = pathlib.Path(".config")
     if not config.exists():
         config = pathlib.Path(".config-default")
@@ -22,12 +25,16 @@ def configured_cmdline() -> str:
 
 
 def main() -> None:
-    source, destination, kaslr = sys.argv[1:]
+    source = sys.argv[1]
+    destination = sys.argv[2]
+    kaslr = sys.argv[3]
+    dtb_line = sys.argv[4] if len(sys.argv) > 4 else ""
     if kaslr not in ("yes", "no"):
         raise SystemExit("KASLR must be yes or no")
     template = pathlib.Path(source).read_text()
     output = template.replace("@KASLR@", kaslr)
     output = output.replace("@KERNEL_CMDLINE@", configured_cmdline())
+    output = output.replace("@DTB_LINE@", dtb_line)
     pathlib.Path(destination).write_text(output)
 
 

@@ -27,25 +27,6 @@ pub(super) fn write32(base: usize, offset: usize, value: u32) {
     // SAFETY: callers use mapped GIC register pages.
     unsafe { ((base + offset) as *mut u32).write_volatile(value) }
 }
-fn reg_pair(bytes: &[u8], index: usize) -> Option<(u64, u64)> {
-    if bytes.len() >= (index + 1) * 16 {
-        let start = index * 16;
-        let item = &bytes[start..start + 16];
-        Some((
-            u64::from_be_bytes(item[..8].try_into().ok()?),
-            u64::from_be_bytes(item[8..].try_into().ok()?),
-        ))
-    } else if bytes.len() >= (index + 1) * 8 {
-        let start = index * 8;
-        let item = &bytes[start..start + 8];
-        Some((
-            u32::from_be_bytes(item[..4].try_into().ok()?) as u64,
-            u32::from_be_bytes(item[4..].try_into().ok()?) as u64,
-        ))
-    } else {
-        None
-    }
-}
 
 fn discover_from_acpi() -> Option<(u8, u64, u64, u64, u64)> {
     let rsdp = boot::rsdp_address()?;
@@ -86,18 +67,23 @@ fn discover_from_fdt() -> Option<(u8, u64, u64, u64, u64)> {
     let dtb = boot::dtb_address()?;
     let tree = Fdt::from_boot_address(dtb).ok()?;
     let node = tree
-        .compatible("arm,gic-v3")
-        .ok()?
-        .or(tree.compatible("arm,cortex-a15-gic").ok()?)?;
+        .find_compatible("arm,gic-v3")
+        .or_else(|| tree.find_compatible("arm,cortex-a15-gic"))?;
     let version = if node.is_compatible("arm,gic-v3") {
         3
     } else {
         2
     };
-    let regs = node.property("reg")?;
-    let (dist_phys, dist_length) = reg_pair(regs, 0)?;
-    let (second_phys, second_length) = reg_pair(regs, 1)?;
-    Some((version, dist_phys, dist_length, second_phys, second_length))
+    let mut reg = node.reg()?;
+    let dist = reg.next()?;
+    let second = reg.next()?;
+    Some((
+        version,
+        dist.address,
+        dist.size,
+        second.address,
+        second.size,
+    ))
 }
 
 pub fn init_bsp() -> Result<(), IrqError> {

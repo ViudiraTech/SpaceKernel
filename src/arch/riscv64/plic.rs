@@ -37,26 +37,6 @@ fn write32(offset: usize, value: u32) {
     unsafe { ((base + offset) as *mut u32).write_volatile(value) }
 }
 
-fn parse_reg_pair(bytes: &[u8], index: usize) -> Option<(u64, u64)> {
-    if bytes.len() >= (index + 1) * 16 {
-        let start = index * 16;
-        let item = &bytes[start..start + 16];
-        Some((
-            u64::from_be_bytes(item[..8].try_into().ok()?),
-            u64::from_be_bytes(item[8..].try_into().ok()?),
-        ))
-    } else if bytes.len() >= (index + 1) * 8 {
-        let start = index * 8;
-        let item = &bytes[start..start + 8];
-        Some((
-            u32::from_be_bytes(item[..4].try_into().ok()?) as u64,
-            u32::from_be_bytes(item[4..].try_into().ok()?) as u64,
-        ))
-    } else {
-        None
-    }
-}
-
 fn discover_from_acpi() -> Option<(u64, usize)> {
     let rsdp = boot::rsdp_address()?;
     let acpi = Acpi::from_rsdp(rsdp).ok()?;
@@ -75,12 +55,11 @@ fn discover_from_fdt() -> Option<(u64, usize)> {
     let dtb = boot::dtb_address()?;
     let tree = Fdt::from_boot_address(dtb).ok()?;
     let node = tree
-        .compatible("riscv,plic0")
-        .ok()?
-        .or(tree.compatible("sifive,plic-1.0.0").ok()?)?;
-    let regs = node.property("reg")?;
-    let (phys, length) = parse_reg_pair(regs, 0)?;
-    Some((phys, length as usize))
+        .find_compatible("riscv,plic0")
+        .or_else(|| tree.find_compatible("sifive,plic-1.0.0"))?;
+    let mut reg = node.reg()?;
+    let entry = reg.next()?;
+    Some((entry.address, entry.size as usize))
 }
 
 fn discover() -> (u64, usize) {

@@ -36,14 +36,38 @@ pub fn report() {
                         srat.memory_affinities().count()
                     );
                 }
-                return;
             }
             Err(error) => crate::kwarn!("ACPI rejected: {error:?}"),
         }
     }
     if let Some(address) = boot::dtb_address() {
         match fdt::Fdt::from_boot_address(address) {
-            Ok(tree) => crate::kinfo!("DTB: {} bytes", tree.len()),
+            Ok(tree) => {
+                let header = tree.header();
+                crate::kinfo!("DTB: {} bytes, v{}", tree.len(), header.version);
+                if let Ok(root) = tree.root() {
+                    if let Some(model) = root.property("model").and_then(|p| p.as_str()) {
+                        crate::kinfo!("DTB model: {model}");
+                    }
+                    if let Some(compat) = root.property("compatible").and_then(|p| p.as_str()) {
+                        crate::kinfo!("DTB compatible: {compat}");
+                    }
+                }
+                let rsv_count = tree.memory_reservations().count();
+                if rsv_count > 0 {
+                    crate::kinfo!("DTB: {rsv_count} reserved memory regions");
+                }
+                if let Some(chosen) = tree.chosen() {
+                    if let Some(stdout) = chosen.stdout_path() {
+                        crate::kinfo!("DTB chosen stdout: {stdout}");
+                    }
+                    if let Some(bootargs) = chosen.bootargs() {
+                        if !bootargs.is_empty() {
+                            crate::kinfo!("DTB chosen bootargs: {bootargs}");
+                        }
+                    }
+                }
+            }
             Err(error) => crate::kwarn!("DTB rejected: {error:?}"),
         }
     }

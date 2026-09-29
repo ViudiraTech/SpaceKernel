@@ -26,6 +26,8 @@ EFI := BOOTX64.EFI
 QEMU := qemu-system-x86_64
 FIRMWARE := /usr/share/OVMF/OVMF_CODE_4M.fd
 MACHINE := q35
+DTB_CMD := true
+DTB_LINE :=
 else ifeq ($(ARCH),aarch64)
 TARGET := aarch64-unknown-none-softfloat
 EFI := BOOTAA64.EFI
@@ -33,12 +35,16 @@ QEMU := qemu-system-aarch64
 FIRMWARE := /usr/share/AAVMF/AAVMF_CODE.fd
 MACHINE := virt
 QEMU_CPU := -cpu max
+DTB_CMD = $(QEMU) -machine virt,dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb $(QEMU_CPU)
+DTB_LINE = dtb_path: boot():/boot/limine/dtb.dtb
 else ifeq ($(ARCH),riscv64)
 TARGET := riscv64gc-unknown-none-elf
 EFI := BOOTRISCV64.EFI
 QEMU := qemu-system-riscv64
 FIRMWARE := /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd
 MACHINE := virt
+DTB_CMD = $(QEMU) -machine virt,dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb
+DTB_LINE = dtb_path: boot():/boot/limine/dtb.dtb
 else
 $(error Unsupported ARCH=$(ARCH))
 endif
@@ -108,7 +114,8 @@ iso: kernel limine
 	cp $(KERNEL) $(ISO_ROOT)/kernel.elf
 	cp $(LIMINE_DIR)/$(EFI) $(ISO_ROOT)/EFI/BOOT/$(EFI)
 	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
-	python3 tools/render_limine.py boot/limine.conf.in $(ISO_ROOT)/limine.conf $(if $(filter y,$(CONFIG_KASLR)),yes,no)
+	$(DTB_CMD)
+	python3 tools/render_limine.py boot/limine.conf.in $(ISO_ROOT)/limine.conf $(if $(filter y,$(CONFIG_KASLR)),yes,no) '$(DTB_LINE)'
 	xorriso -as mkisofs -R -r -J $(if $(filter x86_64,$(ARCH)),-b boot/limine/limine-bios-cd.bin -no-emul-boot -boot-load-size 4 -boot-info-table,) -hfsplus -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin -efi-boot-part --efi-boot-image --protective-msdos-label -o $(ISO) $(ISO_ROOT)
 	$(if $(filter x86_64,$(ARCH)),$(LIMINE_DIR)/limine bios-install $(ISO),true)
 	@printf 'ISO ready: %s\n' '$(ISO)'

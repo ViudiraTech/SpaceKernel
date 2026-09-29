@@ -23,7 +23,10 @@ use core::{
 
 use crate::{
     boot,
-    hardware::acpi::{Acpi, AcpiError, Mcfg, PciSegment},
+    hardware::{
+        acpi::{Acpi, AcpiError, Mcfg, PciSegment},
+        fdt::Fdt,
+    },
     mm::vmm::MapError,
 };
 use ecam::EcamWindow;
@@ -84,6 +87,38 @@ impl PciCore {
         })
     }
 
+    fn from_fdt(fdt: Fdt<'_>) -> Result<Self, PciError> {
+        let node = fdt
+            .find_compatible("pci-host-ecam-generic")
+            .ok_or(PciError::NoWindow)?;
+        let reg = node
+            .reg()
+            .and_then(|mut r| r.next())
+            .ok_or(PciError::MalformedWindow)?;
+        let (start_bus, end_bus) = if let Some(bus_range) = node.property("bus-range") {
+            if bus_range.value.len() >= 8 {
+                let start = u32::from_be_bytes(bus_range.value[0..4].try_into().unwrap()) as u8;
+                let end = u32::from_be_bytes(bus_range.value[4..8].try_into().unwrap()) as u8;
+                (start, end)
+            } else {
+                (0, 255)
+            }
+        } else {
+            (0, 255)
+        };
+        let segment = PciSegment {
+            base: reg.address,
+            group: 0,
+            start_bus,
+            end_bus,
+        };
+        let window = EcamWindow::new(segment)?;
+        Ok(Self {
+            windows: alloc::vec![window],
+            devices: Vec::new().into_boxed_slice(),
+        })
+    }
+
     fn window(&self, address: Address) -> Option<&EcamWindow> {
         self.windows.iter().find(|window| window.contains(address))
     }
@@ -110,15 +145,32 @@ fn core() -> Option<&'static PciCore> {
     }
 }
 
+fn discover_core() -> Result<PciCore, PciError> {
+    if let Some(rsdp) = boot::rsdp_address() {
+        if let Ok(acpi) = Acpi::from_rsdp(rsdp) {
+            if let Ok(Some(mcfg)) = acpi.mcfg() {
+                if let Ok(core) = PciCore::from_mcfg(mcfg) {
+                    return Ok(core);
+                }
+            }
+        }
+    }
+    if let Some(dtb) = boot::dtb_address() {
+        if let Ok(fdt) = Fdt::from_boot_address(dtb) {
+            if let Ok(core) = PciCore::from_fdt(fdt) {
+                return Ok(core);
+            }
+        }
+    }
+    Err(PciError::NoFirmware)
+}
+
 /// Discover ECAM windows and firmware-configured buses before drivers start.
 pub fn init() -> Result<usize, PciError> {
     if core().is_some() {
         return Err(PciError::AlreadyInitialized);
     }
-    let rsdp = boot::rsdp_address().ok_or(PciError::NoFirmware)?;
-    let acpi = Acpi::from_rsdp(rsdp)?;
-    let mcfg = acpi.mcfg()?.ok_or(PciError::NoWindow)?;
-    let mut found = PciCore::from_mcfg(mcfg)?;
+    let mut found = discover_core()?;
     let discovered = enumerate::scan(&found)?;
     let count = discovered.len();
     found.devices = discovered.into_boxed_slice();

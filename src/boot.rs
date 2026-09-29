@@ -84,7 +84,16 @@ pub fn read() -> BootInfo {
     }
 }
 
+pub fn acpi_disabled() -> bool {
+    cmdline()
+        .split_ascii_whitespace()
+        .any(|arg| arg == "acpi=none" || arg == "acpi=off")
+}
+
 pub fn rsdp_address() -> Option<usize> {
+    if acpi_disabled() {
+        return None;
+    }
     RSDP.response().map(|response| response.address as usize)
 }
 
