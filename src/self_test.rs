@@ -60,8 +60,43 @@ pub fn run() {
     assert_eq!(tty::read(tty::TtyDevice::Virtual(2), &mut input), Ok(2));
     assert_eq!(&input[..2], b"x\n");
 
+    // IRQ subsystem and controller self-test
+    static IRQ_HIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    fn test_irq_handler(irq: u32) {
+        if irq == 42 {
+            IRQ_HIT.store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::gic::request(42, test_irq_handler, false).expect("GIC request failed");
+        assert_eq!(crate::irq::count(42), Some(0));
+        crate::irq::dispatch(42);
+        assert!(IRQ_HIT.load(core::sync::atomic::Ordering::Acquire));
+        assert_eq!(crate::irq::count(42), Some(1));
+        crate::arch::gic::release(42).expect("GIC release failed");
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::arch::plic::request(42, test_irq_handler).expect("PLIC request failed");
+        assert_eq!(crate::irq::count(42), Some(0));
+        crate::irq::dispatch(42);
+        assert!(IRQ_HIT.load(core::sync::atomic::Ordering::Acquire));
+        assert_eq!(crate::irq::count(42), Some(1));
+        crate::arch::plic::release(42).expect("PLIC release failed");
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::irq::register(42, test_irq_handler).expect("IRQ register failed");
+        assert_eq!(crate::irq::count(42), Some(0));
+        crate::irq::dispatch(42);
+        assert!(IRQ_HIT.load(core::sync::atomic::Ordering::Acquire));
+        assert_eq!(crate::irq::count(42), Some(1));
+        crate::irq::unregister(42).expect("IRQ unregister failed");
+    }
+
     let sequence = printk::next_sequence();
-    kinfo!("PMM/VMM/SLAB/TTY self-test passed");
+    kinfo!("PMM/VMM/SLAB/TTY/IRQ self-test passed");
     let record = printk::read(sequence).expect("printk record missing");
     assert_eq!(record.sequence, sequence);
 }

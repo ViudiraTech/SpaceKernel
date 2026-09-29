@@ -8,7 +8,9 @@ extern crate alloc;
 mod arch;
 mod boot;
 mod hardware;
+pub mod irq;
 mod mm;
+pub mod pci;
 pub mod printk;
 #[cfg(feature = "boot-self-test")]
 mod self_test;
@@ -67,9 +69,65 @@ pub extern "C" fn kmain() -> ! {
         boot::dtb_address()
     );
     hardware::report();
+    #[cfg(target_arch = "x86_64")]
+    let interrupt_ready = match arch::apic::init_bsp() {
+        Ok(()) => true,
+        Err(error) => {
+            kwarn!("APIC unavailable: {error:?}");
+            false
+        }
+    };
+    #[cfg(target_arch = "aarch64")]
+    let interrupt_ready = match arch::gic::init_bsp() {
+        Ok(()) => true,
+        Err(error) => {
+            kwarn!("GIC unavailable: {error:?}");
+            false
+        }
+    };
+    #[cfg(target_arch = "riscv64")]
+    let interrupt_ready = match arch::plic::init_bsp() {
+        Ok(()) => {
+            let _ = arch::clint::init_bsp();
+            true
+        }
+        Err(error) => {
+            kwarn!("PLIC unavailable: {error:?}");
+            false
+        }
+    };
+    match pci::init() {
+        Ok(count) => {
+            kinfo!(
+                "PCI: discovered {} functions in {} ECAM windows",
+                count,
+                pci::segments().len()
+            );
+            for device in pci::devices() {
+                kinfo!(
+                    "PCI {} {:04x}:{:04x} class {:02x}:{:02x}:{:02x}",
+                    device.address,
+                    device.vendor_id,
+                    device.device_id,
+                    device.class,
+                    device.subclass,
+                    device.programming_interface
+                );
+            }
+        }
+        Err(error) => kwarn!("PCI discovery unavailable: {error:?}"),
+    }
     #[cfg(feature = "boot-self-test")]
     self_test::run();
     kinfo!("BOOT_OK");
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    if interrupt_ready {
+        arch::enable_interrupts();
+    }
     loop {
         arch::halt();
     }

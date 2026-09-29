@@ -172,11 +172,24 @@ pub fn translate(virtual_address: u64) -> Option<u64> {
     arch::pte_present(leaf).then(|| arch::pte_phys(leaf) + virtual_address % PAGE_SIZE)
 }
 
-#[cfg(not(target_arch = "x86_64"))]
 pub fn map_device_page(physical: u64) -> Result<u64, MapError> {
     let region = reserve(1)?;
     map(region, 0, physical & !(PAGE_SIZE - 1), true)?;
     Ok(region.base + physical % PAGE_SIZE)
+}
+
+pub fn map_device_range(physical: u64, length: usize) -> Result<u64, MapError> {
+    if length == 0 {
+        return Err(MapError::OutOfRange);
+    }
+    let offset = physical % PAGE_SIZE;
+    let base_phys = physical & !(PAGE_SIZE - 1);
+    let pages = ((length as u64 + offset + (PAGE_SIZE - 1)) / PAGE_SIZE) as usize;
+    let region = reserve(pages)?;
+    for i in 0..pages {
+        map(region, i, base_phys + (i as u64 * PAGE_SIZE), true)?;
+    }
+    Ok(region.base + offset)
 }
 
 fn entry_ptr(table: u64, virtual_address: u64, level: usize) -> *mut u64 {

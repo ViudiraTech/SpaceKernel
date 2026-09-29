@@ -21,3 +21,8 @@ pub fn uptime_micros() -> u64 {
     let ticks = arch::counter().wrapping_sub(ORIGIN.load(Ordering::Acquire));
     ((ticks as u128 * 1_000_000) / frequency as u128).min(u64::MAX as u128) as u64
 }
+
+pub fn counter_frequency() -> Option<u64> {
+    let value = FREQUENCY.load(Ordering::Acquire);
+    (value != 0).then_some(value)
+}

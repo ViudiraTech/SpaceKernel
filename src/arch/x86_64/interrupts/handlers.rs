@@ -37,6 +37,10 @@ fatal_no_code!(x87_floating_point, "#MF floating point");
 fatal_no_code!(simd_floating_point, "#XM SIMD floating point");
 fatal_no_code!(virtualization, "#HV virtualization");
 fatal_no_code!(unhandled_interrupt, "unhandled interrupt");
+
+pub(super) extern "x86-interrupt" fn external<const VECTOR: u8>(_frame: InterruptStackFrame) {
+    crate::arch::apic::dispatch(VECTOR);
+}
 fatal_with_code!(invalid_tss, "#TS invalid TSS");
 fatal_with_code!(segment_not_present, "#NP segment absent");
 fatal_with_code!(stack_segment_fault, "#SS stack segment");

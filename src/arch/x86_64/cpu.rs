@@ -6,6 +6,11 @@ pub fn disable_interrupts() {
     unsafe { asm!("cli", options(nomem, nostack)) }
 }
 
+pub fn enable_interrupts() {
+    // SAFETY: the BSP enables delivery only after IDT and APIC setup.
+    unsafe { asm!("sti", options(nomem, nostack)) }
+}
+
 #[inline]
 pub fn irq_save() -> u64 {
     let flags: u64;

@@ -65,6 +65,8 @@ LIMINE_VERSION := v12.9.1
 LIMINE_DIR := build/limine/$(LIMINE_VERSION)
 LIMINE_ARCHIVE := build/downloads/limine-$(LIMINE_VERSION)-binary.tar.gz
 LIMINE_SHA256 := 5cdebc518daa3af30b22c2322ba0dba2e0e2046fa8b087b9e13071b8dbcdcff4
+LIMINE_URL ?= https://github.com/Limine-Bootloader/Limine/releases/download/$(LIMINE_VERSION)/limine-binary.tar.gz
+DOWNLOAD_JOBS ?= 8
 QEMU_FLAGS := -machine $(MACHINE) $(QEMU_CPU) -m $(MEMORY_MIB) -smp $(CPUS) -serial stdio -monitor none -no-reboot
 
 .PHONY: all kernel iso run debug test check fmt menuconfig defconfig olddefconfig deps limine clean help
@@ -89,7 +91,7 @@ kernel: deps
 
 $(LIMINE_ARCHIVE):
 	mkdir -p build/downloads
-	curl -fL --retry 3 -o $@ https://github.com/Limine-Bootloader/Limine/releases/download/$(LIMINE_VERSION)/limine-binary.tar.gz
+	python3 tools/download_parallel.py '$(LIMINE_URL)' $@ $(LIMINE_SHA256) --jobs $(DOWNLOAD_JOBS)
 
 $(LIMINE_DIR)/.extracted: $(LIMINE_ARCHIVE)
 	printf '%s  %s\n' $(LIMINE_SHA256) $(LIMINE_ARCHIVE) | sha256sum -c -

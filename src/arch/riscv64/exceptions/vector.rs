@@ -13,6 +13,26 @@ pub(super) fn address() -> usize {
 }
 
 #[unsafe(no_mangle)]
+extern "C" fn spacekernel_riscv64_irq(cause: u64) {
+    let irq_code = cause & !(1u64 << 63);
+    match irq_code {
+        // Supervisor external interrupt (PLIC)
+        9 => {
+            crate::arch::plic::handle_irq();
+        }
+        // Supervisor timer interrupt (CLINT / SBI / Sstc)
+        5 => {
+            crate::arch::clint::handle_timer_irq();
+        }
+        // Supervisor software interrupt (IPI)
+        1 => {
+            crate::arch::clint::handle_software_irq();
+        }
+        _ => {}
+    }
+}
+
+#[unsafe(no_mangle)]
 extern "C" fn spacekernel_riscv64_exception(original_sp: u64, original_t0: u64) -> ! {
     let (cause, epc, tval, status): (u64, u64, u64, u64);
     // SAFETY: supervisor CSRs describe the currently entered trap.

@@ -4,6 +4,11 @@ use crate::{arch, printk};
 
 global_asm!(include_str!("vector.S"));
 
+#[unsafe(no_mangle)]
+extern "C" fn spacekernel_aarch64_irq() {
+    crate::arch::gic::handle_irq();
+}
+
 unsafe extern "C" {
     static __spacekernel_aarch64_vectors: u8;
 }

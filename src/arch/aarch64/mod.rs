@@ -1,9 +1,10 @@
 mod cpu;
 mod exceptions;
+pub mod gic;
 mod paging;
 mod serial;
 
-pub use cpu::{counter, disable_interrupts, halt, irq_restore, irq_save};
+pub use cpu::{counter, disable_interrupts, enable_interrupts, halt, irq_restore, irq_save};
 pub use exceptions::init_bsp as init_exceptions;
 pub use paging::{
     flush_page, page_root, pte_leaf, pte_phys, pte_present, pte_table, set_page_root,

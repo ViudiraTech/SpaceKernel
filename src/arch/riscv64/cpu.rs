@@ -5,6 +5,11 @@ pub fn disable_interrupts() {
     unsafe { asm!("csrci sstatus, 2", options(nomem, nostack)) }
 }
 
+pub fn enable_interrupts() {
+    // SAFETY: set SIE on this hart.
+    unsafe { asm!("csrsi sstatus, 2", options(nomem, nostack)) }
+}
+
 pub fn irq_save() -> u64 {
     let flags: u64;
     // SAFETY: atomic CSR exchange saves the previous SIE bit.

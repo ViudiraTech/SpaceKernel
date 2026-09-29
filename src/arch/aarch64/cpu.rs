@@ -5,6 +5,11 @@ pub fn disable_interrupts() {
     unsafe { asm!("msr daifset, #0xf", options(nomem, nostack)) }
 }
 
+pub fn enable_interrupts() {
+    // SAFETY: unmasks IRQ on the local processing element.
+    unsafe { asm!("msr daifclr, #0x2", options(nomem, nostack)) }
+}
+
 pub fn irq_save() -> u64 {
     let flags: u64;
     // SAFETY: capture and mask interrupts on the same processing element.

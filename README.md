@@ -10,7 +10,7 @@
 
 ## 快速开始
 
-构建环境需要 Rust/rustup、GNU Make、Python 3、`curl`、`tar`、`sha256sum`、`xorriso`，以及目标架构的 QEMU 和 UEFI 固件。`make menuconfig`、`make defconfig` 分别需要 Kconfig frontends 提供的 `kconfig-mconf`、`kconfig-conf`。`make` 会安装所选 Rust target、下载 Cargo 依赖，并自动获取校验过的 Limine 二进制发行包。
+构建环境需要 Rust/rustup、GNU Make、Python 3、`tar`、`sha256sum`、`xorriso`，以及目标架构的 QEMU 和 UEFI 固件。`make menuconfig`、`make defconfig` 分别需要 Kconfig frontends 提供的 `kconfig-mconf`、`kconfig-conf`。`make` 会安装所选 Rust target、下载 Cargo 依赖，并自动获取校验过的 Limine 二进制发行包。Limine 使用 8 路并行 HTTP Range 下载；可用 `make DOWNLOAD_JOBS=16` 调整并发数。
 
 ```sh
 make menuconfig  # 选择架构、debug/release、KASLR、内核命令行及 QEMU 配置
@@ -55,6 +55,7 @@ make debug                # QEMU 暂停在启动处，GDB 端口 1234
 | --- | --- |
 | `src/boot.rs`、`src/arch/` | Limine 响应；各架构的 CPU、分页、串口、异常与中断入口 |
 | `src/mm/` | PMM、VMM、SLAB 和大块堆分配 |
+| `src/pci/` | MCFG/ECAM 配置访问、固件配置总线枚举、设备快照和 capability 链解析 |
 | `src/printk/` | 日志记录与有序控制台输出 |
 | `src/tty/console/`、`src/tty/line/` | 控制台选择、TTY 设备分发、输入行规程 |
 | `src/tty/fbcon/` | 虚拟终端状态、ANSI 解析、滚屏与像素绘制 |

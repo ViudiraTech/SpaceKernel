@@ -8,8 +8,8 @@ mod sdt;
 mod srat;
 
 pub use fadt::Fadt;
-pub use madt::Madt;
-pub use mcfg::Mcfg;
+pub use madt::{Madt, MadtEntry};
+pub use mcfg::{Mcfg, PciSegment};
 pub use sdt::Table;
 pub use srat::Srat;
 
