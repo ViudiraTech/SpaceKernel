@@ -356,3 +356,10 @@ pub fn send_sgi(intid: u8, affinity: u64) -> Result<(), IrqError> {
     unsafe { write_icc_sgi1r_el1(sgi_val) }
     Ok(())
 }
+
+pub fn configure_local(intid: u32, edge: bool) -> Result<(), IrqError> {
+    if intid >= 16 {
+        return configure(0, intid, edge);
+    }
+    mask(0, intid, false)
+}

@@ -14,4 +14,4 @@ mod per_cpu;
 mod vector;
 
 pub(crate) use per_cpu::current_cpu_index;
-pub use per_cpu::init_bsp;
+pub use per_cpu::{init_bsp, load_cpu};

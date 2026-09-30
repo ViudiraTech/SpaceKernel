@@ -50,6 +50,7 @@ fatal_no_code!(unhandled_interrupt, "unhandled interrupt");
 
 pub(super) extern "x86-interrupt" fn external<const VECTOR: u8>(_frame: InterruptStackFrame) {
     crate::arch::apic::dispatch(VECTOR);
+    crate::sched::irq_exit();
 }
 fatal_with_code!(invalid_tss, "#TS invalid TSS");
 fatal_with_code!(segment_not_present, "#NP segment absent");

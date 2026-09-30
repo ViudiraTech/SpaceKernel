@@ -24,8 +24,10 @@ pub mod irq;
 mod mm;
 pub mod pci;
 pub mod printk;
+pub mod sched;
 #[cfg(feature = "boot-self-test")]
 mod self_test;
+mod smp;
 mod sync;
 mod time;
 pub mod tty;
@@ -47,6 +49,7 @@ pub extern "C" fn kmain() -> ! {
         arch::serial_init(uart);
     }
     let prepared_cpus = arch::init_exceptions();
+    arch::install_cpu_index(boot::bsp_cpu_index());
     fpu::init().expect("extended CPU state initialization failed");
     time::init();
     tty::init();
@@ -147,20 +150,28 @@ pub extern "C" fn kmain() -> ! {
         }
         Err(error) => kwarn!("PCI discovery unavailable: {error:?}"),
     }
+
     #[cfg(feature = "boot-self-test")]
     self_test::run();
+    assert!(interrupt_ready, "scheduler requires interrupt controller");
+    sched::init(boot::cpu_count());
+    smp::start();
+    kinfo!("Scheduler: per-CPU EEVDF ready");
+    #[cfg(feature = "boot-self-test")]
+    sched::spawn_on(
+        boot::bsp_cpu_index(),
+        || {
+            sched::sched_test::run();
+            kinfo!("BOOT_OK");
+        },
+        0,
+    )
+    .expect("scheduler test task allocation failed");
+    #[cfg(not(feature = "boot-self-test"))]
     kinfo!("BOOT_OK");
-    #[cfg(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64"
-    ))]
-    if interrupt_ready {
-        arch::enable_interrupts();
-    }
-    loop {
-        arch::halt();
-    }
+    smp::release();
+    sched::start_current_cpu();
+    sched::idle_loop()
 }
 
 #[alloc_error_handler]

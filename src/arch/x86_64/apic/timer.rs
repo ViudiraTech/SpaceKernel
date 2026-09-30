@@ -47,3 +47,7 @@ pub fn cancel() {
     }
     local::timer_set_initial(0);
 }
+
+pub fn current_ticks() -> u32 {
+    local::timer_current()
+}

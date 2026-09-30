@@ -123,8 +123,12 @@ pub fn cancel() {
 }
 
 pub fn send_ipi(hart_id: usize) -> Result<(), IrqError> {
+    let (error, _) = sbi_call(0x0073_5049, 0, 1, hart_id, 0);
+    if error == 0 {
+        return Ok(());
+    }
     if hart_id >= usize::BITS as usize {
-        return Err(IrqError::Invalid);
+        return Err(IrqError::Unsupported);
     }
     sbi_send_ipi_mask(1 << hart_id)
 }

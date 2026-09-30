@@ -10,7 +10,7 @@ x86 后端检查基本、扩展、虚拟机 CPUID 叶范围，解析 family/mode
 
 硬件支持与 OS 管理是两件事。执行扩展指令前，使用 `fpu::config().supports(feature, &cpu)` 判断寄存器状态是否受到管理，再取得寄存器所有权。SVE、SME、RVV、AMX、MPX、PKRU 等状态没有在本次实现中开放，不能因为硬件报告支持就执行它们。AArch64/RISC-V 不会被错误标记为支持 x86 SSE/AVX。
 
-AP 上线前，需要在正确 CPU 上调用 `unsafe cpuid::detect_current(index)`，检查 `cpuid::compatible` 所需能力与地址宽度，并调用 `unsafe fpu::init_current_cpu(&local_info)`。地址宽度低于 BSP、已知宽度变成未知，或扩展状态格式、大小/掩码不匹配时拒绝上线。当前仓库尚未启动 AP，不能把这些入口的存在等同于完成 SMP 验证。
+AP 上线前，需要在正确 CPU 上调用 `unsafe cpuid::detect_current(index)`，检查 `cpuid::compatible` 所需能力与地址宽度，并调用 `unsafe fpu::init_current_cpu(&local_info)`。地址宽度低于 BSP、已知宽度变成未知，或扩展状态格式、大小/掩码不匹配时拒绝上线。`smp` 已在每个 AP 上执行这些步骤，并在全部完成后发布 online。三个架构通过统一的启动、硬件抢占和跨核扩展状态隔离测试。
 
 ## 分页模式
 
@@ -41,7 +41,7 @@ x86 在 CPUID 检查后配置 CR0/CR4，写入实际 XCR0 后重新读取 CPUID.
 - `enable_user` 只能在已恢复的用户任务返回前调用；所有内核入口需关闭门，并在调度前保存该任务。
 - `bytes` 和 `import` 提供未来 signal/ptrace 接口的内部存储层。导入要求精确长度，检查 MXCSR、XSAVE 掩码/标准格式/保留字段或本架构控制字段，失败保持原状态。
 
-保存、恢复、切换和 AP 初始化为 `unsafe` 接口：调用者必须持有当前 CPU/任务的所有权，关闭中断及抢占，防止迁移和并发修改。它们不能代替尚不存在的调度器、用户返回路径或 signal ABI。状态缓冲区在释放前用 volatile 写清零。
+保存、恢复、切换和 AP 初始化为 `unsafe` 接口：调用者必须持有当前 CPU/任务的所有权，关闭中断及抢占，防止迁移和并发修改。调度器已在持有源运行队列所有权时执行 eager 保存/恢复；用户返回路径和 signal ABI 尚未实现。状态缓冲区在释放前用 volatile 写清零。
 
 ## 显式内核借用
 

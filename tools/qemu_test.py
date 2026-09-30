@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--accel", choices=["tcg", "kvm"])
     parser.add_argument("--cpu")
     parser.add_argument("--machine")
+    parser.add_argument("--timeout", type=float, default=90)
+    parser.add_argument("--online-cpus", type=int)
     parser.add_argument("--require", action="append", default=[])
     args = parser.parse_args()
     arch, iso, firmware, cpus, memory_mib = args.arch, args.iso, args.firmware, args.cpus, args.memory_mib
@@ -46,7 +48,9 @@ def main():
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     output = bytearray()
-    deadline = time.monotonic() + 50
+    deadline = time.monotonic() + args.timeout
+    if args.online_cpus is not None:
+        args.require.append(f"SMP: {args.online_cpus}/{args.online_cpus} CPUs online")
     try:
         while time.monotonic() < deadline:
             for key, _ in selector.select(timeout=0.5):

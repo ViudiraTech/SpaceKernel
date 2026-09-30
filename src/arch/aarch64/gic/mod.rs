@@ -209,3 +209,15 @@ pub fn send_sgi(intid: u8, affinity: u64) -> Result<(), IrqError> {
         _ => Err(IrqError::NoController),
     }
 }
+
+/// Program an already registered SGI/PPI on this CPU without global registration.
+pub fn configure_local(intid: u32, edge: bool) -> Result<(), IrqError> {
+    if intid >= 32 {
+        return Err(IrqError::Invalid);
+    }
+    match VERSION.load(Ordering::Acquire) {
+        2 => v2::configure_local(DISTRIBUTOR.load(Ordering::Relaxed), intid, edge),
+        3 => v3::configure_local(intid, edge),
+        _ => Err(IrqError::NoController),
+    }
+}

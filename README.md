@@ -30,6 +30,7 @@ make test ARCH=riscv64
 ## 测试与调试
 
 ```sh
+make test-all             # 三架构统一调度测试：debug/release、1/4 核、GICv3、Sv48
 make check                # rustfmt + 三架构 cargo check
 make test ARCH=x86_64     # 构建 ISO，在无图形 QEMU 中等待串口 BOOT_OK
 make test ARCH=aarch64
@@ -39,13 +40,14 @@ make test ARCH=aarch64 MACHINE=virt,gic-version=3
 make debug                # QEMU 暂停在启动处，GDB 端口 1234
 ```
 
-启用 `CONFIG_BOOT_SELF_TEST` 时，启动自测检查 PMM/VMM/SLAB/TTY/IRQ/FDT、扩展寄存器保存恢复与隔离、嵌套内核借用、非法状态导入，以及真实 timer IRQ。`make test` 检查最终 ELF 的普通代码无 FP/SIMD 指令，并要求自测标记与 `BOOT_OK`；它仍不等同于完整的实机或并发压力测试。
+启用 `CONFIG_BOOT_SELF_TEST` 时，启动自测检查 PMM/VMM/SLAB/TTY/IRQ/FDT、扩展寄存器保存恢复与隔离、嵌套内核借用、非法状态导入，以及真实 timer IRQ。调度测试同时验证各核上线、硬件抢占、EEVDF 份额、跨核等待唤醒、FPU 迁移隔离与任务退出回收。`make test` 检查最终 ELF 的普通代码无 FP/SIMD 指令，并要求自测标记与 `BOOT_OK`；统一矩阵的逐项日志和 JSON 汇总保存在 `build/sched-tests/`；QEMU 验证仍不等同于实机验证。
 
 ## 当前实现
 
 | 子系统 | 当前范围 |
 | --- | --- |
 | 启动与架构 | Limine 请求、KASLR 配置、三架构串口和页表接口、x86_64 GDT/IDT 与其他架构的异常向量 |
+| SMP 与调度 | Limine AP 启动、每核异常/FPU/控制器初始化、增广红黑树 EEVDF、定时抢占、亲和性、拓扑域拉取、等待/定时睡眠、切换后回收 |
 | 内存 | PMM 位图、按架构几何的内核 VMM（含 Sv39/Sv48）、单次映射、SLAB 及大块分配 |
 | CPU 能力与扩展状态 | 无锁 BSP 能力快照、三架构探测、x87/SSE/AVX XSAVE 或 FXSAVE、AArch64 FP/AdvSIMD、RISC-V F/D 状态管理与显式内核借用 |
 | 输出 | 有界 printk 环形记录、`console=` 路由、8 个 framebuffer 虚拟终端、ANSI 基础控制与滚屏历史 |
@@ -57,6 +59,7 @@ make debug                # QEMU 暂停在启动处，GDB 端口 1234
 | 路径 | 职责 |
 | --- | --- |
 | `src/boot.rs`、`src/arch/` | Limine 响应；各架构的 CPU、分页、串口、异常与中断入口 |
+| `src/smp.rs`、`src/sched/` | 三架构 CPU 上线、每核运行队列、EEVDF、跨核迁移与调度自测 |
 | `src/cpuid/`、`src/fpu/` | 架构无关 CPU 能力与扩展寄存器所有权接口 |
 | `src/mm/` | PMM、VMM、SLAB 和大块堆分配 |
 | `src/pci/` | MCFG/ECAM 配置访问、固件配置总线枚举、设备快照和 capability 链解析 |
@@ -68,8 +71,8 @@ make debug                # QEMU 暂停在启动处，GDB 端口 1234
 
 ## 并发约束与后续工作
 
-共享状态由关闭本地中断的自旋锁和 acquire/release 原子操作保护。VMM 锁与各 SLAB 类锁可以获取 PMM 锁，反向获取禁止；printk 在写控制台前释放日志环锁；持有 TTY 锁时不调用分配器或日志接口。这些约束为未来启动 AP 留出了基础，但目前**只运行 BSP**。
+共享状态由关闭本地中断的自旋锁和 acquire/release 原子操作保护。VMM 锁与各 SLAB 类锁可以获取 PMM 锁，反向获取禁止；printk 在写控制台前释放日志环锁；持有 TTY 锁时不调用分配器或日志接口。AP 已按统一流程上线并参与调度。运行队列锁按 CPU 编号排序；切换把源队列锁交给新栈释放，保证旧栈保存后才能迁移或唤醒。
 
-AP 启动、跨核 TLB shootdown、VMM 解除映射、调度器/用户态的扩展状态接入、可返回的用户异常处理、键盘/UART 中断输入以及用户空间设备接口仍需实现。已有 APIC/GIC/PLIC 与 timer IRQ，以及 ACPI/FDT 驱动的 PCI 固件拓扑枚举。PLIC 的 hart 上下文目前需要设备树的 `interrupts-extended`，不会猜测 ACPI-only 平台的上下文布局。
+跨核 TLB shootdown、VMM 解除映射、用户态的扩展状态接入、可返回的用户异常处理、键盘/UART 中断输入以及用户空间设备接口仍需实现。已有 APIC/GIC/PLIC 与 timer IRQ，以及 ACPI/FDT 驱动的 PCI 固件拓扑枚举。PLIC 的 hart 上下文目前需要设备树的 `interrupts-extended`，不会猜测 ACPI-only 平台的上下文布局。
 
-接口契约与当前边界见 [CPU 与扩展状态说明](docs/CPU_STATE.md)，文件头和注释规范见 [源码约定](docs/CODING_STYLE.md)，本轮问题修复与验证见 [审查记录](docs/REVIEW_2026-09-30.md)。
+调度算法、接口、锁顺序和统一测试见 [SMP 与调度器](docs/SCHEDULER.md)。接口契约与当前边界见 [CPU 与扩展状态说明](docs/CPU_STATE.md)，文件头和注释规范见 [源码约定](docs/CODING_STYLE.md)，本轮问题修复与验证见 [审查记录](docs/REVIEW_2026-09-30.md)。

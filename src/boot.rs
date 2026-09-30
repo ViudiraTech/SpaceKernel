@@ -162,3 +162,9 @@ pub fn bsp_cpu_index() -> usize {
         .position(|cpu| cpu.hartid == response.bsp_hartid);
     index.expect("BSP absent from Limine CPU list")
 }
+
+/// Release the AP only after all kernel-owned startup state is published.
+pub fn start_cpu(index: usize, entry: limine::mp::MpGotoFunction) {
+    assert_ne!(index, bsp_cpu_index());
+    MP.response().expect("MP required").cpus()[index].bootstrap(entry, index as u64);
+}

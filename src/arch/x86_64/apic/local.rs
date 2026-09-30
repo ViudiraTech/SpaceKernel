@@ -194,6 +194,15 @@ pub fn send_nmi(destination: u32) -> Result<(), IrqError> {
 }
 
 fn send(destination: u32, low: u32) -> Result<(), IrqError> {
+    // xAPIC has separate destination/high and vector/low writes. A local IRQ
+    // sending another IPI between them would redirect the interrupted send.
+    let flags = crate::arch::irq_save();
+    let result = send_masked(destination, low);
+    crate::arch::irq_restore(flags);
+    result
+}
+
+fn send_masked(destination: u32, low: u32) -> Result<(), IrqError> {
     if !ready() {
         return Err(IrqError::NoController);
     }

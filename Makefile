@@ -88,7 +88,7 @@ LIMINE_URL ?= https://github.com/Limine-Bootloader/Limine/releases/download/$(LI
 DOWNLOAD_JOBS ?= 8
 QEMU_FLAGS := -machine $(MACHINE) $(QEMU_CPU) -m $(MEMORY_MIB) -smp $(CPUS) -serial stdio -monitor none -no-reboot
 
-.PHONY: all kernel iso run debug test check fmt menuconfig defconfig olddefconfig deps limine clean help
+.PHONY: all kernel iso run debug test test-all test-sched-model check fmt menuconfig defconfig olddefconfig deps limine clean help
 all: iso
 
 defconfig:
@@ -141,7 +141,15 @@ debug: iso
 
 test: iso
 	python3 tools/check_no_simd.py $(ARCH) $(KERNEL)
-	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'CPU/FPU self-test passed' --require 'PMM/VMM/SLAB/TTY/IRQ/FDT self-test passed',)
+	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'CPU/FPU self-test passed' --require 'PMM/VMM/SLAB/TTY/IRQ/FDT self-test passed' --require 'scheduler self-test passed',) --online-cpus $(CPUS)
+
+test-sched-model:
+	mkdir -p build
+	rustc --edition=2024 --test tools/sched_model_test.rs -o build/sched-model-test
+	build/sched-model-test
+
+test-all: test-sched-model
+	python3 tools/test_schedulers.py
 
 check:
 	cargo fmt --all -- --check
@@ -164,4 +172,5 @@ help:
 	  'make run         Boot ISO in QEMU' \
 	  'make debug       Start QEMU paused with GDB port 1234' \
 	  'make test        Boot smoke test' \
+	  'make test-all    Three-architecture scheduler matrix (debug/release, 1/4 CPUs)' \
 	  'make check       Format and check all target architectures'

@@ -19,6 +19,8 @@
 mod self_test;
 #[cfg(feature = "boot-self-test")]
 pub(crate) use self_test::run as self_test;
+#[cfg(feature = "boot-self-test")]
+pub(crate) use self_test::{assert_registers as assert_test_registers, pattern as test_pattern};
 
 use crate::{
     arch,

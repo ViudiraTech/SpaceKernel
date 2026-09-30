@@ -23,7 +23,7 @@ __spacekernel_aarch64_vectors:
     .endr
 
 __spacekernel_aarch64_irq_entry:
-    sub sp, sp, #256
+    sub sp, sp, #272
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
     stp x4, x5, [sp, #32]
@@ -40,7 +40,15 @@ __spacekernel_aarch64_irq_entry:
     stp x26, x27, [sp, #208]
     stp x28, x29, [sp, #224]
     str x30, [sp, #240]
+    mrs x0, elr_el1
+    str x0, [sp, #248]
+    mrs x0, spsr_el1
+    str x0, [sp, #256]
     bl spacekernel_aarch64_irq
+    ldr x0, [sp, #248]
+    msr elr_el1, x0
+    ldr x0, [sp, #256]
+    msr spsr_el1, x0
     ldp x0, x1, [sp, #0]
     ldp x2, x3, [sp, #16]
     ldp x4, x5, [sp, #32]
@@ -57,7 +65,7 @@ __spacekernel_aarch64_irq_entry:
     ldp x26, x27, [sp, #208]
     ldp x28, x29, [sp, #224]
     ldr x30, [sp, #240]
-    add sp, sp, #256
+    add sp, sp, #272
     eret
 
 __spacekernel_aarch64_exception_entry:

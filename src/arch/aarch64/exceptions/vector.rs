@@ -17,6 +17,7 @@ global_asm!(include_str!("vector.S"));
 #[unsafe(no_mangle)]
 extern "C" fn spacekernel_aarch64_irq() {
     crate::arch::gic::handle_irq();
+    crate::sched::irq_exit();
 }
 
 unsafe extern "C" {

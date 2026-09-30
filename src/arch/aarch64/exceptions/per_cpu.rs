@@ -24,6 +24,7 @@ struct Stack([u8; STACK_SIZE]);
 struct CpuState {
     // vector.S reads the top of this stack at offset zero.
     stack_top: usize,
+    index: usize,
     _stack: Box<Stack>,
 }
 
@@ -37,11 +38,12 @@ pub fn init_bsp() -> usize {
     let count = boot::cpu_count();
     assert!((1..=256).contains(&count), "invalid Limine CPU count");
     let mut prepared = Vec::with_capacity(count);
-    for _ in 0..count {
+    for index in 0..count {
         let stack = Box::new(Stack([0; STACK_SIZE]));
         let stack_top = stack.0.as_ptr().wrapping_add(STACK_SIZE) as usize;
         prepared.push(Box::new(CpuState {
             stack_top,
+            index,
             _stack: stack,
         }));
     }
@@ -70,4 +72,18 @@ pub fn load_cpu(index: usize) {
             state = in(reg) state_ptr, vectors = in(reg) vectors,
             options(nostack, preserves_flags));
     }
+}
+
+/// Installed CPU-local state is immutable and never part of a task context.
+pub fn current_cpu_index() -> Option<usize> {
+    let pointer: usize;
+    // SAFETY: TPIDR_EL1 is installed before any scheduler operation.
+    unsafe {
+        asm!("mrs {}, tpidr_el1", out(reg) pointer, options(nomem,nostack));
+    }
+    if pointer == 0 {
+        return None;
+    }
+    // SAFETY: only load_cpu writes this register, with a pinned CpuState.
+    Some(unsafe { (*(pointer as *const CpuState)).index })
 }

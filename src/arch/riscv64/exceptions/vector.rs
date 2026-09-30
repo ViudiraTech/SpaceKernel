@@ -40,6 +40,7 @@ extern "C" fn spacekernel_riscv64_irq(cause: u64) {
         }
         _ => {}
     }
+    crate::sched::irq_exit();
 }
 
 #[unsafe(no_mangle)]

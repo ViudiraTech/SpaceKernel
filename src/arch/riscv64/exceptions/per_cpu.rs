@@ -27,6 +27,7 @@ struct Stack([u8; STACK_SIZE]);
 struct HartState {
     // vector.S reads the top of this stack at offset zero.
     stack_top: usize,
+    index: usize,
     _stack: Box<Stack>,
 }
 
@@ -42,11 +43,12 @@ pub fn init_bsp() -> usize {
     let count = boot::cpu_count();
     assert!((1..=256).contains(&count), "invalid Limine CPU count");
     let mut prepared = Vec::with_capacity(count);
-    for _ in 0..count {
+    for index in 0..count {
         let stack = Box::new(Stack([0; STACK_SIZE]));
         let stack_top = stack.0.as_ptr().wrapping_add(STACK_SIZE) as usize;
         prepared.push(Box::new(HartState {
             stack_top,
+            index,
             _stack: stack,
         }));
     }
@@ -85,7 +87,10 @@ pub fn current_cpu_index() -> Option<usize> {
     if state == 0 {
         return None;
     }
+    // Validate the installed pointer before dereferencing boot-time sscratch.
     POINTERS
         .iter()
-        .position(|pointer| pointer.load(Ordering::Acquire) == state)
+        .find(|pointer| pointer.load(Ordering::Acquire) == state)?;
+    // SAFETY: the match identifies a permanent HartState allocation.
+    Some(unsafe { (*(state as *const HartState)).index })
 }

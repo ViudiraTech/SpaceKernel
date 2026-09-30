@@ -287,3 +287,18 @@ pub fn dispatch(vector: u8) {
     }
     local::eoi();
 }
+
+/// Local setup only; never reprogram shared I/O APIC routes on an AP.
+pub fn init_cpu() -> Result<(), IrqError> {
+    if !local::ready() {
+        return Err(IrqError::NoController);
+    }
+    local::configure_cpu();
+    let rsdp = boot::rsdp_address().ok_or(IrqError::NoController)?;
+    let acpi = Acpi::from_rsdp(rsdp).map_err(|_| IrqError::Invalid)?;
+    let madt = acpi
+        .madt()
+        .map_err(|_| IrqError::Invalid)?
+        .ok_or(IrqError::NoController)?;
+    configure_lint(&madt, local::id())
+}

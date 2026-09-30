@@ -149,3 +149,18 @@ pub fn send_sgi(dist: usize, intid: u8, affinity: u64) -> Result<(), IrqError> {
     write32(dist, GICD_SGIR, value);
     Ok(())
 }
+
+pub fn configure_local(dist: usize, intid: u32, edge: bool) -> Result<(), IrqError> {
+    let priority = GICD_IPRIORITYR + (intid as usize & !3);
+    let shift = (intid % 4) * 8;
+    write32(
+        dist,
+        priority,
+        (read32(dist, priority) & !(0xff << shift)) | (0xa0 << shift),
+    );
+    if intid >= 16 {
+        configure(dist, intid, edge)
+    } else {
+        mask(dist, intid, false)
+    }
+}

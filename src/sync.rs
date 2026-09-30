@@ -62,6 +62,13 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// # Safety
+    /// The caller owns a guard transferred with Guard::handoff on this CPU.
+    /// No access to the protected value may remain when this is called.
+    pub unsafe fn unlock_handoff(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+
     pub fn try_lock(&self) -> Option<Guard<'_, T>> {
         let flags = arch::irq_save();
         if self
@@ -100,5 +107,14 @@ impl<T> Drop for Guard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
         arch::irq_restore(self.flags);
+    }
+}
+
+impl<T> Guard<'_, T> {
+    /// # Safety
+    /// IRQs must already be masked. The incoming stack must release this exact
+    /// lock before enabling IRQs. No guard or protected borrow may be used again.
+    pub unsafe fn handoff(self) {
+        core::mem::forget(self);
     }
 }

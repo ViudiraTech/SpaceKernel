@@ -50,7 +50,7 @@ fn register_ranges(config: Config) -> Vec<(usize, usize)> {
     ranges
 }
 
-fn pattern(config: Config, salt: u8) -> State {
+pub(crate) fn pattern(config: Config, salt: u8) -> State {
     let mut state = State::new().expect("FPU pattern allocation failed");
     let mut bytes = state.bytes().to_vec();
     for (start, end) in register_ranges(config) {
@@ -87,7 +87,7 @@ fn pattern(config: Config, salt: u8) -> State {
     state
 }
 
-fn assert_registers(config: Config, expected: &State, observed: &State) {
+pub(crate) fn assert_registers(config: Config, expected: &State, observed: &State) {
     for (start, end) in register_ranges(config) {
         assert_eq!(
             &expected.bytes()[start..end],
