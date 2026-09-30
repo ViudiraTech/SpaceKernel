@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/x86_64/interrupts/handlers.rs
+ *       Fault reporting is lock independent and does not allocate
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Fault reporting is lock independent and does not allocate.
 use crate::{arch, printk};
 use x86_64::{

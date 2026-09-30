@@ -1,3 +1,11 @@
+#
+#       Makefile
+#       Multi-architecture build, ISO generation and verification targets
+#
+#       2026/9/30 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
 SHELL := /bin/sh
 
 # A generated .config is authoritative; the checked-in defaults make a fresh
@@ -35,15 +43,15 @@ QEMU := qemu-system-aarch64
 FIRMWARE := /usr/share/AAVMF/AAVMF_CODE.fd
 MACHINE := virt
 QEMU_CPU := -cpu max
-DTB_CMD = $(QEMU) -machine virt,dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb $(QEMU_CPU)
+DTB_CMD = $(QEMU) -machine $(MACHINE),dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb $(QEMU_CPU) -smp $(CPUS) -m $(MEMORY_MIB)
 DTB_LINE = dtb_path: boot():/boot/limine/dtb.dtb
 else ifeq ($(ARCH),riscv64)
-TARGET := riscv64gc-unknown-none-elf
+TARGET := riscv64imac-unknown-none-elf
 EFI := BOOTRISCV64.EFI
 QEMU := qemu-system-riscv64
 FIRMWARE := /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd
 MACHINE := virt
-DTB_CMD = $(QEMU) -machine virt,dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb
+DTB_CMD = $(QEMU) -machine $(MACHINE),dumpdtb=$(ISO_ROOT)/boot/limine/dtb.dtb $(QEMU_CPU) -smp $(CPUS) -m $(MEMORY_MIB)
 DTB_LINE = dtb_path: boot():/boot/limine/dtb.dtb
 else
 $(error Unsupported ARCH=$(ARCH))
@@ -58,10 +66,15 @@ $(error Unsupported PROFILE=$(PROFILE))
 endif
 
 ifeq ($(CONFIG_BOOT_SELF_TEST),y)
-CARGO_FEATURES := --features boot-self-test
+CARGO_FEATURE_LIST := boot-self-test
 else
-CARGO_FEATURES :=
+CARGO_FEATURE_LIST :=
 endif
+
+ifeq ($(CONFIG_RISCV_SV48),y)
+CARGO_FEATURE_LIST += riscv-sv48
+endif
+CARGO_FEATURES = $(foreach feature,$(CARGO_FEATURE_LIST),--features $(feature))
 
 OUT := build/$(ARCH)/$(PROFILE)
 KERNEL := target/$(TARGET)/$(PROFILE)/spacekernel
@@ -127,11 +140,12 @@ debug: iso
 	$(QEMU) $(QEMU_FLAGS) -display gtk -S -s -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -cdrom $(ISO)
 
 test: iso
-	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB)
+	python3 tools/check_no_simd.py $(ARCH) $(KERNEL)
+	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'CPU/FPU self-test passed' --require 'PMM/VMM/SLAB/TTY/IRQ/FDT self-test passed',)
 
 check:
 	cargo fmt --all -- --check
-	@for target in x86_64-unknown-none aarch64-unknown-none-softfloat riscv64gc-unknown-none-elf; do \
+	@for target in x86_64-unknown-none aarch64-unknown-none-softfloat riscv64imac-unknown-none-elf; do \
 	  rustup target add $$target && cargo check --target $$target --all-features || exit 1; \
 	done
 

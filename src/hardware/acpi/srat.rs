@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/hardware/acpi/srat.rs
+ *       System resource affinity ACPI descriptors
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use super::{
     AcpiError,
     sdt::{Table, le_u32, le_u64},

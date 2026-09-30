@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/hardware/acpi/mod.rs
+ *       ACPI table discovery and validated views
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! ACPI table discovery and validated hardware-description views.
 
 mod fadt;
@@ -8,7 +18,9 @@ mod sdt;
 mod srat;
 
 pub use fadt::Fadt;
-pub use madt::{Madt, MadtEntry};
+pub use madt::Madt;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub use madt::MadtEntry;
 pub use mcfg::{Mcfg, PciSegment};
 pub use sdt::Table;
 pub use srat::Srat;
@@ -45,7 +57,7 @@ impl Acpi {
         {
             return Err(AcpiError::Signature);
         }
-        if (root.bytes().len() - HEADER_SIZE) % rsdp.entry_size != 0 {
+        if !(root.bytes().len() - HEADER_SIZE).is_multiple_of(rsdp.entry_size) {
             return Err(AcpiError::Length);
         }
         Ok(Self {

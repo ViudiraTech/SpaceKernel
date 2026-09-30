@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/time.rs
+ *       Counter frequency discovery and kernel uptime
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{arch, boot};
@@ -7,6 +17,7 @@ static ORIGIN: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
     let frequency = boot::counter_frequency()
+        .or_else(|| crate::cpuid::info().and_then(|cpu| cpu.counter_hz))
         .filter(|value| *value != 0)
         .unwrap_or(0);
     ORIGIN.store(arch::counter(), Ordering::Release);

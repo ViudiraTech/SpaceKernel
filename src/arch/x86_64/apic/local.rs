@@ -1,8 +1,18 @@
+/*
+ *
+ *       src/arch/x86_64/apic/local.rs
+ *       Local APIC register access, initialization and interprocessor interrupts
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Local APIC register access, initialization and interprocessor interrupts.
 
 use crate::{irq::IrqError, mm::vmm};
 use core::{
-    arch::{asm, x86_64::__cpuid},
+    arch::asm,
     sync::atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
@@ -79,11 +89,10 @@ pub fn is_x2apic() -> bool {
 }
 
 pub fn init_bsp(address: u64) -> Result<u32, IrqError> {
-    let caps = __cpuid(1);
-    if caps.edx & (1 << 9) == 0 {
+    if !crate::cpuid::has(crate::cpuid::Feature::Apic) {
         return Err(IrqError::Unsupported);
     }
-    let x2 = caps.ecx & (1 << 21) != 0;
+    let x2 = crate::cpuid::has(crate::cpuid::Feature::X2apic);
     let mut base = rdmsr(APIC_BASE_MSR);
     if base & X2APIC_ENABLE != 0 && !x2 {
         return Err(IrqError::Unsupported);
@@ -236,7 +245,7 @@ pub fn timer_current() -> u32 {
     read(0x390)
 }
 pub fn tsc_deadline_supported() -> bool {
-    __cpuid(1).ecx & (1 << 24) != 0
+    crate::cpuid::has(crate::cpuid::Feature::TscDeadline)
 }
 pub fn set_tsc_deadline(value: u64) {
     wrmsr(0x6e0, value);

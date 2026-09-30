@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/pci/capability.rs
+ *       Bounded PCI capability-chain enumeration
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use alloc::vec::Vec;
 
 use super::{Address, PciError, config_for};
@@ -44,7 +54,7 @@ pub fn extended(address: Address) -> Result<Vec<ExtendedCapability>, PciError> {
     let mut offset = 0x100u16;
     let mut seen = [false; 1024];
     loop {
-        if offset < 0x100 || offset > 0xffc || offset & 3 != 0 || seen[usize::from(offset / 4)] {
+        if !(0x100..=0xffc).contains(&offset) || offset & 3 != 0 || seen[usize::from(offset / 4)] {
             return Err(PciError::MalformedCapability);
         }
         seen[usize::from(offset / 4)] = true;

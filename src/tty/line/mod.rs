@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/tty/line/mod.rs
+ *       Per-terminal input queues and termios dispatch
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Bounded POSIX-style canonical and raw input processing.
 
 const INPUT_CAPACITY: usize = 4096;

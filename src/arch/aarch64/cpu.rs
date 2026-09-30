@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/aarch64/cpu.rs
+ *       AArch64 interrupt state and architectural counter operations
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use core::arch::asm;
 
 pub fn disable_interrupts() {

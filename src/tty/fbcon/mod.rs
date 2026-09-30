@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/tty/fbcon/mod.rs
+ *       Limine framebuffer console, split by terminal state and rendering
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Limine framebuffer console, split by terminal state and rendering.
 mod ansi;
 mod render;

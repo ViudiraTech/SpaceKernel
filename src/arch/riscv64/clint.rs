@@ -1,23 +1,29 @@
-//! RISC-V Core Local Interruptor (CLINT) and S-mode Timer / IPI driver.
-//!
-//! Provides timer and software interrupt control in Supervisor mode using:
-//! 1. Direct hardware Sstc extension (stimecmp CSR) when available.
-//! 2. Standard SBI Time (0x54494D45) and sPI (0x735049) extensions.
-//! 3. Legacy SBI calls and CLINT MMIO fallback.
+/*
+ *
+ *       src/arch/riscv64/clint.rs
+ *       Supervisor timer and IPI control through the standard and legacy SBI ABIs
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
+//! Supervisor timer and IPI control through the standard and legacy SBI ABIs.
+//! MMIO CLINT and direct Sstc access require platform permission and are not
+//! selected speculatively by this driver.
 
 use crate::{
     arch,
     irq::{self, IrqError},
     time,
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const TIMER_IRQ: u32 = 0;
 pub const IPI_IRQ: u32 = 1;
 
 const DEFAULT_FREQ: u64 = 10_000_000; // 10 MHz default on RISC-V virt
 
-static HAS_SSTC: AtomicBool = AtomicBool::new(false);
 static FREQUENCY: AtomicU64 = AtomicU64::new(DEFAULT_FREQ);
 
 #[inline]
@@ -48,14 +54,19 @@ fn sbi_set_timer(stime: u64) {
     }
 }
 
-fn sbi_send_ipi_mask(hart_mask: usize) {
+fn sbi_send_ipi_mask(hart_mask: usize) -> Result<(), IrqError> {
     let mask = hart_mask;
     // Standard SBI sPI extension (EID 0x735049)
-    let (err, _) = sbi_call(0x7350_49, 0, core::ptr::addr_of!(mask) as usize, 0, 0);
+    // SBI v0.2 passes the mask by value; only the legacy ABI takes a pointer.
+    let (err, _) = sbi_call(0x0073_5049, 0, mask, 0, 0);
     if err != 0 {
         // Fallback to legacy SBI IPI (EID 0x04)
-        let _ = sbi_call(0x04, 0, core::ptr::addr_of!(mask) as usize, 0, 0);
+        let (legacy_error, _) = sbi_call(0x04, 0, core::ptr::addr_of!(mask) as usize, 0, 0);
+        if legacy_error != 0 {
+            return Err(IrqError::Unsupported);
+        }
     }
+    Ok(())
 }
 
 pub fn init_bsp() -> Result<(), IrqError> {
@@ -115,8 +126,7 @@ pub fn send_ipi(hart_id: usize) -> Result<(), IrqError> {
     if hart_id >= usize::BITS as usize {
         return Err(IrqError::Invalid);
     }
-    sbi_send_ipi_mask(1 << hart_id);
-    Ok(())
+    sbi_send_ipi_mask(1 << hart_id)
 }
 
 pub fn handle_timer_irq() {

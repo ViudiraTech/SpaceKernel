@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/x86_64/apic/ioapic.rs
+ *       I/O APIC discovery and serialized redirection table programming
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! I/O APIC discovery and serialized redirection table programming.
 
 use crate::{

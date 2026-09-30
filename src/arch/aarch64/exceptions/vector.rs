@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/aarch64/exceptions/vector.rs
+ *       AArch64 exception entry and interrupt dispatch
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use core::arch::{asm, global_asm};
 
 use crate::{arch, printk};

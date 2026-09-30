@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/self_test.rs
+ *       Boot-time memory, CPU, interrupt and firmware validation
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use alloc::{boxed::Box, vec::Vec};
 
 pub fn run() {
@@ -45,8 +55,10 @@ pub fn run() {
     let mut input = [0; 4];
     assert_eq!(line.read(&mut input), Ok(2));
     assert_eq!(&input[..2], b"a\n");
-    let mut no_echo = tty::Termios::default();
-    no_echo.echo = false;
+    let no_echo = tty::Termios {
+        echo: false,
+        ..tty::Termios::default()
+    };
     tty::set_termios(tty::TtyDevice::Virtual(2), no_echo).expect("TTY termios failed");
     assert_eq!(
         tty::receive(tty::TtyDevice::Virtual(2), b'x'),
@@ -95,11 +107,118 @@ pub fn run() {
     }
 
     test_fdt();
+    crate::pci::self_test();
+    crate::fpu::self_test();
+    test_timer_interrupt();
+
+    // Test rejection before any page tables or device mappings are published.
+    assert_eq!(
+        mm::vmm::map_device_range(u64::MAX, 2),
+        Err(mm::vmm::MapError::OutOfRange)
+    );
+    assert_eq!(
+        mm::vmm::map_device_range(0, 0),
+        Err(mm::vmm::MapError::OutOfRange)
+    );
+    assert_eq!(
+        mm::vmm::map(region, 1, mapped_frame, false),
+        Err(mm::vmm::MapError::OutOfRange)
+    );
+    assert_eq!(
+        mm::vmm::map(region, 0, mapped_frame + 1, false),
+        Err(mm::vmm::MapError::Unaligned)
+    );
+    assert_eq!(
+        mm::vmm::translate(region.base() + 7),
+        Some(mapped_frame + 7)
+    );
+    for (levels, bits) in [(3, 39), (4, 48)] {
+        let geometry = crate::arch::paging::Geometry {
+            levels,
+            virtual_bits: bits,
+            physical_bits: 56,
+        };
+        assert_eq!(geometry.slot_base(256), !((1u64 << (bits - 1)) - 1));
+        assert_eq!(
+            geometry
+                .slot_base(510)
+                .checked_add(geometry.slot_bytes())
+                .unwrap(),
+            geometry.slot_base(511)
+        );
+    }
 
     let sequence = printk::next_sequence();
     kinfo!("PMM/VMM/SLAB/TTY/IRQ/FDT self-test passed");
     let record = printk::read(sequence).expect("printk record missing");
     assert_eq!(record.sequence, sequence);
+}
+
+/// Verify an actual interrupt entry/return while the FP gate is closed. This
+/// catches accidental SIMD use by Rust handlers and missing PPI programming.
+fn test_timer_interrupt() {
+    use crate::arch;
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    use crate::irq;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static HIT: AtomicBool = AtomicBool::new(false);
+    fn handler(_irq: u32) {
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::gic::timer::cancel(); // Deassert the level source before EOI.
+        HIT.store(true, Ordering::Release);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if arch::apic::local_id().is_none() {
+            return;
+        }
+        irq::register(0xf0, handler).unwrap();
+        arch::apic::timer::arm_apic_ticks(10000).unwrap();
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !arch::gic::ready() {
+            return;
+        }
+        arch::gic::request(arch::gic::timer::TIMER_INTID, handler, false).unwrap();
+        arch::gic::timer::arm_after_micros(1000).unwrap();
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        irq::register(arch::clint::TIMER_IRQ, handler).unwrap();
+        arch::clint::arm_after_micros(1000).unwrap();
+    }
+    arch::enable_interrupts();
+    let mut received = false;
+    for _ in 0..10_000_000 {
+        if HIT.load(Ordering::Acquire) {
+            received = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    arch::disable_interrupts();
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch::apic::timer::cancel();
+        irq::unregister(0xf0).unwrap();
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        arch::gic::timer::cancel();
+        arch::gic::release(arch::gic::timer::TIMER_INTID).unwrap();
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        arch::clint::cancel();
+        irq::unregister(arch::clint::TIMER_IRQ).unwrap();
+    }
+    assert!(
+        received,
+        "timer did not reach the architecture interrupt handler"
+    );
+    assert!(!arch::fpu::is_enabled());
+    crate::kinfo!("hardware timer IRQ self-test passed");
 }
 
 struct DtbBuilder {
@@ -126,7 +245,7 @@ impl DtbBuilder {
         self.struct_data.extend_from_slice(&1u32.to_be_bytes()); // FDT_BEGIN_NODE
         self.struct_data.extend_from_slice(name.as_bytes());
         self.struct_data.push(0);
-        while self.struct_data.len() % 4 != 0 {
+        while !self.struct_data.len().is_multiple_of(4) {
             self.struct_data.push(0);
         }
     }
@@ -145,7 +264,7 @@ impl DtbBuilder {
             .extend_from_slice(&(val.len() as u32).to_be_bytes());
         self.struct_data.extend_from_slice(&name_off.to_be_bytes());
         self.struct_data.extend_from_slice(val);
-        while self.struct_data.len() % 4 != 0 {
+        while !self.struct_data.len().is_multiple_of(4) {
             self.struct_data.push(0);
         }
     }

@@ -1,5 +1,18 @@
+/*
+ *
+ *       src/arch/riscv64/exceptions/per_cpu.rs
+ *       RISC-V CPU-local exception state and emergency stack ownership
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use alloc::{boxed::Box, vec::Vec};
-use core::arch::asm;
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{boot, sync::SpinLock};
 
@@ -17,6 +30,12 @@ struct HartState {
     _stack: Box<Stack>,
 }
 
+static POINTERS: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
+
+#[allow(
+    clippy::vec_box,
+    reason = "CPU-local addresses remain pinned independently of Vec movement or growth"
+)]
 static STATES: SpinLock<Vec<Box<HartState>>> = SpinLock::new(Vec::new());
 
 pub fn init_bsp() -> usize {
@@ -45,6 +64,7 @@ pub fn load_cpu(index: usize) {
     let state = states.get(index).expect("unknown hart index");
     let state_ptr = &**state as *const HartState as usize;
     let vector = vector::address();
+    POINTERS[index].store(state_ptr, Ordering::Release);
     // SAFETY: sscratch contains this hart's pinned stack state, while stvec
     // selects the immutable direct-mode trap entry.
     unsafe {
@@ -52,4 +72,20 @@ pub fn load_cpu(index: usize) {
             state = in(reg) state_ptr, vector = in(reg) vector,
             options(nostack, preserves_flags));
     }
+}
+
+/// Resolve the installed hart-local pointer without dereferencing an arbitrary
+/// boot or uninitialized sscratch value.
+pub fn current_cpu_index() -> Option<usize> {
+    let state: usize;
+    // SAFETY: reading sscratch does not require the pointer to be initialized.
+    unsafe {
+        asm!("csrr {}, sscratch", out(reg) state, options(nomem,nostack));
+    }
+    if state == 0 {
+        return None;
+    }
+    POINTERS
+        .iter()
+        .position(|pointer| pointer.load(Ordering::Acquire) == state)
 }

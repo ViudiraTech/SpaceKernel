@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/mod.rs
+ *       Architecture backend selection
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
@@ -13,3 +23,4 @@ pub use aarch64::*;
 mod riscv64;
 #[cfg(target_arch = "riscv64")]
 pub use riscv64::*;
+pub mod paging;

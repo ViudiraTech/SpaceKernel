@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/irq/mod.rs
+ *       Architecture independent synchronous interrupt dispatch
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Architecture independent synchronous interrupt dispatch.
 //!
 //! Controller drivers own routing and acknowledgement. A handler is called with

@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/mm/pmm.rs
+ *       Bitmap physical frame allocator and ownership checks
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sync::SpinLock;
@@ -85,8 +95,15 @@ pub fn init(entries: &[&Entry], hhdm: u64) {
     state.frames = frames;
     for entry in entries.iter().filter(|e| e.type_ == MEMMAP_USABLE) {
         let start = entry.base.max(PAGE_SIZE).div_ceil(PAGE_SIZE) as usize;
-        let end = ((entry.base + entry.length) / PAGE_SIZE) as usize;
+        let end = (entry
+            .base
+            .checked_add(entry.length)
+            .expect("usable RAM span overflow")
+            / PAGE_SIZE) as usize;
         for frame in start..end.min(frames) {
+            if state.bit(state.usable_addr, frame) {
+                continue;
+            }
             state.set_bit(state.usable_addr, frame, true);
             state.set_bit(state.used_addr, frame, false);
             state.free += 1;
@@ -96,6 +113,7 @@ pub fn init(entries: &[&Entry], hhdm: u64) {
         (bitmap_phys / PAGE_SIZE) as usize..((bitmap_phys / PAGE_SIZE) + bitmap_pages) as usize
     {
         state.set_bit(state.used_addr, frame, true);
+        state.set_bit(state.usable_addr, frame, false); // Permanent metadata, never allocatable/freeable.
         state.free -= 1;
     }
     state.hint = (bitmap_phys / PAGE_SIZE + bitmap_pages) as usize;
@@ -130,7 +148,8 @@ pub fn alloc(pages: usize) -> Option<u64> {
         let (start, end) = if pass == 0 {
             (state.hint, state.frames)
         } else {
-            (1, state.hint)
+            // Include runs straddling the hint; it is not an allocation boundary.
+            (1, state.frames)
         };
         let mut run = 0;
         for frame in start..end {
@@ -154,7 +173,7 @@ pub fn alloc(pages: usize) -> Option<u64> {
 }
 
 pub fn free(physical: u64, pages: usize) -> Result<(), &'static str> {
-    if physical % PAGE_SIZE != 0 || pages == 0 {
+    if !physical.is_multiple_of(PAGE_SIZE) || pages == 0 {
         return Err("invalid frame span");
     }
     let first = (physical / PAGE_SIZE) as usize;

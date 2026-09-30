@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/printk/drain.rs
+ *       Ordered console delivery. The ring lock is dropped before each device write
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Ordered console delivery. The ring lock is dropped before each device write.
 
 use super::ring;

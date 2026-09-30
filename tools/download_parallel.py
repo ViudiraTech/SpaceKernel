@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+#
+#       tools/download_parallel.py
+#       Download a pinned release asset with verified HTTP range requests
+#
+#       2026/9/30 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
 """Download a pinned release asset with verified HTTP range requests.
 
 Each worker writes a disjoint range to a temporary file. The final file is

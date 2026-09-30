@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/main.rs
+ *       Kernel entry and subsystem initialization
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
@@ -7,6 +17,8 @@ extern crate alloc;
 
 mod arch;
 mod boot;
+pub mod cpuid;
+pub mod fpu;
 mod hardware;
 pub mod irq;
 mod mm;
@@ -26,6 +38,7 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(target_arch = "x86_64")]
     arch::serial_init(0);
     let info = boot::read();
+    cpuid::init();
     mm::pmm::init(boot::memory_map(), info.hhdm);
     mm::vmm::init();
     #[cfg(not(target_arch = "x86_64"))]
@@ -34,9 +47,26 @@ pub extern "C" fn kmain() -> ! {
         arch::serial_init(uart);
     }
     let prepared_cpus = arch::init_exceptions();
+    fpu::init().expect("extended CPU state initialization failed");
     time::init();
     tty::init();
     kinfo!("SpaceKernel: Limine entry");
+    let cpu = cpuid::info().expect("CPU discovery required");
+    kinfo!(
+        "CPU: {:?} {} {} id={:#x} PA={:?} VA={:?}",
+        cpu.architecture,
+        cpu.vendor.as_str(),
+        cpu.model.as_str(),
+        cpu.hardware_id,
+        cpu.physical_bits,
+        cpu.virtual_bits
+    );
+    kinfo!("FPU: {:?}", fpu::config());
+    kinfo!(
+        "paging: {} levels, {} virtual bits",
+        arch::paging_geometry().levels,
+        arch::paging_geometry().virtual_bits
+    );
     kinfo!("exception state prepared for {} CPUs", prepared_cpus);
     kinfo!("kernel_cmdline: {}", boot::cmdline());
     let console = tty::status();

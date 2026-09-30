@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/sync.rs
+ *       Local IRQ-safe spin locks and guard ownership
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use core::{
     cell::UnsafeCell,
     marker::PhantomData,

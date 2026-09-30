@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/boot.rs
+ *       Validated Limine boot handoff and request declarations
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use limine::{
     BaseRevision, RequestsEndMarker, RequestsStartMarker,
     paging::PagingMode,
@@ -12,7 +22,9 @@ use limine::{
 const MODE: PagingMode = PagingMode::X86_64_4LVL;
 #[cfg(target_arch = "aarch64")]
 const MODE: PagingMode = PagingMode::AARCH64_4LVL;
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(target_arch = "riscv64", not(feature = "riscv-sv48")))]
+const MODE: PagingMode = PagingMode::RISCV_SV39;
+#[cfg(all(target_arch = "riscv64", feature = "riscv-sv48"))]
 const MODE: PagingMode = PagingMode::RISCV_SV48;
 
 #[used]
@@ -66,10 +78,7 @@ pub struct BootInfo {
 
 pub fn read() -> BootInfo {
     assert!(REVISION.is_supported(), "unsupported Limine base revision");
-    assert!(
-        PAGING.response().is_some(),
-        "requested paging mode required"
-    );
+    assert_eq!(PAGING.response().expect("paging mode required").mode, MODE);
     let hhdm = HHDM.response().expect("HHDM required");
     let address = ADDRESS.response().expect("executable address required");
     assert!(MEMMAP.response().is_some(), "memory map required");
@@ -121,6 +130,17 @@ pub fn counter_frequency() -> Option<u64> {
 
 pub fn cpu_count() -> usize {
     MP.response().expect("MP required").cpus().len()
+}
+
+/// Firmware hardware ID for an indexed logical CPU (APIC ID, MPIDR or hart ID).
+pub fn cpu_hardware_id(index: usize) -> Option<u64> {
+    let cpu = *MP.response()?.cpus().get(index)?;
+    #[cfg(target_arch = "x86_64")]
+    return Some(u64::from(cpu.lapic_id));
+    #[cfg(target_arch = "aarch64")]
+    return Some(cpu.mpidr);
+    #[cfg(target_arch = "riscv64")]
+    return Some(cpu.hartid);
 }
 
 pub fn bsp_cpu_index() -> usize {

@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/x86_64/interrupts/mod.rs
+ *       CPU-local descriptor tables and exception routing
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! CPU-local descriptor tables and exception routing.
 mod gdt;
 mod handlers;

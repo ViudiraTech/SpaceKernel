@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/hardware/acpi/sdt.rs
+ *       ACPI system description table bounds and checksum checks
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use crate::{boot, mm::pmm};
 use limine::memmap::{
     MEMMAP_ACPI_NVS, MEMMAP_ACPI_RECLAIMABLE, MEMMAP_BOOTLOADER_RECLAIMABLE, MEMMAP_MAPPED_RESERVED,

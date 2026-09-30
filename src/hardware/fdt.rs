@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/hardware/fdt.rs
+ *       Bounds checked access to the firmware-supplied flattened device tree (FDT / DTB)
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Bounds checked access to the firmware-supplied flattened device tree (FDT / DTB).
 //! Conforms to Devicetree Specification v0.4.
 
@@ -94,8 +104,8 @@ impl<'a> Fdt<'a> {
         let reserve = be32(&bytes[16..20]) as usize;
         let strings_size = be32(&bytes[32..36]) as usize;
         let structure_size = be32(&bytes[36..40]) as usize;
-        if structure % 4 != 0
-            || reserve % 8 != 0
+        if !structure.is_multiple_of(4)
+            || !reserve.is_multiple_of(8)
             || !inside(size, structure, structure_size)
             || !inside(size, strings, strings_size)
             || reserve >= size
@@ -705,10 +715,10 @@ impl<'a> Iterator for StringList<'a> {
             } else {
                 &[]
             };
-            if let Ok(s) = core::str::from_utf8(slice) {
-                if !s.is_empty() {
-                    return Some(s);
-                }
+            if let Ok(s) = core::str::from_utf8(slice)
+                && !s.is_empty()
+            {
+                return Some(s);
             }
         }
         None
@@ -726,6 +736,9 @@ pub struct RegRanges<'a> {
 impl<'a> Iterator for RegRanges<'a> {
     type Item = RegRange;
     fn next(&mut self) -> Option<Self::Item> {
+        if self.address_cells > 3 || self.size_cells > 2 {
+            return None;
+        }
         let entry_len = (self.address_cells + self.size_cells) * 4;
         if entry_len == 0 || self.cursor + entry_len > self.bytes.len() {
             return None;
@@ -751,6 +764,9 @@ pub struct RangeRanges<'a> {
 impl<'a> Iterator for RangeRanges<'a> {
     type Item = BusRange;
     fn next(&mut self) -> Option<Self::Item> {
+        if self.child_address_cells > 3 || self.parent_address_cells > 3 || self.size_cells > 2 {
+            return None;
+        }
         let entry_len =
             (self.child_address_cells + self.parent_address_cells + self.size_cells) * 4;
         if entry_len == 0 || self.cursor + entry_len > self.bytes.len() {

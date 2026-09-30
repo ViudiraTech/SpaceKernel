@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+#
+#       tools/render_limine.py
+#       Render the checked-in Limine template from a Kconfig generated .config
+#
+#       2026/9/30 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
 """Render the checked-in Limine template from a Kconfig generated .config."""
 
 import ast

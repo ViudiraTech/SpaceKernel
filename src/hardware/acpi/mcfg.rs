@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/hardware/acpi/mcfg.rs
+ *       PCI configuration-window ACPI descriptors
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use super::{
     AcpiError,
     sdt::{Table, le_u16, le_u64},
@@ -18,7 +28,7 @@ pub struct PciSegment {
 
 impl Mcfg {
     pub(super) fn new(table: Table) -> Result<Self, AcpiError> {
-        if table.bytes().len() < 44 || (table.bytes().len() - 44) % 16 != 0 {
+        if table.bytes().len() < 44 || !(table.bytes().len() - 44).is_multiple_of(16) {
             return Err(AcpiError::Length);
         }
         let mcfg = Self { table };

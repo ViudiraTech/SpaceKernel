@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/pci/device.rs
+ *       Firmware-assigned PCI resources and device snapshots
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use super::{Address, ConfigSpace, PciError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,7 +87,10 @@ impl DeviceInfo {
                 index += 1;
                 continue;
             }
-            bars[index] = Some(if raw & 1 != 0 {
+            // A 64-bit BAR occupies two slots; retain its low-slot index even
+            // though reading its upper half advances the enumeration cursor.
+            let low_index = index;
+            let bar = if raw & 1 != 0 {
                 Bar::Io { base: raw & !3 }
             } else {
                 let prefetchable = raw & 8 != 0;
@@ -96,7 +109,8 @@ impl DeviceInfo {
                     }
                     _ => Bar::Unsupported { raw },
                 }
-            });
+            };
+            bars[low_index] = Some(bar);
             index += 1;
         }
         Ok(Some(Self {

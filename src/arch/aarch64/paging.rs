@@ -1,6 +1,28 @@
+/*
+ *
+ *       src/arch/aarch64/paging.rs
+ *       AArch64 page-table descriptors, root activation and TLB maintenance
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use core::arch::asm;
 
 const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
+
+pub fn paging_geometry() -> super::super::paging::Geometry {
+    super::super::paging::Geometry {
+        levels: 4,
+        virtual_bits: 48,
+        physical_bits: crate::cpuid::info()
+            .expect("CPU discovery required")
+            .physical_bits
+            .unwrap_or(32)
+            .min(48) as u32,
+    }
+}
 
 pub fn page_root() -> u64 {
     let root: u64;
@@ -18,6 +40,9 @@ pub fn set_page_root(root: u64) {
 
 pub fn pte_present(entry: u64) -> bool {
     entry & 1 != 0
+}
+pub fn pte_is_table(entry: u64, _level: usize) -> bool {
+    entry & 3 == 3
 }
 pub fn pte_phys(entry: u64) -> u64 {
     entry & ADDRESS_MASK
@@ -52,5 +77,19 @@ pub fn flush_page(virtual_address: u64) {
     // SAFETY: required barriers surround invalidation of the new mapping.
     unsafe {
         asm!("dsb ishst", "tlbi vaae1is, {}", "dsb ish", "isb", in(reg) page, options(nostack))
+    }
+}
+
+/// Complete publication of a new descendant table at every cached walk level.
+pub fn flush_table(_virtual_address: u64) {
+    // SAFETY: EL1 context invalidation, ordered after the parent descriptor.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack)
+        )
     }
 }

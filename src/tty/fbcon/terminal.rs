@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/tty/fbcon/terminal.rs
+ *       Character decoding, ANSI CSI processing and ring scrolling
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Character decoding, ANSI CSI processing and ring scrolling.
 use super::{Cell, Escape, FbConsole, HISTORY_ROWS};
 
@@ -141,15 +151,12 @@ impl FbConsole {
             let cell_index = terminal.cell_index(self.rows - 1, column, self.columns);
             terminal.clear_cell(cell_index);
         }
-        if index == self.active {
-            if self.terminals[index].view_offset == 0 {
-                self.scroll_pixels();
-                for column in 0..self.columns {
-                    let terminal = &self.terminals[index];
-                    let cell =
-                        terminal.cells[terminal.cell_index(self.rows - 1, column, self.columns)];
-                    self.draw_cell(column, self.rows - 1, cell);
-                }
+        if index == self.active && self.terminals[index].view_offset == 0 {
+            self.scroll_pixels();
+            for column in 0..self.columns {
+                let terminal = &self.terminals[index];
+                let cell = terminal.cells[terminal.cell_index(self.rows - 1, column, self.columns)];
+                self.draw_cell(column, self.rows - 1, cell);
             }
         }
     }

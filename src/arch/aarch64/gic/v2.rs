@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/aarch64/gic/v2.rs
+ *       ARM Generic Interrupt Controller v2 (GICv2) driver
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! ARM Generic Interrupt Controller v2 (GICv2) driver.
 
 use super::{read32, write32};

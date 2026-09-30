@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/mm/slab/large.rs
+ *       Direct PMM backing for allocations larger than a slab slot
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Direct PMM backing for allocations larger than a slab slot.
 
 use super::align_up;

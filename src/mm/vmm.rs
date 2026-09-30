@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/mm/vmm.rs
+ *       Geometry-aware kernel virtual reservations and page mappings
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
@@ -7,7 +17,6 @@ use crate::{
 };
 
 const ENTRIES_PER_TABLE: usize = 512;
-const SLOT_BYTES: u64 = 1 << 39;
 static READY: AtomicBool = AtomicBool::new(false);
 static VMM: SpinLock<State> = SpinLock::new(State::empty());
 
@@ -16,6 +25,7 @@ struct State {
     base: u64,
     next: u64,
     limit: u64,
+    geometry: arch::paging::Geometry,
 }
 
 impl State {
@@ -25,11 +35,16 @@ impl State {
             base: 0,
             next: 0,
             limit: 0,
+            geometry: arch::paging::Geometry {
+                levels: 4,
+                virtual_bits: 48,
+                physical_bits: 48,
+            },
         }
     }
 }
 
-/// An exclusively reserved subrange of the kernel's 512 GiB mapping slot.
+/// An exclusively reserved subrange of an architecture-sized kernel slot.
 /// Each page can be populated once. Keeping the mapping monotonic avoids
 /// cross-CPU TLB invalidation until an IPI shootdown implementation exists.
 #[derive(Clone, Copy)]
@@ -54,11 +69,14 @@ pub enum MapError {
     OutOfRange,
     AlreadyMapped,
     Unaligned,
+    InvalidPhysicalAddress,
+    MalformedTable,
 }
 
 pub fn init() {
     let mut state = VMM.lock();
     assert_eq!(state.root, 0, "VMM initialized twice");
+    let geometry = arch::paging_geometry();
     let boot_root = arch::page_root();
     let root = pmm::alloc(1).expect("root page table allocation failed");
     let source = pmm::phys_to_virt(boot_root) as *const u64;
@@ -72,13 +90,18 @@ pub fn init() {
             unsafe { target.add(index).read_volatile() == 0 }
         })
         .expect("no free kernel virtual slot");
-    let base = 0xffff_0000_0000_0000u64 | ((slot as u64) << 39);
+    let base = geometry.slot_base(slot);
+    state.geometry = geometry;
     state.root = root;
     state.base = base;
     state.next = base;
-    state.limit = base + SLOT_BYTES;
+    state.limit = base
+        .checked_add(geometry.slot_bytes())
+        .expect("virtual slot overflow");
     #[cfg(target_arch = "aarch64")]
     arch::setup_device_memory();
+    #[cfg(target_arch = "x86_64")]
+    arch::setup_memory_protection();
     arch::set_page_root(root);
     READY.store(true, Ordering::Release);
 }
@@ -114,7 +137,7 @@ pub fn map(region: Region, index: usize, physical: u64, device: bool) -> Result<
     if index >= region.pages {
         return Err(MapError::OutOfRange);
     }
-    if physical % PAGE_SIZE != 0 {
+    if !physical.is_multiple_of(PAGE_SIZE) {
         return Err(MapError::Unaligned);
     }
     let virtual_address = region.base + index as u64 * PAGE_SIZE;
@@ -125,31 +148,61 @@ pub fn map(region: Region, index: usize, physical: u64, device: bool) -> Result<
     if virtual_address < state.base || virtual_address >= state.next {
         return Err(MapError::OutOfRange);
     }
+    if !state.geometry.valid_physical(physical) {
+        return Err(MapError::InvalidPhysicalAddress);
+    }
     let mut table = state.root;
-    for level in (1..=3).rev() {
+    // Build missing descendants privately, then publish a single link only
+    // after every allocation succeeds. OOM leaves no visible partial mapping.
+    for level in (1..state.geometry.levels).rev() {
         let entry = entry_ptr(table, virtual_address, level);
-        // SAFETY: lock serializes writes; table is mapped through the HHDM.
+        // SAFETY: VMM owns this hierarchy and its lock excludes PTE writers.
         let value = unsafe { entry.read_volatile() };
-        table = if arch::pte_present(value) {
-            arch::pte_phys(value)
-        } else {
-            let new_table = pmm::alloc(1).ok_or(MapError::OutOfMemory)?;
-            // SAFETY: the new frame is exclusively owned by the page table.
-            unsafe {
-                core::ptr::write_bytes(
-                    pmm::phys_to_virt(new_table) as *mut u8,
-                    0,
-                    PAGE_SIZE as usize,
-                )
+        if arch::pte_present(value) {
+            if !arch::pte_is_table(value, level) {
+                return Err(MapError::MalformedTable);
             }
-            unsafe { entry.write_volatile(arch::pte_table(new_table)) }
-            new_table
+            table = arch::pte_phys(value);
+            continue;
+        }
+        let mut frames = [0u64; 3];
+        for i in 0..level {
+            let Some(frame) = pmm::alloc(1) else {
+                for &allocated in &frames[..i] {
+                    pmm::free(allocated, 1).expect("page table rollback failed");
+                }
+                return Err(MapError::OutOfMemory);
+            };
+            frames[i] = frame;
+            // SAFETY: the frame is private until the parent link is published.
+            unsafe {
+                core::ptr::write_bytes(pmm::phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE as usize)
+            };
+        }
+        for i in 0..level - 1 {
+            // SAFETY: link private, initialized descendant tables.
+            unsafe {
+                entry_ptr(frames[i], virtual_address, level - i - 1)
+                    .write_volatile(arch::pte_table(frames[i + 1]))
+            };
+        }
+        // SAFETY: the leaf is in a fresh, exclusively owned table.
+        unsafe {
+            entry_ptr(frames[level - 1], virtual_address, 0)
+                .write_volatile(arch::pte_leaf(physical, device))
         };
+        core::sync::atomic::fence(Ordering::Release);
+        // SAFETY: publish the completed hierarchy while holding the VMM lock.
+        unsafe { entry.write_volatile(arch::pte_table(frames[0])) };
+        arch::flush_table(virtual_address);
+        return Ok(());
     }
     let leaf = entry_ptr(table, virtual_address, 0);
+    // SAFETY: the existing leaf table is protected by the VMM lock.
     if arch::pte_present(unsafe { leaf.read_volatile() }) {
         return Err(MapError::AlreadyMapped);
     }
+    // SAFETY: exclusively publish this newly populated page.
     unsafe { leaf.write_volatile(arch::pte_leaf(physical, device)) }
     arch::flush_page(virtual_address);
     Ok(())
@@ -161,9 +214,9 @@ pub fn translate(virtual_address: u64) -> Option<u64> {
         return None;
     }
     let mut table = state.root;
-    for level in (1..=3).rev() {
+    for level in (1..state.geometry.levels).rev() {
         let value = unsafe { entry_ptr(table, virtual_address, level).read_volatile() };
-        if !arch::pte_present(value) {
+        if !arch::pte_is_table(value, level) {
             return None;
         }
         table = arch::pte_phys(value);
@@ -173,6 +226,9 @@ pub fn translate(virtual_address: u64) -> Option<u64> {
 }
 
 pub fn map_device_page(physical: u64) -> Result<u64, MapError> {
+    if !arch::paging_geometry().valid_physical(physical) {
+        return Err(MapError::InvalidPhysicalAddress);
+    }
     let region = reserve(1)?;
     map(region, 0, physical & !(PAGE_SIZE - 1), true)?;
     Ok(region.base + physical % PAGE_SIZE)
@@ -184,7 +240,16 @@ pub fn map_device_range(physical: u64, length: usize) -> Result<u64, MapError> {
     }
     let offset = physical % PAGE_SIZE;
     let base_phys = physical & !(PAGE_SIZE - 1);
-    let pages = ((length as u64 + offset + (PAGE_SIZE - 1)) / PAGE_SIZE) as usize;
+    let end = physical
+        .checked_add(length as u64 - 1)
+        .ok_or(MapError::OutOfRange)?;
+    if !arch::paging_geometry().valid_physical(end) {
+        return Err(MapError::InvalidPhysicalAddress);
+    }
+    let span = (length as u64)
+        .checked_add(offset)
+        .ok_or(MapError::OutOfRange)?;
+    let pages = span.div_ceil(PAGE_SIZE) as usize;
     let region = reserve(pages)?;
     for i in 0..pages {
         map(region, i, base_phys + (i as u64 * PAGE_SIZE), true)?;

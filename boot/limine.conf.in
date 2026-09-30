@@ -1,3 +1,11 @@
+#
+#       boot/limine.conf.in
+#       Limine boot configuration template
+#
+#       2026/9/30 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
 timeout: 0
 
 /SpaceKernel

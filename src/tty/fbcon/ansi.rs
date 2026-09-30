@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/tty/fbcon/ansi.rs
+ *       ANSI CSI cursor movement, erase operations and color attributes
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! ANSI CSI cursor movement, erase operations and color attributes.
 
 use super::{DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, FbConsole, PALETTE};

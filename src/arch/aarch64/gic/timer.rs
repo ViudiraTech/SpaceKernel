@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/aarch64/gic/timer.rs
+ *       ARM Generic Timer using the Virtual Timer (CNTV, PPI 27)
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! ARM Generic Timer using the Virtual Timer (CNTV, PPI 27).
 
 use crate::{irq::IrqError, time};

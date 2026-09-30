@@ -1,113 +1,134 @@
+/*
+ *
+ *       src/arch/riscv64/plic.rs
+ *       Platform-Level Interrupt Controller (PLIC) driver for RISC-V
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Platform-Level Interrupt Controller (PLIC) driver for RISC-V.
 
 use crate::{
     boot,
-    hardware::{
-        acpi::{Acpi, MadtEntry},
-        fdt::Fdt,
-    },
+    hardware::fdt::Fdt,
     irq::{self, Handler, IrqError},
     mm::vmm,
     sync::SpinLock,
 };
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const DEFAULT_PLIC_PHYS: u64 = 0x0c00_0000;
-const DEFAULT_PLIC_SIZE: usize = 0x0040_0000;
 const MAX_SOURCES: usize = 1024;
-
-const PRIORITY_OFFSET: usize = 0x000000;
-const PENDING_OFFSET: usize = 0x001000;
 const ENABLE_OFFSET: usize = 0x002000;
 const THRESHOLD_OFFSET: usize = 0x200000;
 const CLAIM_OFFSET: usize = 0x200004;
+const NO_CONTEXT: usize = usize::MAX;
 
 static PLIC_BASE: AtomicUsize = AtomicUsize::new(0);
+static PLIC_SIZE: AtomicUsize = AtomicUsize::new(0);
+static SOURCE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static CONTEXTS: [AtomicUsize; 256] = [const { AtomicUsize::new(NO_CONTEXT) }; 256];
 static PLIC_LOCK: SpinLock<()> = SpinLock::new(());
 
 fn read32(offset: usize) -> u32 {
-    let base = PLIC_BASE.load(Ordering::Relaxed);
-    // SAFETY: callers supply mapped PLIC register offsets.
-    unsafe { ((base + offset) as *const u32).read_volatile() }
+    // SAFETY: all call sites validate the source/context within the mapped bank.
+    unsafe { ((PLIC_BASE.load(Ordering::Acquire) + offset) as *const u32).read_volatile() }
 }
-
 fn write32(offset: usize, value: u32) {
-    let base = PLIC_BASE.load(Ordering::Relaxed);
-    // SAFETY: callers supply mapped PLIC register offsets.
-    unsafe { ((base + offset) as *mut u32).write_volatile(value) }
+    // SAFETY: all call sites validate the source/context within the mapped bank.
+    unsafe { ((PLIC_BASE.load(Ordering::Acquire) + offset) as *mut u32).write_volatile(value) }
 }
 
-fn discover_from_acpi() -> Option<(u64, usize)> {
-    let rsdp = boot::rsdp_address()?;
-    let acpi = Acpi::from_rsdp(rsdp).ok()?;
-    let madt = acpi.madt().ok()??;
-    for entry in madt.entries().filter_map(Result::ok) {
-        if let MadtEntry::Plic { address, size, .. } = entry {
-            if address != 0 {
-                return Some((address, size as usize));
+fn valid_context(context: usize, length: usize) -> bool {
+    context
+        .checked_mul(0x1000)
+        .and_then(|n| CLAIM_OFFSET.checked_add(n))
+        .and_then(|n| n.checked_add(4))
+        .is_some_and(|end| end <= length)
+        && context
+            .checked_mul(0x80)
+            .and_then(|n| ENABLE_OFFSET.checked_add(n))
+            .and_then(|n| n.checked_add(0x80))
+            .is_some_and(|end| end <= length)
+}
+
+/// Discover context indices from interrupts-extended, which need not follow
+/// 2*hart+1 and may contain noncontiguous hart IDs or reordered CPU nodes.
+pub fn init_bsp() -> Result<(), IrqError> {
+    if ready() {
+        return Err(IrqError::InUse);
+    }
+    let tree = boot::dtb_address()
+        .and_then(|addr| Fdt::from_boot_address(addr).ok())
+        .ok_or(IrqError::NoController)?;
+    let node = tree
+        .find_compatible("riscv,plic0")
+        .or_else(|| tree.find_compatible("sifive,plic-1.0.0"))
+        .ok_or(IrqError::NoController)?;
+    let reg = node
+        .reg()
+        .and_then(|mut regs| regs.next())
+        .ok_or(IrqError::Invalid)?;
+    let sources = node.cell("riscv,ndev").ok_or(IrqError::Invalid)? as usize;
+    if sources == 0 || sources >= MAX_SOURCES || reg.address & 0xfff != 0 {
+        return Err(IrqError::Invalid);
+    }
+    let extended = node
+        .property("interrupts-extended")
+        .ok_or(IrqError::Unsupported)?;
+    if extended.value.len() % 8 != 0 {
+        return Err(IrqError::Invalid);
+    }
+    let mut contexts = [NO_CONTEXT; 256];
+    for (index, context) in contexts.iter_mut().enumerate().take(boot::cpu_count()) {
+        let hart = boot::cpu_hardware_id(index).ok_or(IrqError::Invalid)?;
+        let cpu = tree
+            .cpus()
+            .find(|cpu| {
+                cpu.reg()
+                    .and_then(|mut regs| regs.next())
+                    .is_some_and(|reg| reg.address == hart)
+            })
+            .ok_or(IrqError::Unsupported)?;
+        let intc = cpu
+            .children()
+            .find(|child| child.is_compatible("riscv,cpu-intc"))
+            .ok_or(IrqError::Unsupported)?;
+        if intc.cell("#interrupt-cells") != Some(1) {
+            return Err(IrqError::Unsupported);
+        }
+        let phandle = intc.phandle().ok_or(IrqError::Invalid)?;
+        for (position, entry) in extended.value.chunks_exact(8).enumerate() {
+            if u32::from_be_bytes(entry[..4].try_into().unwrap()) == phandle
+                && u32::from_be_bytes(entry[4..].try_into().unwrap()) == 9
+            {
+                if *context != NO_CONTEXT || !valid_context(position, reg.size as usize) {
+                    return Err(IrqError::Invalid);
+                }
+                *context = position;
             }
         }
     }
-    None
-}
-
-fn discover_from_fdt() -> Option<(u64, usize)> {
-    let dtb = boot::dtb_address()?;
-    let tree = Fdt::from_boot_address(dtb).ok()?;
-    let node = tree
-        .find_compatible("riscv,plic0")
-        .or_else(|| tree.find_compatible("sifive,plic-1.0.0"))?;
-    let mut reg = node.reg()?;
-    let entry = reg.next()?;
-    Some((entry.address, entry.size as usize))
-}
-
-fn discover() -> (u64, usize) {
-    discover_from_acpi()
-        .or_else(discover_from_fdt)
-        .unwrap_or((DEFAULT_PLIC_PHYS, DEFAULT_PLIC_SIZE))
-}
-
-/// S-mode context index for the given hart ID.
-/// In standard RISC-V systems (including QEMU virt), M-mode context is 2*hart,
-/// and S-mode context is 2*hart + 1.
-#[inline]
-pub fn context_for_hart(hart_id: usize) -> usize {
-    hart_id * 2 + 1
-}
-
-pub fn init_bsp() -> Result<(), IrqError> {
-    let (phys, size) = discover();
-    let mapped = vmm::map_device_range(phys, size).map_err(|_| IrqError::Mapping)? as usize;
+    if contexts[boot::bsp_cpu_index()] == NO_CONTEXT {
+        return Err(IrqError::Unsupported);
+    }
+    let mapped = vmm::map_device_range(reg.address, reg.size as usize)
+        .map_err(|_| IrqError::Mapping)? as usize;
+    PLIC_SIZE.store(reg.size as usize, Ordering::Relaxed);
+    SOURCE_COUNT.store(sources + 1, Ordering::Relaxed);
+    for (to, value) in CONTEXTS.iter().zip(contexts) {
+        to.store(value, Ordering::Relaxed);
+    }
     PLIC_BASE.store(mapped, Ordering::Release);
-
-    let bsp_context = context_for_hart(0);
-
-    // Disable all interrupt sources in BSP context
-    for word in 0..(MAX_SOURCES / 32) {
-        let enable_offset = ENABLE_OFFSET + 0x80 * bsp_context + word * 4;
-        write32(enable_offset, 0);
+    for source in 1..=sources {
+        write32(source * 4, 0);
     }
-
-    // Set priority threshold for BSP context to 0 (accept all priority > 0)
-    let threshold_offset = THRESHOLD_OFFSET + 0x1000 * bsp_context;
-    write32(threshold_offset, 0);
-
-    // Clear all source priorities
-    for source in 1..MAX_SOURCES {
-        write32(PRIORITY_OFFSET + source * 4, 0);
-    }
-
-    // Enable Supervisor External Interrupts (SEIE = bit 9) in sie CSR
-    // SAFETY: modifying supervisor interrupt enable CSR.
-    unsafe {
-        core::arch::asm!("csrs sie, {mask}", mask = in(reg) (1usize << 9), options(nomem, nostack));
-    }
-
+    init_cpu(boot::cpu_hardware_id(boot::bsp_cpu_index()).ok_or(IrqError::Invalid)? as usize)?;
     crate::kinfo!(
         "PLIC: initialized at phys {:#x}, context={}",
-        phys,
-        bsp_context
+        reg.address,
+        current_context()?
     );
     Ok(())
 }
@@ -116,110 +137,123 @@ pub fn ready() -> bool {
     PLIC_BASE.load(Ordering::Acquire) != 0
 }
 
-pub fn init_cpu(hart_id: usize) -> Result<(), IrqError> {
+pub fn context_for_hart(hart_id: usize) -> Option<usize> {
+    if !ready() {
+        return None;
+    }
+    let index =
+        (0..boot::cpu_count()).find(|&i| boot::cpu_hardware_id(i) == Some(hart_id as u64))?;
+    let context = CONTEXTS[index].load(Ordering::Relaxed);
+    (context != NO_CONTEXT).then_some(context)
+}
+
+fn current_context() -> Result<usize, IrqError> {
     if !ready() {
         return Err(IrqError::NoController);
     }
-    let context = context_for_hart(hart_id);
-
-    // Disable all interrupt sources for this context
-    for word in 0..(MAX_SOURCES / 32) {
-        let enable_offset = ENABLE_OFFSET + 0x80 * context + word * 4;
-        write32(enable_offset, 0);
+    let context = CONTEXTS[super::current_cpu_index().ok_or(IrqError::NotRegistered)?]
+        .load(Ordering::Relaxed);
+    if context == NO_CONTEXT {
+        return Err(IrqError::Unsupported);
     }
+    Ok(context)
+}
 
-    // Threshold = 0
-    let threshold_offset = THRESHOLD_OFFSET + 0x1000 * context;
-    write32(threshold_offset, 0);
-
-    // Enable SEIE on this hart
-    // SAFETY: modifying supervisor interrupt enable CSR.
+pub fn init_cpu(hart_id: usize) -> Result<(), IrqError> {
+    let context = context_for_hart(hart_id).ok_or(IrqError::Unsupported)?;
+    for word in 0..SOURCE_COUNT.load(Ordering::Relaxed).div_ceil(32) {
+        write32(ENABLE_OFFSET + 0x80 * context + word * 4, 0);
+    }
+    set_threshold(context, 0)?;
+    // SAFETY: configure supervisor external interrupt delivery on this hart.
     unsafe {
-        core::arch::asm!("csrs sie, {mask}", mask = in(reg) (1usize << 9), options(nomem, nostack));
+        core::arch::asm!("csrs sie, {}", in(reg) 1usize << 9, options(nomem,nostack));
     }
-
     Ok(())
 }
 
-pub fn set_priority(source: u32, priority: u32) {
-    if (1..MAX_SOURCES as u32).contains(&source) {
-        write32(PRIORITY_OFFSET + (source as usize) * 4, priority);
-    }
-}
-
-pub fn set_threshold(context: usize, threshold: u32) {
-    write32(THRESHOLD_OFFSET + 0x1000 * context, threshold);
-}
-
-pub fn set_mask(source: u32, masked: bool) -> Result<(), IrqError> {
+pub fn set_priority(source: u32, priority: u32) -> Result<(), IrqError> {
     if !ready() {
         return Err(IrqError::NoController);
     }
-    if source == 0 || source >= MAX_SOURCES as u32 {
+    if source == 0 || source as usize >= SOURCE_COUNT.load(Ordering::Relaxed) {
         return Err(IrqError::Invalid);
     }
+    write32(source as usize * 4, priority);
+    Ok(())
+}
 
-    let context = context_for_hart(0);
-    let offset = ENABLE_OFFSET + 0x80 * context + (source as usize / 32) * 4;
-    let bit = 1 << (source % 32);
-
-    let _guard = PLIC_LOCK.lock();
-    let mut current = read32(offset);
-    if masked {
-        current &= !bit;
-    } else {
-        current |= bit;
+pub fn set_threshold(context: usize, threshold: u32) -> Result<(), IrqError> {
+    if !ready() {
+        return Err(IrqError::NoController);
     }
-    write32(offset, current);
+    if !valid_context(context, PLIC_SIZE.load(Ordering::Relaxed)) {
+        return Err(IrqError::Invalid);
+    }
+    write32(THRESHOLD_OFFSET + 0x1000 * context, threshold);
+    Ok(())
+}
 
+pub fn set_mask(source: u32, masked: bool) -> Result<(), IrqError> {
+    let context = current_context()?;
+    if source == 0 || source as usize >= SOURCE_COUNT.load(Ordering::Relaxed) {
+        return Err(IrqError::Invalid);
+    }
+    let offset = ENABLE_OFFSET + 0x80 * context + source as usize / 32 * 4;
+    let bit = 1 << (source % 32);
+    let _guard = PLIC_LOCK.lock();
+    let old = read32(offset);
+    write32(offset, if masked { old & !bit } else { old | bit });
     Ok(())
 }
 
 pub fn request(source: u32, handler: Handler) -> Result<(), IrqError> {
-    if !ready() {
-        return Err(IrqError::NoController);
-    }
-    if source == 0 || source >= MAX_SOURCES as u32 {
+    let _ = current_context()?;
+    if source == 0 || source as usize >= SOURCE_COUNT.load(Ordering::Relaxed) {
         return Err(IrqError::Invalid);
     }
-
     irq::register(source, handler)?;
-
-    // Set priority = 1 (active)
-    set_priority(source, 1);
-
-    // Unmask in PLIC
-    if let Err(e) = set_mask(source, false) {
+    set_priority(source, 1)?;
+    if let Err(error) = set_mask(source, false) {
         let _ = irq::unregister(source);
-        return Err(e);
+        return Err(error);
     }
-
     Ok(())
 }
 
 pub fn release(source: u32) -> Result<(), IrqError> {
     set_mask(source, true)?;
-    set_priority(source, 0);
+    set_priority(source, 0)?;
     irq::unregister(source)
 }
 
 pub fn claim(context: usize) -> u32 {
+    if !ready() || !valid_context(context, PLIC_SIZE.load(Ordering::Relaxed)) {
+        return 0;
+    }
     read32(CLAIM_OFFSET + 0x1000 * context)
 }
-
 pub fn complete(context: usize, source: u32) {
-    write32(CLAIM_OFFSET + 0x1000 * context, source);
+    if ready()
+        && valid_context(context, PLIC_SIZE.load(Ordering::Relaxed))
+        && source != 0
+        && (source as usize) < SOURCE_COUNT.load(Ordering::Relaxed)
+    {
+        write32(CLAIM_OFFSET + 0x1000 * context, source);
+    }
 }
 
-/// Dispatches all pending interrupts for the BSP context.
 pub fn handle_irq() {
-    if !ready() {
+    let Ok(context) = current_context() else {
         return;
-    }
-    let context = context_for_hart(0);
-    loop {
+    };
+    // Bound draining so a permanently asserted device cannot starve the CPU.
+    for _ in 0..MAX_SOURCES {
         let source = claim(context);
         if source == 0 {
+            break;
+        }
+        if source as usize >= SOURCE_COUNT.load(Ordering::Relaxed) {
             break;
         }
         irq::dispatch(source);

@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/riscv64/cpu.rs
+ *       RISC-V interrupt state and architectural counter operations
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use core::arch::asm;
 
 pub fn disable_interrupts() {

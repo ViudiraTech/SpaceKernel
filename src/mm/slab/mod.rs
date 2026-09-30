@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/mm/slab/mod.rs
+ *       Kernel global allocator and slab class dispatch
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Size class slabs and contiguous large allocations.
 
 mod class;

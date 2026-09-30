@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/pci/address.rs
+ *       Validated PCI segment, bus, device and function addresses
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use core::fmt;
 
 use super::PciError;

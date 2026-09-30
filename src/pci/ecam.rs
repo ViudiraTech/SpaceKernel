@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/pci/ecam.rs
+ *       Firmware-advertised ECAM windows and per-bus ownership
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use alloc::boxed::Box;
 
 use crate::{boot, hardware::acpi::PciSegment, mm::vmm, sync::SpinLock};
@@ -23,7 +33,9 @@ pub(super) struct EcamWindow {
 
 impl EcamWindow {
     pub fn new(segment: PciSegment) -> Result<Self, PciError> {
-        if segment.base == 0 || segment.base % BUS_SIZE != 0 || segment.start_bus > segment.end_bus
+        if segment.base == 0
+            || !segment.base.is_multiple_of(BUS_SIZE)
+            || segment.start_bus > segment.end_bus
         {
             return Err(PciError::MalformedWindow);
         }

@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/mm/slab/class.rs
+ *       Per-class page lists and slot accounting
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Per-class page lists and slot accounting.
 
 use super::align_up;

@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/printk/ring.rs
+ *       Bounded allocation-free log storage. Device I/O never runs under this lock
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Bounded allocation-free log storage. Device I/O never runs under this lock.
 
 use super::{Level, drain};

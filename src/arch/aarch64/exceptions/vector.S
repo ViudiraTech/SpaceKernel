@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/aarch64/exceptions/vector.S
+ *       AArch64 integer-register exception and interrupt vectors
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
     .section .text.spacekernel_vectors, "ax"
     .balign 2048
     .global __spacekernel_aarch64_vectors

@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/riscv64/exceptions/vector.S
+ *       RISC-V integer-register exception and interrupt vectors
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
     .section .text.spacekernel_traps, "ax"
     .balign 4
     .global __spacekernel_riscv64_trap

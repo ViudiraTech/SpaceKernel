@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/pci/enumerate.rs
+ *       PCI function and configured bridge discovery
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use alloc::{
     collections::{BTreeSet, VecDeque},
     vec::Vec,

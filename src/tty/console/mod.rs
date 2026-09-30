@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/tty/console/mod.rs
+ *       Kernel console selection and device ownership
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Kernel console selection and synchronized output routing.
 
 mod device;

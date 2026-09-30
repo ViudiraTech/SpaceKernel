@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/pci/mod.rs
+ *       PCIe configuration and firmware-topology discovery, independent of CPU ISA
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! PCIe configuration and firmware-topology discovery, independent of CPU ISA.
 
 mod address;
@@ -62,6 +72,7 @@ impl PciCore {
     fn from_mcfg(mcfg: Mcfg) -> Result<Self, PciError> {
         let mut windows: Vec<EcamWindow> = Vec::new();
         for segment in mcfg.segments() {
+            let segment = mcfg_bus_window(segment)?;
             for existing in &windows {
                 let other = existing.segment();
                 if segment.group == other.group
@@ -96,16 +107,30 @@ impl PciCore {
             .and_then(|mut r| r.next())
             .ok_or(PciError::MalformedWindow)?;
         let (start_bus, end_bus) = if let Some(bus_range) = node.property("bus-range") {
-            if bus_range.value.len() >= 8 {
-                let start = u32::from_be_bytes(bus_range.value[0..4].try_into().unwrap()) as u8;
-                let end = u32::from_be_bytes(bus_range.value[4..8].try_into().unwrap()) as u8;
+            if bus_range.value.len() == 8 {
+                let start = u8::try_from(u32::from_be_bytes(
+                    bus_range.value[0..4].try_into().unwrap(),
+                ))
+                .map_err(|_| PciError::MalformedWindow)?;
+                let end = u8::try_from(u32::from_be_bytes(
+                    bus_range.value[4..8].try_into().unwrap(),
+                ))
+                .map_err(|_| PciError::MalformedWindow)?;
                 (start, end)
             } else {
-                (0, 255)
+                return Err(PciError::MalformedWindow);
             }
         } else {
             (0, 255)
         };
+        let buses = u64::from(
+            end_bus
+                .checked_sub(start_bus)
+                .ok_or(PciError::MalformedWindow)?,
+        ) + 1;
+        if reg.size < buses * (1 << 20) {
+            return Err(PciError::MalformedWindow);
+        }
         let segment = PciSegment {
             base: reg.address,
             group: 0,
@@ -130,6 +155,36 @@ impl PciCore {
     }
 }
 
+/// MCFG bases always describe bus zero. Our common ECAM window (also used for
+/// DT reg ranges) starts at the first advertised bus, so normalize exactly once.
+fn mcfg_bus_window(mut segment: PciSegment) -> Result<PciSegment, PciError> {
+    segment.base = segment
+        .base
+        .checked_add(u64::from(segment.start_bus) << 20)
+        .ok_or(PciError::MalformedWindow)?;
+    Ok(segment)
+}
+
+#[cfg(feature = "boot-self-test")]
+pub(crate) fn self_test() {
+    let descriptor = PciSegment {
+        base: 0x8000_0000,
+        group: 1,
+        start_bus: 64,
+        end_bus: 127,
+    };
+    let window = mcfg_bus_window(descriptor).unwrap();
+    assert_eq!(window.base, 0x8400_0000);
+    assert_eq!(ecam_end(window), Some(0x8800_0000));
+    assert_eq!(
+        mcfg_bus_window(PciSegment {
+            base: !((1u64 << 20) - 1),
+            ..descriptor
+        }),
+        Err(PciError::MalformedWindow)
+    );
+}
+
 fn ecam_end(segment: PciSegment) -> Option<u64> {
     let buses = u64::from(segment.end_bus.checked_sub(segment.start_bus)?) + 1;
     segment.base.checked_add(buses.checked_mul(1 << 20)?)
@@ -146,21 +201,18 @@ fn core() -> Option<&'static PciCore> {
 }
 
 fn discover_core() -> Result<PciCore, PciError> {
-    if let Some(rsdp) = boot::rsdp_address() {
-        if let Ok(acpi) = Acpi::from_rsdp(rsdp) {
-            if let Ok(Some(mcfg)) = acpi.mcfg() {
-                if let Ok(core) = PciCore::from_mcfg(mcfg) {
-                    return Ok(core);
-                }
-            }
-        }
+    if let Some(rsdp) = boot::rsdp_address()
+        && let Ok(acpi) = Acpi::from_rsdp(rsdp)
+        && let Ok(Some(mcfg)) = acpi.mcfg()
+        && let Ok(core) = PciCore::from_mcfg(mcfg)
+    {
+        return Ok(core);
     }
-    if let Some(dtb) = boot::dtb_address() {
-        if let Ok(fdt) = Fdt::from_boot_address(dtb) {
-            if let Ok(core) = PciCore::from_fdt(fdt) {
-                return Ok(core);
-            }
-        }
+    if let Some(dtb) = boot::dtb_address()
+        && let Ok(fdt) = Fdt::from_boot_address(dtb)
+        && let Ok(core) = PciCore::from_fdt(fdt)
+    {
+        return Ok(core);
     }
     Err(PciError::NoFirmware)
 }

@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/x86_64/serial.rs
+ *       x86-64 early serial console access
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use core::arch::asm;
 
 const COM1: u16 = 0x3f8;

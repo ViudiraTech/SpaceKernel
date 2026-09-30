@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/tty/fbcon/render.rs
+ *       Pixel format conversion, glyph blitting and display scrolling
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Pixel format conversion, glyph blitting and display scrolling.
 use super::{Cell, DEFAULT_BACKGROUND, FbConsole, GLYPH_HEIGHT, GLYPH_WIDTH};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
@@ -69,7 +79,7 @@ impl FbConsole {
     #[inline]
     fn draw_packed_pixel(&self, x: usize, y: usize, value: u32) {
         let offset = y * self.pitch + x * self.bytes_per_pixel;
-        if self.bytes_per_pixel == 4 && (self.address + offset) % 4 == 0 {
+        if self.bytes_per_pixel == 4 && (self.address + offset).is_multiple_of(4) {
             // SAFETY: the address and pitch were validated; this branch also
             // proves 32-bit alignment and the framebuffer remains mapped.
             unsafe { ((self.address + offset) as *mut u32).write_volatile(value) }

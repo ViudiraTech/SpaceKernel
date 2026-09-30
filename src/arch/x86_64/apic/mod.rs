@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/x86_64/apic/mod.rs
+ *       x86 interrupt controllers: LAPIC, I/O APIC, legacy PIC and timer
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! x86 interrupt controllers: LAPIC, I/O APIC, legacy PIC and timer.
 
 mod ioapic;
@@ -186,12 +196,10 @@ pub fn request_isa(source: u8, handler: Handler) -> Result<Route, IrqError> {
             gsi,
             flags,
         } = entry.map_err(|_| IrqError::Invalid)?
+            && irq == source
+            && (bus != 0 || override_data.replace((gsi, flags)).is_some())
         {
-            if irq == source {
-                if bus != 0 || override_data.replace((gsi, flags)).is_some() {
-                    return Err(IrqError::Invalid);
-                }
-            }
+            return Err(IrqError::Invalid);
         }
     }
     let (gsi, flags) = override_data.unwrap_or((u32::from(source), 0));

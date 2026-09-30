@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/tty/console/device.rs
+ *       TTY device routing and termios access
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Named TTY I/O and line discipline dispatch.
 
 use super::{CONSOLE, write_serial};

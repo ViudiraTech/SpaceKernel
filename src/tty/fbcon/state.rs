@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/tty/fbcon/state.rs
+ *       Ring-backed virtual terminal cells and parser state
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Ring-backed virtual terminal cells and parser state.
 use super::{DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, HISTORY_ROWS};
 use alloc::{vec, vec::Vec};

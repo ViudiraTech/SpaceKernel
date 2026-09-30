@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/aarch64/serial.rs
+ *       AArch64 early serial console access
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const SERIAL_PHYS: u64 = 0x0900_0000;

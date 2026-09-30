@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/x86_64/interrupts/gdt.rs
+ *       CPU-local GDT, TSS and emergency stack ownership
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! CPU-local GDT, TSS and emergency stack ownership.
 use alloc::boxed::Box;
 use x86_64::{
@@ -72,7 +82,7 @@ impl CpuTables {
             _nmi_stack: nmi_stack,
             _machine_check_stack: machine_check_stack,
         });
-        super::idt::install(&mut cpu.idt);
+        super::idt::install(&mut cpu.idt, code);
         cpu
     }
 

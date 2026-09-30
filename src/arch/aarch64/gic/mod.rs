@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/aarch64/gic/mod.rs
+ *       Arm Generic Interrupt Controller discovery and common IRQ-domain API
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Arm Generic Interrupt Controller discovery and common IRQ-domain API.
 pub mod timer;
 mod v2;
@@ -45,10 +55,10 @@ fn discover_from_acpi() -> Option<(u8, u64, u64, u64, u64)> {
             crate::hardware::acpi::MadtEntry::Gicr { address, length } => {
                 gicr = Some((address, length));
             }
-            crate::hardware::acpi::MadtEntry::Gicc { address, .. } => {
-                if gicc.is_none() && address != 0 {
-                    gicc = Some(address);
-                }
+            crate::hardware::acpi::MadtEntry::Gicc { address, .. }
+                if gicc.is_none() && address != 0 =>
+            {
+                gicc = Some(address);
             }
             _ => {}
         }

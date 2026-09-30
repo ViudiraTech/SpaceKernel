@@ -1,3 +1,11 @@
+#
+#       Kconfig
+#       Kernel architecture, paging and boot configuration
+#
+#       2026/9/30 By JiTianYu391
+#       Copyright (C) 2026 ViudiraTech.
+#
+
 mainmenu "SpaceKernel configuration"
 
 choice
@@ -24,6 +32,14 @@ config PROFILE_DEBUG
 config PROFILE_RELEASE
     bool "Release"
 endchoice
+
+config RISCV_SV48
+    bool "Use Sv48 instead of Sv39 on RISC-V"
+    depends on ARCH_RISCV64
+    default n
+    help
+      Sv39 uses three page-table levels and is the default for RV64.
+      Enable this only on machines with Sv48 support.
 
 menu "Boot and test"
 config KERNEL_CMDLINE

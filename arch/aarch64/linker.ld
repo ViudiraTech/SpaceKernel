@@ -1,3 +1,13 @@
+/*
+ *
+ *       arch/aarch64/linker.ld
+ *       AArch64 relocatable kernel ELF layout
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 ENTRY(kmain)
 
 PHDRS {

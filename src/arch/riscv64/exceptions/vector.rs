@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/riscv64/exceptions/vector.rs
+ *       RISC-V exception entry and interrupt dispatch
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use core::arch::{asm, global_asm};
 
 use crate::{arch, printk};

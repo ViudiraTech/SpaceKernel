@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/tty/line/discipline.rs
+ *       Canonical input editing and bounded line queues
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Per-device bounded canonical and raw input queues.
 
 use super::{INPUT_CAPACITY, InputEvent, ReadError, Termios};
@@ -13,6 +23,12 @@ pub struct LineDiscipline {
     head: usize,
     ready_len: usize,
     eof_pending: bool,
+}
+
+impl Default for LineDiscipline {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LineDiscipline {
@@ -43,10 +59,8 @@ impl LineDiscipline {
     }
 
     pub fn set_termios(&mut self, settings: Termios) -> Result<(), ReadError> {
-        if self.termios.canonical && !settings.canonical {
-            if !self.commit() {
-                return Err(ReadError::BufferFull);
-            }
+        if self.termios.canonical && !settings.canonical && !self.commit() {
+            return Err(ReadError::BufferFull);
         }
         self.termios = settings;
         Ok(())
@@ -87,7 +101,7 @@ impl LineDiscipline {
             self.pending_len = 0;
             return if self.termios.echo {
                 InputEvent::Echo {
-                    bytes: [b'^', b'U', b'\n'],
+                    bytes: *b"^U\n",
                     length: 3,
                 }
             } else {

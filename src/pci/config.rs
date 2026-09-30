@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/pci/config.rs
+ *       Serialized PCI configuration-register access
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use crate::sync::Guard;
 
 use super::{PciError, ecam::BusState};

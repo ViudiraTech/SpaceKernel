@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/arch/x86_64/apic/timer.rs
+ *       Local APIC one-shot timer, using TSC deadline when available
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Local APIC one-shot timer, using TSC deadline when available.
 use super::local;
 use crate::{irq::IrqError, time};

@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/hardware/acpi/rsdp.rs
+ *       ACPI root descriptor validation
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use crate::mm::pmm;
 
 use super::{

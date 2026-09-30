@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/printk/mod.rs
+ *       Allocation-free kernel logging with bounded storage and ordered output
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 //! Allocation-free kernel logging with bounded storage and ordered output.
 
 mod drain;

@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/hardware/mod.rs
+ *       Firmware discovery and hardware reporting
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 pub mod acpi;
 pub mod fdt;
 
@@ -61,10 +71,10 @@ pub fn report() {
                     if let Some(stdout) = chosen.stdout_path() {
                         crate::kinfo!("DTB chosen stdout: {stdout}");
                     }
-                    if let Some(bootargs) = chosen.bootargs() {
-                        if !bootargs.is_empty() {
-                            crate::kinfo!("DTB chosen bootargs: {bootargs}");
-                        }
+                    if let Some(bootargs) = chosen.bootargs()
+                        && !bootargs.is_empty()
+                    {
+                        crate::kinfo!("DTB chosen bootargs: {bootargs}");
                     }
                 }
             }

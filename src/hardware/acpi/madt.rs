@@ -1,3 +1,13 @@
+/*
+ *
+ *       src/hardware/acpi/madt.rs
+ *       Multiple APIC description and interrupt-controller entries
+ *
+ *       2026/9/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
 use super::{
     AcpiError,
     sdt::{Table, le_u16, le_u32, le_u64},
@@ -224,11 +234,7 @@ impl Iterator for MadtEntries<'_> {
                 size: le_u32(&entry[20..24]),
                 address: le_u64(&entry[24..32]),
             },
-            kind if matches!(
-                kind,
-                0 | 1 | 2 | 3 | 4 | 5 | 9 | 10 | 0x0b | 0x0c | 0x0e | 0x18 | 0x1b
-            ) =>
-            {
+            0 | 1 | 2 | 3 | 4 | 5 | 9 | 10 | 0x0b | 0x0c | 0x0e | 0x18 | 0x1b => {
                 return Some(Err(AcpiError::Malformed));
             }
             kind => MadtEntry::Other { kind },
