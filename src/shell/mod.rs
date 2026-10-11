@@ -38,31 +38,26 @@ fn shell_task() {
     print_tty(PROMPT);
 
     let mut line_buf = [0u8; 256];
-    let mut line_pos = 0;
 
     loop {
-        // Read input from Serial0
-        let mut byte = [0u8; 1];
-        match tty::read(TtyDevice::Serial0, &mut byte) {
-            Ok(1) => {
-                let b = byte[0];
-                if b == b'\n' || b == b'\r' {
-                    print_tty("\n");
-                    if line_pos > 0 {
-                        if let Ok(cmd_str) = core::str::from_utf8(&line_buf[..line_pos]) {
-                            execute_command(cmd_str.trim());
-                        }
-                        line_pos = 0;
-                    }
-                    print_tty(PROMPT);
-                } else if b == 0x08 || b == 0x7f {
-                    if line_pos > 0 {
-                        line_pos -= 1;
-                    }
-                } else if line_pos < line_buf.len() {
-                    line_buf[line_pos] = b;
-                    line_pos += 1;
+        // Read input from Serial0 or Foreground VT
+        let read_res = match tty::read(TtyDevice::Serial0, &mut line_buf) {
+            Ok(n) if n > 0 => Ok(n),
+            _ => tty::read(TtyDevice::Foreground, &mut line_buf),
+        };
+        match read_res {
+            Ok(n) if n > 0 => {
+                let mut len = n;
+                while len > 0 && (line_buf[len - 1] == b'\n' || line_buf[len - 1] == b'\r') {
+                    len -= 1;
                 }
+                if let Ok(cmd_str) = core::str::from_utf8(&line_buf[..len]) {
+                    let cmd_trimmed = cmd_str.trim();
+                    if !cmd_trimmed.is_empty() {
+                        execute_command(cmd_trimmed);
+                    }
+                }
+                print_tty(PROMPT);
             }
             Ok(_) => {
                 sched::sleep_micros(10_000);
@@ -89,6 +84,7 @@ fn execute_command(line: &str) {
     match cmd {
         "help" => cmd_help(),
         "ps" => cmd_ps(),
+        "ps2" => cmd_ps2(),
         "meminfo" => cmd_meminfo(),
         "cpuinfo" => cmd_cpuinfo(),
         "lspci" => cmd_lspci(),
@@ -117,6 +113,7 @@ fn cmd_help() {
     print_tty("Available commands:\n");
     print_tty("  help      - Show this help message\n");
     print_tty("  ps        - Display active kernel tasks and scheduler statistics\n");
+    print_tty("  ps2       - Display PS/2 controller, keyboard and mouse diagnostics\n");
     print_tty("  meminfo   - Display physical memory and allocator statistics\n");
     print_tty("  cpuinfo   - Display processor capability and topology information\n");
     print_tty("  lspci     - Display enumerated PCI configuration devices\n");
@@ -209,5 +206,54 @@ fn cmd_uname() {
     };
     print_tty(&format!(
         "SpaceKernel 0.1.0 ({arch_name}) SMP EEVDF Linux-ABI #1 2026\n"
+    ));
+}
+
+fn cmd_ps2() {
+    let status = crate::hardware::ps2::status();
+    print_tty("=== PS/2 Subsystem Status ===\n");
+    print_tty(&format!(
+        "Controller : present={} self_test={} dual_channel={} CCB={:#04x}\n",
+        status.controller.present,
+        status.controller.self_test_ok,
+        status.controller.dual_channel,
+        status.controller.config_byte
+    ));
+    print_tty(&format!(
+        "Port 1 (KB): functional={}\n",
+        status.controller.port1_ok
+    ));
+    let mods = crate::hardware::ps2::modifiers();
+    print_tty(&format!(
+        "Keyboard   : ready={} Shift={} Ctrl={} Alt={} CapsLock={} NumLock={} ScrollLock={}\n",
+        status.keyboard_ok,
+        mods.shift(),
+        mods.ctrl(),
+        mods.alt(),
+        mods.caps_lock,
+        mods.num_lock,
+        mods.scroll_lock
+    ));
+    print_tty(&format!(
+        "Port 2 (MS): functional={}\n",
+        status.controller.port2_ok
+    ));
+    let mouse_st = crate::hardware::ps2::mouse_state();
+    print_tty(&format!(
+        "Mouse      : ready={} type={:?} ID={:#04x} reporting={}\n",
+        status.mouse.present,
+        status.mouse.mouse_type,
+        status.mouse.device_id,
+        status.mouse.reporting_enabled
+    ));
+    print_tty(&format!(
+        "Cursor     : X={} Y={} Buttons(L={} R={} M={} 4={} 5={})\n",
+        mouse_st.x,
+        mouse_st.y,
+        mouse_st.buttons.left,
+        mouse_st.buttons.right,
+        mouse_st.buttons.middle,
+        mouse_st.buttons.btn4,
+        mouse_st.buttons.btn5
     ));
 }

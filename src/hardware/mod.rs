@@ -10,6 +10,7 @@
 
 pub mod acpi;
 pub mod fdt;
+pub mod ps2;
 
 use crate::boot;
 

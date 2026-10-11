@@ -159,6 +159,7 @@ pub extern "C" fn kmain() -> ! {
     self_test::run();
     assert!(interrupt_ready, "scheduler requires interrupt controller");
     arch::serial_enable_irq();
+    hardware::ps2::init();
     sched::init(boot::cpu_count());
     smp::start();
     kinfo!("Scheduler: per-CPU EEVDF ready");

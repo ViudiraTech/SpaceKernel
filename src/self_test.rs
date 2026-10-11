@@ -448,4 +448,7 @@ fn test_fdt() {
     let mut bad_magic = blob.clone();
     bad_magic[0..4].copy_from_slice(&0xdead_beefu32.to_be_bytes());
     assert_eq!(Fdt::from_slice(&bad_magic), Err(FdtError::Magic));
+
+    // PS/2 Subsystem unit tests
+    crate::hardware::ps2::self_test::run();
 }
