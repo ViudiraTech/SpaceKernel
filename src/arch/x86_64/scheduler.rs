@@ -16,12 +16,24 @@ use core::{
 const TIMER: u32 = 0xf0;
 const IPI: u32 = 0xf1;
 #[repr(C)]
-struct CpuLocal {
-    index: usize,
+pub struct CpuLocal {
+    pub index: usize,
+    pub kernel_rsp: u64,
+    pub user_rsp: u64,
 }
-static LOCALS: [CpuLocal; 256] = make_locals();
+struct SyncUnsafeCell<T>(core::cell::UnsafeCell<T>);
+unsafe impl<T> Sync for SyncUnsafeCell<T> {}
+
+static LOCALS: SyncUnsafeCell<[CpuLocal; 256]> =
+    SyncUnsafeCell(core::cell::UnsafeCell::new(make_locals()));
 const fn make_locals() -> [CpuLocal; 256] {
-    let mut locals = [const { CpuLocal { index: 0 } }; 256];
+    let mut locals = [const {
+        CpuLocal {
+            index: 0,
+            kernel_rsp: 0,
+            user_rsp: 0,
+        }
+    }; 256];
     let mut i = 0;
     while i < 256 {
         locals[i].index = i;
@@ -32,11 +44,20 @@ const fn make_locals() -> [CpuLocal; 256] {
 static TICKS: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
 
 pub fn install_cpu_index(index: usize) {
-    let address = &LOCALS[index] as *const CpuLocal as u64;
-    // SAFETY: permanent CPU-local object; FS/GS are never task-owned in this kernel.
+    let address = unsafe { (&raw mut (*LOCALS.0.get())[index]) as u64 };
+    // SAFETY: permanent CPU-local object; configure IA32_GS_BASE and IA32_KERNEL_GS_BASE.
     unsafe {
-        asm!("wrmsr",in("ecx") 0xc0000101u32,in("eax") address as u32,in("edx") (address>>32) as u32,options(nostack));
+        asm!("wrmsr", in("ecx") 0xc0000101u32, in("eax") address as u32, in("edx") (address >> 32) as u32, options(nostack));
+        asm!("wrmsr", in("ecx") 0xc0000102u32, in("eax") address as u32, in("edx") (address >> 32) as u32, options(nostack));
     }
+    super::syscall::init_syscall_msrs();
+}
+
+pub fn set_kernel_stack(cpu: usize, stack_top: u64) {
+    unsafe {
+        (*LOCALS.0.get())[cpu].kernel_rsp = stack_top;
+    }
+    super::interrupts::set_kernel_stack(cpu, stack_top);
 }
 pub fn current_cpu_index() -> Option<usize> {
     let index: usize;
@@ -48,7 +69,11 @@ pub fn current_cpu_index() -> Option<usize> {
 }
 pub fn register_scheduler_irqs() -> Result<(), irq::IrqError> {
     irq::register(TIMER, crate::sched::timer_interrupt)?;
-    irq::register(IPI, crate::sched::reschedule_interrupt)
+    irq::register(IPI, crate::sched::reschedule_interrupt)?;
+    irq::register(
+        super::paging::TLB_IPI_VECTOR as u32,
+        super::paging::handle_tlb_ipi,
+    )
 }
 pub fn init_scheduler_cpu(cpu: usize) -> Result<(), irq::IrqError> {
     super::apic::init_cpu()?;

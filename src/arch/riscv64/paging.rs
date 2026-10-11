@@ -69,3 +69,21 @@ pub fn flush_table(_virtual_address: u64) {
     // SAFETY: synchronize this hart's walks, all addresses/ASIDs/global entries.
     unsafe { asm!("sfence.vma x0, x0", options(nostack)) }
 }
+
+pub fn tlb_shootdown(virtual_address: u64, pages: usize) {
+    let size = if pages == 0 { 0 } else { pages * 4096 };
+    let (err, _) = super::clint::sbi_call_ext(
+        0x5246_4E43, // RFNC
+        1,           // remote_sfence_vma
+        usize::MAX,
+        0,
+        virtual_address as usize,
+        size,
+    );
+    if err != 0 {
+        // Fallback: local sfence
+        unsafe { asm!("sfence.vma x0, x0", options(nostack)) };
+    } else {
+        unsafe { asm!("sfence.vma x0, x0", options(nostack)) };
+    }
+}

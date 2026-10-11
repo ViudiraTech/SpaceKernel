@@ -191,6 +191,17 @@ impl<V> RBTree<V> {
         visit(&self.root, budget, predicate)
     }
 
+    pub fn for_each(&self, mut f: impl FnMut(&Node<V>)) {
+        fn visit_all<V>(node: Option<&Node<V>>, f: &mut impl FnMut(&Node<V>)) {
+            if let Some(n) = node {
+                visit_all(n.left.as_deref(), f);
+                f(n);
+                visit_all(n.right.as_deref(), f);
+            }
+        }
+        visit_all(self.root.as_deref(), &mut f);
+    }
+
     pub fn pop_first(&mut self) -> Option<Box<Node<V>>> {
         self.remove(self.first()?.key)
     }

@@ -42,3 +42,21 @@ pub fn serial_try_read() -> Option<u8> {
             .then(|| (base as *const u32).read_volatile() as u8)
     }
 }
+
+fn handle_serial_irq(_intid: u32) {
+    while let Some(byte) = serial_try_read() {
+        crate::tty::receive(crate::tty::TtyDevice::Serial0, byte);
+    }
+}
+
+pub fn serial_enable_irq() {
+    let base = SERIAL.load(Ordering::Acquire);
+    if base != 0 {
+        // SAFETY: PL011 UARTIMSC is at offset 0x38; bit 4 is RXIM.
+        unsafe {
+            let imsc = ((base + 0x38) as *const u32).read_volatile();
+            ((base + 0x38) as *mut u32).write_volatile(imsc | (1 << 4));
+        }
+        let _ = super::gic::request(33, handle_serial_irq, false);
+    }
+}

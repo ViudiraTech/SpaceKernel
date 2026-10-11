@@ -75,3 +75,65 @@ pub fn flush_page(virtual_address: u64) {
 pub fn flush_table(virtual_address: u64) {
     flush_page(virtual_address);
 }
+
+use crate::sync::SpinLock;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+pub const TLB_IPI_VECTOR: u8 = 0xf2;
+
+static TLB_LOCK: SpinLock<()> = SpinLock::new(());
+static PENDING_VADDR: AtomicU64 = AtomicU64::new(0);
+static PENDING_PAGES: AtomicUsize = AtomicUsize::new(0);
+static ACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+pub fn handle_tlb_ipi(_vector: u32) {
+    let vaddr = PENDING_VADDR.load(Ordering::Acquire);
+    let pages = PENDING_PAGES.load(Ordering::Acquire);
+    flush_local(vaddr, pages);
+    ACK_COUNT.fetch_add(1, Ordering::Release);
+}
+
+fn flush_local(vaddr: u64, pages: usize) {
+    if pages == 0 || pages > 32 {
+        set_page_root(page_root());
+    } else {
+        for i in 0..pages {
+            flush_page(vaddr + (i as u64) * 4096);
+        }
+    }
+}
+
+pub fn tlb_shootdown(virtual_address: u64, pages: usize) {
+    let flags = crate::arch::irq_save();
+    let _guard = TLB_LOCK.lock();
+    PENDING_VADDR.store(virtual_address, Ordering::Release);
+    PENDING_PAGES.store(pages, Ordering::Release);
+    ACK_COUNT.store(0, Ordering::Release);
+
+    let _online = crate::smp::online_count();
+    let current = crate::smp::current_cpu();
+    let mut sent = 0;
+
+    for cpu in 0..crate::boot::cpu_count() {
+        if cpu != current && crate::smp::online(cpu) {
+            if let Some(hw_id) = crate::boot::cpu_hardware_id(cpu) {
+                if super::apic::send_fixed_ipi(hw_id as u32, TLB_IPI_VECTOR).is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+    }
+
+    flush_local(virtual_address, pages);
+
+    if sent > 0 {
+        let start = crate::time::uptime_micros();
+        while ACK_COUNT.load(Ordering::Acquire) < sent {
+            if crate::time::uptime_micros().saturating_sub(start) > 50_000 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+    crate::arch::irq_restore(flags);
+}

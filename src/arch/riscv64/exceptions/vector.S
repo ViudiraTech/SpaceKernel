@@ -12,10 +12,60 @@
     .balign 4
     .global __spacekernel_riscv64_trap
 __spacekernel_riscv64_trap:
-    addi sp, sp, -256
+    // 1. Swap sp and sscratch: sp = HartState*, sscratch = incoming sp
+    csrrw sp, sscratch, sp
+
+    // 2. Save scratch registers into HartState
+    sd t0, 24(sp)
+    sd t1, 32(sp)
+
+    // 3. Check sstatus.SPP (bit 8): 0 if from U-mode, 1 if from S-mode
+    csrr t0, sstatus
+    andi t0, t0, 0x100
+    bnez t0, .Ltrap_from_kernel
+
+    // === Trap from User Mode ===
+    // Retrieve incoming user sp from sscratch
+    csrr t0, sscratch
+    sd t0, 8(sp)        // HartState.user_sp = user_sp
+
+    // Load task's kernel stack top from HartState.kernel_stack (offset 0)
+    ld t1, 0(sp)
+
+    // Restore sscratch to point to HartState
+    csrw sscratch, sp
+
+    // Switch to task kernel stack
+    mv sp, t1
+    // Allocate 272-byte trap frame (16-byte aligned)
+    addi sp, sp, -272
+
+    // Save user sp at offset 256
+    sd t0, 256(sp)
+    j .Lsave_trap_context
+
+.Ltrap_from_kernel:
+    // Retrieve incoming kernel sp from sscratch
+    csrr t0, sscratch
+    // Restore sscratch to point to HartState
+    csrw sscratch, sp
+
+    // sp is back to incoming kernel sp
+    mv sp, t0
+    // Allocate 272-byte trap frame
+    addi sp, sp, -272
+    // Mark user sp as 0
+    sd zero, 256(sp)
+
+.Lsave_trap_context:
     sd ra, 0(sp)
-    sd t0, 8(sp)
+    // Restore original t0 and t1 from HartState and store into trap frame
+    csrr t0, sscratch
+    ld t1, 24(t0)
+    sd t1, 8(sp)
+    ld t1, 32(t0)
     sd t1, 16(sp)
+
     sd t2, 24(sp)
     sd a0, 32(sp)
     sd a1, 40(sp)
@@ -51,11 +101,33 @@ __spacekernel_riscv64_trap:
     csrr a0, scause
     bltz a0, 1f
 
+    // Check for scause == 8 (Environment call from U-mode)
+    li t0, 8
+    bne a0, t0, 3f
+
+    // 1. Advance sepc past the 4-byte ecall
+    ld t0, 240(sp)
+    addi t0, t0, 4
+    sd t0, 240(sp)
+
+    // 2. Invoke syscall dispatcher: a0=num, a1..a6=args
+    ld a0, 88(sp)
+    ld a1, 32(sp)
+    ld a2, 40(sp)
+    ld a3, 48(sp)
+    ld a4, 56(sp)
+    ld a5, 64(sp)
+    ld a6, 72(sp)
+    call spacekernel_syscall_c
+    sd a0, 32(sp)
+    j 4f
+
+3:
     // Exception branch: switch to panic stack
     csrr t0, sscratch
     beqz t0, 2f
     ld t1, 0(t0)
-    addi a0, sp, 256
+    addi a0, sp, 272
     ld a1, 8(sp)
     mv sp, t1
     call spacekernel_riscv64_exception
@@ -67,11 +139,71 @@ __spacekernel_riscv64_trap:
     // Interrupt branch: call spacekernel_riscv64_irq
     call spacekernel_riscv64_irq
 
+4:
     ld t0, 240(sp)
     csrw sepc, t0
     ld t1, 248(sp)
     csrw sstatus, t1
 
+    // Check if returning to user mode (sstatus.SPP == 0) or kernel mode
+    andi t1, t1, 0x100
+    bnez t1, .Lret_to_kernel
+
+    // === Return to User Mode ===
+    // 1. Get user_sp from trap frame offset 256
+    ld t0, 256(sp)
+    // 2. Store user_sp into HartState.user_sp (offset 8)
+    csrr t1, sscratch
+    sd t0, 8(t1)
+
+    // 3. Stash original t0 and t1 from trap frame into HartState scratch slots
+    ld t0, 8(sp)
+    sd t0, 24(t1)
+    ld t0, 16(sp)
+    sd t0, 32(t1)
+
+    // 4. Restore general registers
+    ld ra, 0(sp)
+    ld t2, 24(sp)
+    ld a0, 32(sp)
+    ld a1, 40(sp)
+    ld a2, 48(sp)
+    ld a3, 56(sp)
+    ld a4, 64(sp)
+    ld a5, 72(sp)
+    ld a6, 80(sp)
+    ld a7, 88(sp)
+    ld t3, 96(sp)
+    ld t4, 104(sp)
+    ld t5, 112(sp)
+    ld t6, 120(sp)
+    ld s0, 128(sp)
+    ld s1, 136(sp)
+    ld s2, 144(sp)
+    ld s3, 152(sp)
+    ld s4, 160(sp)
+    ld s5, 168(sp)
+    ld s6, 176(sp)
+    ld s7, 184(sp)
+    ld s8, 192(sp)
+    ld s9, 200(sp)
+    ld s10, 208(sp)
+    ld s11, 216(sp)
+    ld gp, 224(sp)
+    ld tp, 232(sp)
+
+    // 5. Point sp to HartState
+    csrr sp, sscratch
+    // 6. Restore t0 and t1 from HartState scratch
+    ld t0, 24(sp)
+    ld t1, 32(sp)
+    // 7. Load user_sp from HartState.user_sp (offset 8)
+    ld sp, 8(sp)
+    // 8. Return to user mode!
+    sret
+
+.Lret_to_kernel:
+    // === Return to Kernel Mode ===
     ld ra, 0(sp)
     ld t0, 8(sp)
     ld t1, 16(sp)
@@ -102,5 +234,5 @@ __spacekernel_riscv64_trap:
     ld s11, 216(sp)
     ld gp, 224(sp)
     ld tp, 232(sp)
-    addi sp, sp, 256
+    addi sp, sp, 272
     sret

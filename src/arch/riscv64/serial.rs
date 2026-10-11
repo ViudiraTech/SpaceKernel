@@ -42,3 +42,22 @@ pub fn serial_try_read() -> Option<u8> {
             .then(|| (base as *const u8).read_volatile())
     }
 }
+
+fn handle_serial_irq(_source: u32) {
+    while let Some(byte) = serial_try_read() {
+        crate::tty::receive(crate::tty::TtyDevice::Serial0, byte);
+    }
+}
+
+pub fn serial_enable_irq() {
+    let base = SERIAL.load(Ordering::Acquire);
+    if base != 0 {
+        // SAFETY: 16550 UART IER is at offset 1, MCR is at offset 4.
+        unsafe {
+            ((base + 1) as *mut u8).write_volatile(1);
+            let mcr = ((base + 4) as *const u8).read_volatile();
+            ((base + 4) as *mut u8).write_volatile(mcr | 0x0b);
+        }
+        let _ = super::plic::request(10, handle_serial_irq);
+    }
+}

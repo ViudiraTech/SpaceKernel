@@ -93,3 +93,13 @@ pub fn flush_table(_virtual_address: u64) {
         )
     }
 }
+
+pub fn tlb_shootdown(virtual_address: u64, pages: usize) {
+    if pages == 0 || pages > 32 {
+        flush_table(virtual_address);
+    } else {
+        for i in 0..pages {
+            flush_page(virtual_address + (i as u64) * 4096);
+        }
+    }
+}

@@ -33,6 +33,18 @@ pub fn serial_try_read() -> Option<u8> {
     (input(COM1 + 5) & 1 != 0).then(|| input(COM1))
 }
 
+fn handle_serial_irq(_vector: u32) {
+    while let Some(byte) = serial_try_read() {
+        crate::tty::receive(crate::tty::TtyDevice::Serial0, byte);
+    }
+}
+
+pub fn serial_enable_irq() {
+    out(COM1 + 1, 1);
+    out(COM1 + 4, 0x0b);
+    let _ = super::apic::request_isa(4, handle_serial_irq);
+}
+
 fn out(port: u16, byte: u8) {
     // SAFETY: port I/O is supported for the QEMU PC 16550 UART.
     unsafe {

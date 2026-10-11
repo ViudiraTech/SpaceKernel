@@ -18,6 +18,7 @@ pub mod fpu;
 mod interrupts;
 mod paging;
 mod serial;
+pub mod syscall;
 
 pub use context::{Context, context_init, switch};
 pub use cpu::{counter, disable_interrupts, enable_interrupts, halt, irq_restore, irq_save};
@@ -25,6 +26,8 @@ pub use interrupts::{init_bsp as init_exceptions, load_cpu as load_exceptions};
 pub use paging::setup_memory_protection;
 pub use paging::{
     flush_page, flush_table, page_root, paging_geometry, pte_is_table, pte_leaf, pte_phys,
-    pte_present, pte_table, set_page_root,
+    pte_present, pte_table, set_page_root, tlb_shootdown,
 };
-pub use serial::{serial_init, serial_try_read, serial_write};
+pub use scheduler::set_kernel_stack;
+pub use serial::{serial_enable_irq, serial_init, serial_try_read, serial_write};
+pub use syscall::enter_user_mode;

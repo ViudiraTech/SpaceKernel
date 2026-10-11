@@ -7,6 +7,7 @@
  *       Copyright (C) 2026 ViudiraTech.
  *
  */
+#![allow(dead_code)]
 extern crate alloc;
 #[path = "../src/sched/rbtree.rs"]
 mod rbtree;

@@ -130,6 +130,7 @@ pub(crate) struct Task {
     pub(crate) fpu_state: UnsafeCell<Option<fpu::State>>,
     pub(crate) entry: Option<Box<dyn FnOnce() + Send>>,
     pub(crate) stack: Option<KernelStack>,
+    pub(crate) address_space: Option<Arc<SpinLock<crate::user::UserAddressSpace>>>,
 }
 
 pub(crate) struct KernelStack {
@@ -152,7 +153,7 @@ impl KernelStack {
         }
         Ok(Self { base })
     }
-    fn top(&self) -> usize {
+    pub(crate) fn top(&self) -> usize {
         self.base as usize + STACK_SIZE
     }
     pub fn check(&self) {
@@ -176,6 +177,15 @@ impl Drop for KernelStack {
 impl Task {
     pub fn cpu(&self) -> usize {
         self.on_cpu
+    }
+    pub fn kernel_stack_top(&self) -> Option<usize> {
+        self.stack.as_ref().map(|s| s.top())
+    }
+    pub fn set_address_space(&mut self, space: Arc<SpinLock<crate::user::UserAddressSpace>>) {
+        self.address_space = Some(space);
+    }
+    pub fn address_space(&self) -> Option<Arc<SpinLock<crate::user::UserAddressSpace>>> {
+        self.address_space.clone()
     }
     pub(crate) fn create(
         entry: Option<Box<dyn FnOnce() + Send>>,
@@ -216,6 +226,7 @@ impl Task {
             fpu_state: UnsafeCell::new(fpu_state),
             entry,
             stack,
+            address_space: None,
         }))))
     }
 }

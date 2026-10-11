@@ -40,3 +40,10 @@ pub fn load_cpu(index: usize) {
     let tables = TABLES.lock();
     tables.get(index).expect("unknown CPU index").load();
 }
+
+pub fn set_kernel_stack(index: usize, stack_top: u64) {
+    let tables = TABLES.lock();
+    if let Some(table) = tables.get(index) {
+        table.set_kernel_stack(stack_top);
+    }
+}

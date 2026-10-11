@@ -13,8 +13,8 @@ use limine::{
     paging::PagingMode,
     request::{
         DtbRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, FramebufferRequest,
-        HhdmRequest, MemmapRequest, MpRequest, PagingModeRequest, RsdpRequest, StackSizeRequest,
-        TscFrequencyRequest,
+        HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, PagingModeRequest, RsdpRequest,
+        StackSizeRequest, TscFrequencyRequest,
     },
 };
 
@@ -63,6 +63,9 @@ static FRAMEBUFFER: FramebufferRequest = FramebufferRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static COUNTER_FREQUENCY: TscFrequencyRequest = TscFrequencyRequest::new();
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static MODULES: ModulesRequest = ModulesRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static STACK: StackSizeRequest = StackSizeRequest::new(1024 * 1024);
@@ -167,4 +170,12 @@ pub fn bsp_cpu_index() -> usize {
 pub fn start_cpu(index: usize, entry: limine::mp::MpGotoFunction) {
     assert_ne!(index, bsp_cpu_index());
     MP.response().expect("MP required").cpus()[index].bootstrap(entry, index as u64);
+}
+
+pub fn modules() -> &'static [&'static limine::file::File] {
+    if let Some(resp) = MODULES.response() {
+        resp.modules()
+    } else {
+        &[]
+    }
 }

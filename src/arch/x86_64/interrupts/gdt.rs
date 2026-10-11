@@ -46,11 +46,16 @@ pub(super) struct CpuTables {
     code: SegmentSelector,
     data: SegmentSelector,
     tss_selector: SegmentSelector,
+    tss_ptr: *mut TaskStateSegment,
     _kernel_stack: Box<Stack>,
     _double_fault_stack: Box<Stack>,
     _nmi_stack: Box<Stack>,
     _machine_check_stack: Box<Stack>,
 }
+
+// SAFETY: CpuTables are exclusively managed inside TABLES SpinLock during init.
+unsafe impl Send for CpuTables {}
+unsafe impl Sync for CpuTables {}
 
 impl CpuTables {
     pub(super) fn new() -> Box<Self> {
@@ -63,20 +68,21 @@ impl CpuTables {
         tss.interrupt_stack_table[DOUBLE_FAULT_IST as usize] = double_fault_stack.top();
         tss.interrupt_stack_table[NMI_IST as usize] = nmi_stack.top();
         tss.interrupt_stack_table[MACHINE_CHECK_IST as usize] = machine_check_stack.top();
-        // The TSS descriptor embeds its address, so it must remain pinned.
-        let tss: &'static TaskStateSegment = Box::leak(tss);
+        let tss_ptr: *mut TaskStateSegment = Box::into_raw(tss);
         let mut gdt = GlobalDescriptorTable::new();
         let code = gdt.append(Descriptor::kernel_code_segment());
         let data = gdt.append(Descriptor::kernel_data_segment());
-        gdt.append(Descriptor::user_code_segment());
+        // For sysretq: STAR[63:48] + 8 is SS (User Data), STAR[63:48] + 16 is CS (User Code)
         gdt.append(Descriptor::user_data_segment());
-        let tss_selector = gdt.append(Descriptor::tss_segment(tss));
+        gdt.append(Descriptor::user_code_segment());
+        let tss_selector = gdt.append(Descriptor::tss_segment(unsafe { &*tss_ptr }));
         let mut cpu = Box::new(Self {
             gdt,
             idt: InterruptDescriptorTable::new(),
             code,
             data,
             tss_selector,
+            tss_ptr,
             _kernel_stack: kernel_stack,
             _double_fault_stack: double_fault_stack,
             _nmi_stack: nmi_stack,
@@ -84,6 +90,12 @@ impl CpuTables {
         });
         super::idt::install(&mut cpu.idt, code);
         cpu
+    }
+
+    pub(super) fn set_kernel_stack(&self, stack_top: u64) {
+        unsafe {
+            (*self.tss_ptr).privilege_stack_table[0] = VirtAddr::new(stack_top);
+        }
     }
 
     pub(super) fn load(&self) {

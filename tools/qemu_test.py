@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--accel", choices=["tcg", "kvm"])
     parser.add_argument("--cpu")
     parser.add_argument("--machine")
-    parser.add_argument("--timeout", type=float, default=90)
+    parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--online-cpus", type=int)
     parser.add_argument("--require", action="append", default=[])
     args = parser.parse_args()

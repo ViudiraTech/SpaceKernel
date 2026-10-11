@@ -45,6 +45,32 @@ pub fn sbi_call(eid: usize, fid: usize, arg0: usize, arg1: usize, arg2: usize) -
     (error, value)
 }
 
+pub fn sbi_call_ext(
+    eid: usize,
+    fid: usize,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+) -> (usize, usize) {
+    let error: usize;
+    let value: usize;
+    // SAFETY: executes extended SBI environment call with 4 arguments.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") arg0 => error,
+            inlateout("a1") arg1 => value,
+            in("a2") arg2,
+            in("a3") arg3,
+            in("a6") fid,
+            in("a7") eid,
+            options(nostack)
+        );
+    }
+    (error, value)
+}
+
 fn sbi_set_timer(stime: u64) {
     // Try standard SBI Time extension (EID 0x54494D45)
     let (err, _) = sbi_call(0x5449_4D45, 0, stime as usize, 0, 0);

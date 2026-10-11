@@ -404,6 +404,18 @@ pub(crate) fn finish_switch() {
         drop(retired); // Never free the stack while it is still executing.
         COMPLETED.fetch_add(1, Ordering::Release);
     }
+
+    if let Some(current_task) = current() {
+        let task = current_task.lock();
+        if let Some(space) = &task.address_space {
+            space.lock().activate();
+            if let Some(stack_top) = task.kernel_stack_top() {
+                arch::set_kernel_stack(cpu, stack_top as u64);
+            }
+        } else {
+            crate::user::UserAddressSpace::deactivate();
+        }
+    }
 }
 
 pub(crate) fn wake_entity(entity: Entity) {
@@ -520,4 +532,25 @@ fn spawn_placed(
         .admit(Node::new(tid, task, nice_to_weight(nice)), true);
     request_reschedule(cpu);
     Ok(tid)
+}
+
+pub fn task_snapshots() -> Vec<TaskStats> {
+    let mut list = Vec::new();
+    let s = scheduler();
+    for cpu in &s.cpus {
+        let q = cpu.queue.lock();
+        if let Some(ref node) = q.current {
+            list.push(node.value.stats());
+        }
+        if let Some(ref node) = q.idle {
+            list.push(node.value.stats());
+        }
+        q.fair.ready.for_each(|node| {
+            list.push(node.value.stats());
+        });
+    }
+    TIMERS.lock().for_each(|node| {
+        list.push(node.value.stats());
+    });
+    list
 }

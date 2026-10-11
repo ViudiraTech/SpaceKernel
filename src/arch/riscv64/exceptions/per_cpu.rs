@@ -24,10 +24,12 @@ const STACK_SIZE: usize = 16 * 1024;
 struct Stack([u8; STACK_SIZE]);
 
 #[repr(C)]
-struct HartState {
-    // vector.S reads the top of this stack at offset zero.
-    stack_top: usize,
-    index: usize,
+pub struct HartState {
+    pub kernel_stack: usize, // offset 0
+    pub user_sp: usize,      // offset 8
+    pub index: usize,        // offset 16
+    pub scratch_t0: usize,   // offset 24
+    pub scratch_t1: usize,   // offset 32
     _stack: Box<Stack>,
 }
 
@@ -47,8 +49,11 @@ pub fn init_bsp() -> usize {
         let stack = Box::new(Stack([0; STACK_SIZE]));
         let stack_top = stack.0.as_ptr().wrapping_add(STACK_SIZE) as usize;
         prepared.push(Box::new(HartState {
-            stack_top,
+            kernel_stack: stack_top,
+            user_sp: 0,
             index,
+            scratch_t0: 0,
+            scratch_t1: 0,
             _stack: stack,
         }));
     }
@@ -58,6 +63,17 @@ pub fn init_bsp() -> usize {
     drop(states);
     load_cpu(boot::bsp_cpu_index());
     count
+}
+
+pub fn set_kernel_stack(cpu: usize, stack_top: u64) {
+    if cpu < POINTERS.len() {
+        let ptr = POINTERS[cpu].load(Ordering::Acquire);
+        if ptr != 0 {
+            unsafe {
+                (*(ptr as *mut HartState)).kernel_stack = stack_top as usize;
+            }
+        }
+    }
 }
 
 /// AP startup calls this before enabling supervisor interrupts on the hart.
@@ -70,8 +86,8 @@ pub fn load_cpu(index: usize) {
     // SAFETY: sscratch contains this hart's pinned stack state, while stvec
     // selects the immutable direct-mode trap entry.
     unsafe {
-        asm!("csrw sscratch, {state}", "csrw stvec, {vector}", "fence.i",
-            state = in(reg) state_ptr, vector = in(reg) vector,
+        asm!("csrw sscratch, {state}", "csrw stvec, {vector}", "csrs sstatus, {sum}", "fence.i",
+            state = in(reg) state_ptr, vector = in(reg) vector, sum = in(reg) (1usize << 18),
             options(nostack, preserves_flags));
     }
 }

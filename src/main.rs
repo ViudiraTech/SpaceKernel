@@ -11,6 +11,7 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![allow(dead_code)]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 
 extern crate alloc;
@@ -27,10 +28,13 @@ pub mod printk;
 pub mod sched;
 #[cfg(feature = "boot-self-test")]
 mod self_test;
+pub mod shell;
 mod smp;
 mod sync;
+pub mod syscall;
 mod time;
 pub mod tty;
+pub mod user;
 
 use core::panic::PanicInfo;
 
@@ -154,14 +158,17 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "boot-self-test")]
     self_test::run();
     assert!(interrupt_ready, "scheduler requires interrupt controller");
+    arch::serial_enable_irq();
     sched::init(boot::cpu_count());
     smp::start();
     kinfo!("Scheduler: per-CPU EEVDF ready");
+    shell::start();
     #[cfg(feature = "boot-self-test")]
     sched::spawn_on(
         boot::bsp_cpu_index(),
         || {
             sched::sched_test::run();
+            user::run_self_test().expect("user self-test failed");
             kinfo!("BOOT_OK");
         },
         0,

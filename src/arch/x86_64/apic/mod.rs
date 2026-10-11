@@ -263,6 +263,9 @@ pub fn release_msi(message: MsiMessage) -> Result<(), IrqError> {
 pub fn send_ipi(destination: u32) -> Result<(), IrqError> {
     local::send_fixed(destination, local::IPI_VECTOR)
 }
+pub fn send_fixed_ipi(destination: u32, vector: u8) -> Result<(), IrqError> {
+    local::send_fixed(destination, vector)
+}
 pub fn send_nmi(destination: u32) -> Result<(), IrqError> {
     local::send_nmi(destination)
 }

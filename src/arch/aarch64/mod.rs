@@ -24,8 +24,26 @@ pub use cpu::{counter, disable_interrupts, enable_interrupts, halt, irq_restore,
 pub use exceptions::{init_bsp as init_exceptions, load_cpu as load_exceptions};
 pub use paging::{
     flush_page, flush_table, page_root, paging_geometry, pte_is_table, pte_leaf, pte_phys,
-    pte_present, pte_table, set_page_root, setup_device_memory,
+    pte_present, pte_table, set_page_root, setup_device_memory, tlb_shootdown,
 };
-pub use serial::{SERIAL_PHYS, serial_init, serial_try_read, serial_write};
+pub use serial::{SERIAL_PHYS, serial_enable_irq, serial_init, serial_try_read, serial_write};
 
 pub(crate) use exceptions::current_cpu_index;
+
+pub fn set_kernel_stack(_cpu: usize, _stack_top: u64) {}
+
+pub unsafe fn enter_user_mode(entry: u64, user_sp: u64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "msr daifset, #0xf",
+            "msr elr_el1, {entry}",
+            "msr sp_el0, {sp}",
+            "msr spsr_el1, xzr",
+            "isb",
+            "eret",
+            entry = in(reg) entry,
+            sp = in(reg) user_sp,
+            options(noreturn)
+        );
+    }
+}

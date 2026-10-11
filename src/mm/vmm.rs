@@ -257,6 +257,115 @@ pub fn map_device_range(physical: u64, length: usize) -> Result<u64, MapError> {
     Ok(region.base + offset)
 }
 
+pub fn unmap(virtual_address: u64, pages: usize) -> Result<(), MapError> {
+    if pages == 0 {
+        return Err(MapError::OutOfRange);
+    }
+    if !virtual_address.is_multiple_of(PAGE_SIZE) {
+        return Err(MapError::Unaligned);
+    }
+    let state = VMM.lock();
+    if state.root == 0 {
+        return Err(MapError::NotReady);
+    }
+    for page_idx in 0..pages {
+        let va = virtual_address + (page_idx as u64) * PAGE_SIZE;
+        let mut table = state.root;
+        let mut missing = false;
+        for level in (1..state.geometry.levels).rev() {
+            let entry = entry_ptr(table, va, level);
+            let value = unsafe { entry.read_volatile() };
+            if !arch::pte_present(value) || !arch::pte_is_table(value, level) {
+                missing = true;
+                break;
+            }
+            table = arch::pte_phys(value);
+        }
+        if !missing {
+            let leaf = entry_ptr(table, va, 0);
+            let value = unsafe { leaf.read_volatile() };
+            if arch::pte_present(value) {
+                unsafe { leaf.write_volatile(0) };
+                let phys = arch::pte_phys(value);
+                let _ = pmm::free(phys, 1);
+            }
+        }
+    }
+    arch::tlb_shootdown(virtual_address, pages);
+    Ok(())
+}
+
+pub fn protect(
+    virtual_address: u64,
+    pages: usize,
+    user: bool,
+    writable: bool,
+    device: bool,
+) -> Result<(), MapError> {
+    if pages == 0 {
+        return Err(MapError::OutOfRange);
+    }
+    if !virtual_address.is_multiple_of(PAGE_SIZE) {
+        return Err(MapError::Unaligned);
+    }
+    let state = VMM.lock();
+    if state.root == 0 {
+        return Err(MapError::NotReady);
+    }
+    for page_idx in 0..pages {
+        let va = virtual_address + (page_idx as u64) * PAGE_SIZE;
+        let mut table = state.root;
+        let mut missing = false;
+        for level in (1..state.geometry.levels).rev() {
+            let entry = entry_ptr(table, va, level);
+            let value = unsafe { entry.read_volatile() };
+            if !arch::pte_present(value) || !arch::pte_is_table(value, level) {
+                missing = true;
+                break;
+            }
+            table = arch::pte_phys(value);
+        }
+        if !missing {
+            let leaf = entry_ptr(table, va, 0);
+            let value = unsafe { leaf.read_volatile() };
+            if arch::pte_present(value) {
+                let phys = arch::pte_phys(value);
+                let mut new_pte = arch::pte_leaf(phys, device);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if !writable {
+                        new_pte &= !(1 << 1);
+                    }
+                    if user {
+                        new_pte |= 1 << 2;
+                    }
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if !writable {
+                        new_pte |= 1 << 7;
+                    }
+                    if user {
+                        new_pte |= 1 << 6;
+                    }
+                }
+                #[cfg(target_arch = "riscv64")]
+                {
+                    if !writable {
+                        new_pte &= !(1 << 2);
+                    }
+                    if user {
+                        new_pte |= 1 << 4;
+                    }
+                }
+                unsafe { leaf.write_volatile(new_pte) };
+            }
+        }
+    }
+    arch::tlb_shootdown(virtual_address, pages);
+    Ok(())
+}
+
 fn entry_ptr(table: u64, virtual_address: u64, level: usize) -> *mut u64 {
     let shift = 12 + level * 9;
     let index = ((virtual_address >> shift) & 0x1ff) as usize;
