@@ -17,6 +17,7 @@
 extern crate alloc;
 
 mod arch;
+pub mod block;
 mod boot;
 pub mod cpuid;
 pub mod fpu;
@@ -35,6 +36,7 @@ pub mod syscall;
 mod time;
 pub mod tty;
 pub mod user;
+pub mod vfs;
 
 use core::panic::PanicInfo;
 
@@ -160,6 +162,14 @@ pub extern "C" fn kmain() -> ! {
     assert!(interrupt_ready, "scheduler requires interrupt controller");
     arch::serial_enable_irq();
     hardware::ps2::init();
+    block::init();
+    vfs::init();
+    #[cfg(feature = "boot-self-test")]
+    {
+        block::run_self_test();
+        vfs::run_self_test();
+        syscall::run_vfs_syscall_self_test();
+    }
     sched::init(boot::cpu_count());
     smp::start();
     kinfo!("Scheduler: per-CPU EEVDF ready");

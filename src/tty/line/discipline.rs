@@ -80,7 +80,7 @@ impl LineDiscipline {
             }
             return self.echo(byte);
         }
-        if byte == self.termios.erase {
+        if byte == self.termios.erase || byte == 0x08 || byte == 0x7f {
             if self.pending_len == 0 {
                 return InputEvent::None;
             }

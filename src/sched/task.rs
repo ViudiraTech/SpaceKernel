@@ -131,6 +131,7 @@ pub(crate) struct Task {
     pub(crate) entry: Option<Box<dyn FnOnce() + Send>>,
     pub(crate) stack: Option<KernelStack>,
     pub(crate) address_space: Option<Arc<SpinLock<crate::user::UserAddressSpace>>>,
+    pub(crate) fd_table: Arc<SpinLock<crate::vfs::FileDescriptorTable>>,
 }
 
 pub(crate) struct KernelStack {
@@ -227,6 +228,9 @@ impl Task {
             entry,
             stack,
             address_space: None,
+            fd_table: Arc::new(SpinLock::new(
+                crate::vfs::FileDescriptorTable::new_with_stdio(),
+            )),
         }))))
     }
 }

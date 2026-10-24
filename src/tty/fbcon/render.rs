@@ -13,7 +13,7 @@ use super::{Cell, DEFAULT_BACKGROUND, FbConsole, GLYPH_HEIGHT, GLYPH_WIDTH};
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 
 impl FbConsole {
-    pub(super) fn redraw(&self) {
+    pub(super) fn redraw(&mut self) {
         self.clear_screen();
         for row in 0..self.rows {
             for column in 0..self.columns {
@@ -26,8 +26,57 @@ impl FbConsole {
         }
     }
 
-    pub(super) fn clear_screen(&self) {
+    pub(super) fn clear_screen(&mut self) {
         let background = self.pack(DEFAULT_BACKGROUND);
+        let dst = self.address as *mut u8;
+        let is_stride_contiguous = self.pitch == self.width * self.bytes_per_pixel;
+
+        #[cfg(target_arch = "x86_64")]
+        if self.bytes_per_pixel == 4 {
+            if let Some(scratch) = self.fpu_scratch.as_mut() {
+                // Must be executed inside the explicit `with_kernel` section
+                let success = unsafe {
+                    crate::fpu::with_kernel(scratch, || {
+                        if is_stride_contiguous {
+                            super::simd::spacekernel_fpsimd_fb_clear(
+                                dst,
+                                self.height * self.pitch,
+                                background,
+                            );
+                        } else {
+                            let line_bytes = self.width * self.bytes_per_pixel;
+                            for y in 0..self.height {
+                                super::simd::spacekernel_fpsimd_fb_clear(
+                                    dst.add(y * self.pitch),
+                                    line_bytes,
+                                    background,
+                                );
+                            }
+                        }
+                    })
+                };
+                if success.is_ok() {
+                    return;
+                }
+            }
+        }
+
+        // Fast 64-bit integer path (fallback for non-x86_64 or when FPU scratch borrow is inactive)
+        if self.bytes_per_pixel == 4 {
+            unsafe {
+                if is_stride_contiguous {
+                    super::simd::fast_clear(dst, self.height * self.pitch, background);
+                } else {
+                    let line_bytes = self.width * self.bytes_per_pixel;
+                    for y in 0..self.height {
+                        super::simd::fast_clear(dst.add(y * self.pitch), line_bytes, background);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Byte-by-byte fallback for 24bpp
         for y in 0..self.height {
             for x in 0..self.width {
                 self.draw_packed_pixel(x, y, background);
@@ -35,16 +84,27 @@ impl FbConsole {
         }
     }
 
-    pub(super) fn scroll_pixels(&self) {
+    pub(super) fn scroll_pixels(&mut self) {
         let bytes = (self.rows - 1) * GLYPH_HEIGHT * self.pitch;
-        // SAFETY: both ranges are inside the validated framebuffer mapping;
-        // `copy` handles overlap, and the TTY lock excludes concurrent draws.
+        let dst = self.address as *mut u8;
+        let src = (self.address + GLYPH_HEIGHT * self.pitch) as *const u8;
+
+        #[cfg(target_arch = "x86_64")]
+        if let Some(scratch) = self.fpu_scratch.as_mut() {
+            // Must be executed inside the explicit `with_kernel` section
+            let success = unsafe {
+                crate::fpu::with_kernel(scratch, || {
+                    super::simd::spacekernel_fpsimd_fb_copy(dst, src, bytes);
+                })
+            };
+            if success.is_ok() {
+                return;
+            }
+        }
+
+        // Fast 64-bit integer copy (fallback for non-x86_64 or when FPU scratch borrow is inactive)
         unsafe {
-            core::ptr::copy(
-                (self.address + GLYPH_HEIGHT * self.pitch) as *const u8,
-                self.address as *mut u8,
-                bytes,
-            );
+            super::simd::fast_copy(dst, src, bytes);
         }
     }
 
@@ -55,6 +115,22 @@ impl FbConsole {
             .unwrap_or([0; 8]);
         let foreground = self.pack(cell.foreground);
         let background = self.pack(cell.background);
+        if self.bytes_per_pixel == 4 {
+            let base_offset = row * GLYPH_HEIGHT * self.pitch + column * GLYPH_WIDTH * 4;
+            for y in 0..GLYPH_HEIGHT {
+                let bits = glyph[y / 2];
+                let line_ptr = (self.address + base_offset + y * self.pitch) as *mut u32;
+                for x in 0..GLYPH_WIDTH {
+                    let color = if bits & (1 << x) != 0 {
+                        foreground
+                    } else {
+                        background
+                    };
+                    unsafe { line_ptr.add(x).write_volatile(color) };
+                }
+            }
+            return;
+        }
         for y in 0..GLYPH_HEIGHT {
             let bits = glyph[y / 2];
             for x in 0..GLYPH_WIDTH {

@@ -11,6 +11,7 @@
 //! Limine framebuffer console, split by terminal state and rendering.
 mod ansi;
 mod render;
+mod simd;
 mod state;
 mod terminal;
 
@@ -49,6 +50,7 @@ pub struct FbConsole {
     rows: usize,
     active: usize,
     terminals: Vec<Terminal>,
+    fpu_scratch: Option<crate::fpu::State>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +106,8 @@ impl FbConsole {
         for _ in 0..VT_COUNT {
             terminals.push(Terminal::new(columns, rows));
         }
-        let result = Self {
+        let fpu_scratch = crate::fpu::State::new().ok();
+        let mut result = Self {
             address: framebuffer.address() as usize,
             pitch,
             width,
@@ -120,6 +123,7 @@ impl FbConsole {
             rows,
             active: 0,
             terminals,
+            fpu_scratch,
         };
         result.clear_screen();
         Ok(result)

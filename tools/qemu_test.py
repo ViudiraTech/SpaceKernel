@@ -11,8 +11,10 @@
 
 import selectors
 import argparse
+import os
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -44,6 +46,31 @@ def main():
         command += ["-cpu", cpu]
     if args.accel:
         command += ["-accel", args.accel]
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="spacekernel_disks_")
+    nvme_img = os.path.join(temp_dir.name, "nvme.img")
+    sata_img = os.path.join(temp_dir.name, "sata.img")
+    for p in (nvme_img, sata_img):
+        with open(p, "wb") as f:
+            f.truncate(4 * 1024 * 1024)
+
+    command += [
+        "-drive", f"file={nvme_img},if=none,id=nvme0,format=raw",
+        "-device", "nvme,serial=SKNVME01,drive=nvme0",
+        "-device", "ich9-ahci,id=ahci0",
+        "-drive", f"file={sata_img},if=none,id=sata0,format=raw",
+        "-device", "ide-hd,drive=sata0,bus=ahci0.0",
+    ]
+    if arch == "x86_64":
+        ide_img = os.path.join(temp_dir.name, "ide.img")
+        with open(ide_img, "wb") as f:
+            f.truncate(4 * 1024 * 1024)
+        command += [
+            "-device", "piix3-ide,id=ide0",
+            "-drive", f"file={ide_img},if=none,id=pata0,format=raw",
+            "-device", "ide-hd,drive=pata0,bus=ide0.0",
+        ]
+
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)

@@ -125,9 +125,55 @@ config PCI
     help
       Enable PCIe ECAM config space discovery and device enumeration.
 
+config BLOCK
+    bool "Block device layer, LRU sector cache and MBR/GPT partitioning"
+    default y
+    help
+      Enable the unified block device layer, LRU sector cache, RAMDisk,
+      and automatic MBR/GPT partition table discovery.
+
+config IDE
+    bool "PCI IDE / PATA storage driver (Bus Master DMA + LBA28/48 PIO)"
+    depends on BLOCK && PCI
+    default y
+    help
+      Enable PCI IDE / PATA controller support with Bus Master PRDT DMA
+      transfers and automatic LBA28/LBA48 PIO fallback.
+
+config AHCI
+    bool "PCI AHCI 1.0 SATA HBA driver (Command List / FIS / PRDT DMA)"
+    depends on BLOCK && PCI
+    default y
+    help
+      Enable AHCI 1.0 SATA Host Bus Adapter support using ABAR MMIO,
+      Command Lists, H2D Register FIS, and PRDT DMA.
+
+config NVME
+    bool "PCIe NVMe 1.4 storage driver (Admin/IO Queue Pairs & PRP DMA)"
+    depends on BLOCK && PCI
+    default y
+    help
+      Enable PCIe NVMe controller and namespace support using Admin and I/O
+      Submission/Completion Queue Pairs, Doorbells, and PRP DMA.
+
 endmenu
 
 menu "Kernel Features & Subsystems"
+
+config VFS
+    bool "Linux ABI Virtual File System (RamFS / DevFS / ProcFS)"
+    default y
+    help
+      Enable the Linux 64-bit ABI compliant Virtual File System layer,
+      per-task file descriptor tables, pipes, and virtual filesystems.
+
+config FAT32
+    bool "FAT32 (VFAT) filesystem driver with Long File Name (LFN) support"
+    depends on VFS && BLOCK
+    default y
+    help
+      Enable on-disk FAT32 filesystem mounting, formatting, cluster allocation,
+      and VFAT Long File Name read/write support.
 
 config EEVDF_SCHED
     bool "EEVDF preemptive fair scheduler"

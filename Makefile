@@ -133,15 +133,24 @@ iso: kernel limine
 	$(if $(filter x86_64,$(ARCH)),$(LIMINE_DIR)/limine bios-install $(ISO),true)
 	@printf 'ISO ready: %s\n' '$(ISO)'
 
-run: iso
-	$(QEMU) $(QEMU_FLAGS) -display gtk -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -cdrom $(ISO)
+DISK_DIR := build/disks
+QEMU_STORAGE_FLAGS := -drive file=$(DISK_DIR)/nvme.img,if=none,id=nvme0,format=raw -device nvme,serial=SKNVME01,drive=nvme0 -device ich9-ahci,id=ahci0 -drive file=$(DISK_DIR)/sata.img,if=none,id=sata0,format=raw -device ide-hd,drive=sata0,bus=ahci0.0 $(if $(filter x86_64,$(ARCH)),-device piix3-ide,id=ide0 -drive file=$(DISK_DIR)/ide.img,if=none,id=pata0,format=raw -device ide-hd,drive=pata0,bus=ide0.0,)
 
-debug: iso
-	$(QEMU) $(QEMU_FLAGS) -display gtk -S -s -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -cdrom $(ISO)
+disks:
+	mkdir -p $(DISK_DIR)
+	@for img in nvme.img sata.img ide.img; do \
+	  [ -f $(DISK_DIR)/$$img ] || truncate -s 4M $(DISK_DIR)/$$img; \
+	done
+
+run: iso disks
+	$(QEMU) $(QEMU_FLAGS) $(QEMU_STORAGE_FLAGS) -display gtk -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -cdrom $(ISO)
+
+debug: iso disks
+	$(QEMU) $(QEMU_FLAGS) $(QEMU_STORAGE_FLAGS) -display gtk -S -s -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -cdrom $(ISO)
 
 test: iso
 	python3 tools/check_no_simd.py $(ARCH) $(KERNEL)
-	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'CPU/FPU self-test passed' --require 'PMM/VMM/SLAB/TTY/IRQ/FDT self-test passed' --require 'scheduler self-test passed',) --online-cpus $(CPUS)
+	python3 tools/qemu_test.py $(ARCH) $(ISO) $(FIRMWARE) $(CPUS) $(MEMORY_MIB) --machine '$(MACHINE)' $(if $(strip $(QEMU_CPU)),--cpu $(word 2,$(QEMU_CPU)),) $(if $(filter y,$(CONFIG_BOOT_SELF_TEST)),--require 'CPU/FPU self-test passed' --require 'PMM/VMM/SLAB/TTY/IRQ/FDT self-test passed' --require 'block & storage drivers self-test passed' --require 'VFS (RamFS/DevFS/ProcFS/FAT32) self-test passed' --require 'Linux ABI VFS syscall self-test passed' --require 'scheduler self-test passed',) --online-cpus $(CPUS)
 
 test-sched-model:
 	mkdir -p build

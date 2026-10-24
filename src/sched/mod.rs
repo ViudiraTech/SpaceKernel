@@ -536,7 +536,9 @@ fn spawn_placed(
 
 pub fn task_snapshots() -> Vec<TaskStats> {
     let mut list = Vec::new();
-    let s = scheduler();
+    let Some(s) = try_scheduler() else {
+        return list;
+    };
     for cpu in &s.cpus {
         let q = cpu.queue.lock();
         if let Some(ref node) = q.current {
@@ -553,4 +555,12 @@ pub fn task_snapshots() -> Vec<TaskStats> {
         list.push(node.value.stats());
     });
     list
+}
+
+pub fn task_list() -> Vec<TaskStats> {
+    task_snapshots()
+}
+
+pub fn current_fd_table() -> Option<alloc::sync::Arc<SpinLock<crate::vfs::FileDescriptorTable>>> {
+    current().map(|task| task.lock().fd_table.clone())
 }

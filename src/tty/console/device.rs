@@ -68,10 +68,26 @@ pub fn receive(device: TtyDevice, byte: u8) -> InputEvent {
         _ => None,
     };
     if let Some((bytes, length)) = echo_bytes {
-        match number {
-            None => write_serial(&bytes[..length]),
-            Some(number) => {
+        let active = state.active_vt;
+        match device {
+            TtyDevice::Serial0 => {
+                write_serial(&bytes[..length]);
                 if let Some(framebuffer) = state.framebuffer.as_mut() {
+                    framebuffer.write(active, &bytes[..length]);
+                }
+            }
+            TtyDevice::Foreground => {
+                if state.serial {
+                    write_serial(&bytes[..length]);
+                }
+                if let Some(framebuffer) = state.framebuffer.as_mut() {
+                    framebuffer.write(active, &bytes[..length]);
+                }
+            }
+            _ => {
+                if let Some(number) = number
+                    && let Some(framebuffer) = state.framebuffer.as_mut()
+                {
                     framebuffer.write(number, &bytes[..length]);
                 }
             }

@@ -87,12 +87,16 @@ impl FbConsole {
                     self.put_char(index, ' ');
                 }
             }
-            0x08 => {
+            0x08 | 0x7f => {
+                let columns = self.columns;
                 let terminal = &mut self.terminals[index];
                 if terminal.wrap_pending {
                     terminal.wrap_pending = false;
-                } else {
-                    terminal.x = terminal.x.saturating_sub(1);
+                } else if terminal.x > 0 {
+                    terminal.x -= 1;
+                } else if terminal.y > 0 {
+                    terminal.y -= 1;
+                    terminal.x = columns.saturating_sub(1);
                 }
             }
             0x20..=0x7e => self.put_char(index, byte as char),
