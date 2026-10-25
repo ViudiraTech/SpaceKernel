@@ -429,7 +429,11 @@ impl UnixSocket {
         if self.state.lock().peer.is_some() {
             return Err(VfsError::AlreadyConnected);
         }
-        let client_address = match self.state.lock().bound.clone() {
+        let bound = {
+            let state = self.state.lock();
+            state.bound.clone()
+        };
+        let client_address = match bound {
             Some(address) => address,
             None => {
                 let address = autobind(self)?;

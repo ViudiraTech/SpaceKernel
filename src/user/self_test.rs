@@ -383,6 +383,7 @@ pub fn syscalls() {
     assert_eq!(dispatch(SYS_CLOSE, pair[1] as u64, 0, 0, 0, 0, 0), 0);
 
     // SOCK_DGRAM socketpair preserves message boundaries and MSG_TRUNC length.
+    crate::self_test::verbose_log(format_args!("ipc selftest: dgram"));
     assert_eq!(dispatch(SYS_SOCKETPAIR, 1, 2, 0, 0x10500, 0, 0), 0);
     let dgram_left = read_i32(0x10500);
     let dgram_right = read_i32(0x10504);
@@ -421,6 +422,7 @@ pub fn syscalls() {
 
     // Pathname stream socket: bind/listen/connect/accept, getsockname,
     // getpeername and SO_PEERCRED.
+    crate::self_test::verbose_log(format_args!("ipc selftest: pathname"));
     let path = b"/tmp/afunix-test.sock\0";
     let mut address = [0u8; 32];
     address[0] = 1;
@@ -507,6 +509,7 @@ pub fn syscalls() {
     assert_eq!(u32::from_le_bytes(credentials[4..8].try_into().unwrap()), 0);
 
     // Abstract namespace: same flow without a filesystem path.
+    crate::self_test::verbose_log(format_args!("ipc selftest: abstract"));
     let abstract_address = [1u8, 0, 0, b'a', b'b', b's'];
     scratch
         .lock()
@@ -574,6 +577,7 @@ pub fn syscalls() {
     );
 
     // SCM_RIGHTS with a control buffer too small: MSG_CTRUNC and no fd.
+    crate::self_test::verbose_log(format_args!("ipc selftest: rights"));
     assert_eq!(dispatch(SYS_SOCKETPAIR, 1, 1, 0, 0x10800, 0, 0), 0);
     let rights_left = read_i32(0x10800);
     let rights_right = read_i32(0x10804);
@@ -660,6 +664,7 @@ pub fn syscalls() {
     assert_eq!(dispatch(SYS_CLOSE, received_fd as u64, 0, 0, 0, 0, 0), 0);
 
     // SO_PASSCRED delivers SCM_CREDENTIALS.
+    crate::self_test::verbose_log(format_args!("ipc selftest: credentials"));
     scratch
         .lock()
         .write_bytes(0x10810, &1i32.to_le_bytes())
@@ -707,6 +712,7 @@ pub fn syscalls() {
     );
 
     // fcntl(F_SETFL, O_NONBLOCK) changes socket blocking behavior.
+    crate::self_test::verbose_log(format_args!("ipc selftest: nonblock"));
     assert_eq!(
         dispatch(
             SYS_FCNTL,

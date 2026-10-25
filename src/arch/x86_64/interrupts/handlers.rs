@@ -135,10 +135,6 @@ pub(super) extern "x86-interrupt" fn page_fault(
         // Interrupt entry from user mode does not perform SWAPGS.
         unsafe { core::arch::asm!("swapgs", "lfence", options(nostack)) };
         let address = Cr2::read().map(|address| address.as_u64()).unwrap_or(0);
-        crate::self_test::verbose_log(format_args!(
-            "#PF user addr={:#x} code={:?} ip={:?}",
-            address, code, frame.instruction_pointer
-        ));
         if code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
             let handled = crate::sched::current()
                 .and_then(|task| task.address_space())

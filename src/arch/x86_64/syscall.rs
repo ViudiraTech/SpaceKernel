@@ -248,6 +248,9 @@ pub fn capture_user_context() -> Option<UserContext> {
 /// The current address space must be the target process's address space and the
 /// user stack/register state must be owned by the new task.
 pub unsafe fn enter_user_context(context: &UserContext) -> ! {
+    // A timer interrupt between SWAPGS and SYSRETQ would run kernel code with
+    // the user GS base, so the whole handoff is atomic with respect to IRQs.
+    crate::arch::disable_interrupts();
     write_msr(0xc000_0100, context.fs_base);
     write_msr(0xc000_0102, context.gs_base);
     // SAFETY: this code runs on the child task immediately before sysretq.
