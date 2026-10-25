@@ -101,6 +101,39 @@ pub fn run() {
         // Non-RELRO BSS page 0x3000_2000 remains writable
         assert!(s2.validate(0x3000_2000, 8, true).is_ok());
     }
+    {
+        // CoW fork: both sides start on one physical page, each side's first
+        // write gets a private copy, and dropping either side returns the
+        // retained frame to the PMM.
+        let free_before = crate::mm::pmm::stats().free;
+        let mut parent = UserAddressSpace::new().unwrap();
+        parent.map_zeroed(0x7000_0000, 8192, 3).unwrap();
+        parent.write_bytes(0x7000_0000, b"parent-cow").unwrap();
+        let mut child = parent.fork_copy().unwrap();
+        let mut bytes = [0u8; 10];
+        child.read_bytes(0x7000_0000, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"parent-cow");
+        parent.write_bytes(0x7000_0000, b"parent-new").unwrap();
+        child.read_bytes(0x7000_0000, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"parent-cow");
+        parent.read_bytes(0x7000_0000, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"parent-new");
+        child.write_bytes(0x7000_0000, b"child-new").unwrap();
+        child.read_bytes(0x7000_0000, &mut bytes[..9]).unwrap();
+        assert_eq!(&bytes[..9], b"child-new");
+        parent.read_bytes(0x7000_0000, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"parent-new");
+        drop(child);
+        parent.write_bytes(0x7000_0000, b"parent-end").unwrap();
+        parent.read_bytes(0x7000_0000, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"parent-end");
+        drop(parent);
+        assert_eq!(
+            crate::mm::pmm::stats().free,
+            free_before,
+            "CoW fork leaked physical frames"
+        );
+    }
     assert_eq!(
         crate::mm::pmm::stats().free,
         free,

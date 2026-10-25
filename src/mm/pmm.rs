@@ -20,6 +20,7 @@ static PMM: SpinLock<State> = SpinLock::new(State::empty());
 struct State {
     used_addr: usize,
     usable_addr: usize,
+    refs_addr: usize,
     frames: usize,
     free: usize,
     hint: usize,
@@ -30,6 +31,7 @@ impl State {
         Self {
             used_addr: 0,
             usable_addr: 0,
+            refs_addr: 0,
             frames: 0,
             free: 0,
             hint: 0,
@@ -55,6 +57,20 @@ impl State {
     fn free_frame(&self, frame: usize) -> bool {
         self.bit(self.usable_addr, frame) && !self.bit(self.used_addr, frame)
     }
+
+    fn refs(&self) -> *mut u16 {
+        self.refs_addr as *mut u16
+    }
+
+    fn ref_count(&self, frame: usize) -> u16 {
+        // SAFETY: refs_addr covers all `frames` entries and the lock serializes.
+        unsafe { self.refs().add(frame).read() }
+    }
+
+    fn set_ref_count(&self, frame: usize, value: u16) {
+        // SAFETY: as above; frame is always bounded by self.frames.
+        unsafe { self.refs().add(frame).write(value) }
+    }
 }
 
 pub struct Stats {
@@ -73,25 +89,34 @@ pub fn init(entries: &[&Entry], hhdm: u64) {
         .expect("no usable RAM");
     let frames = max_end.div_ceil(PAGE_SIZE) as usize;
     let bitmap_bytes = frames.div_ceil(8);
-    let bitmap_pages = ((bitmap_bytes * 2) as u64).div_ceil(PAGE_SIZE);
+    // Two bitmaps (used/usable) followed by a page-aligned u16 refcount array.
+    let refs_offset = (bitmap_bytes * 2).div_ceil(PAGE_SIZE as usize) * PAGE_SIZE as usize;
+    let metadata_bytes = refs_offset + frames * core::mem::size_of::<u16>();
+    let metadata_pages = (metadata_bytes as u64).div_ceil(PAGE_SIZE);
     let bitmap_phys = entries
         .iter()
         .filter(|e| e.type_ == MEMMAP_USABLE)
         .find_map(|e| {
             let first = e.base.max(PAGE_SIZE).div_ceil(PAGE_SIZE) * PAGE_SIZE;
             let end = e.base.checked_add(e.length)?;
-            (first.checked_add(bitmap_pages * PAGE_SIZE)? <= end).then_some(first)
+            (first.checked_add(metadata_pages * PAGE_SIZE)? <= end).then_some(first)
         })
-        .expect("no room for PMM bitmaps");
+        .expect("no room for PMM metadata");
     let bitmap_virt = hhdm.checked_add(bitmap_phys).expect("HHDM overflow") as usize;
     // SAFETY: the chosen pages are usable and hence present in Limine's HHDM;
     // they are reserved before the allocator is published to other CPUs.
     unsafe {
         core::ptr::write_bytes(bitmap_virt as *mut u8, 0xff, bitmap_bytes);
         core::ptr::write_bytes((bitmap_virt + bitmap_bytes) as *mut u8, 0, bitmap_bytes);
+        core::ptr::write_bytes(
+            (bitmap_virt + refs_offset) as *mut u8,
+            0,
+            frames * core::mem::size_of::<u16>(),
+        );
     }
     state.used_addr = bitmap_virt;
     state.usable_addr = bitmap_virt + bitmap_bytes;
+    state.refs_addr = bitmap_virt + refs_offset;
     state.frames = frames;
     for entry in entries.iter().filter(|e| e.type_ == MEMMAP_USABLE) {
         let start = entry.base.max(PAGE_SIZE).div_ceil(PAGE_SIZE) as usize;
@@ -110,13 +135,13 @@ pub fn init(entries: &[&Entry], hhdm: u64) {
         }
     }
     for frame in
-        (bitmap_phys / PAGE_SIZE) as usize..((bitmap_phys / PAGE_SIZE) + bitmap_pages) as usize
+        (bitmap_phys / PAGE_SIZE) as usize..((bitmap_phys / PAGE_SIZE) + metadata_pages) as usize
     {
         state.set_bit(state.used_addr, frame, true);
         state.set_bit(state.usable_addr, frame, false); // Permanent metadata, never allocatable/freeable.
         state.free -= 1;
     }
-    state.hint = (bitmap_phys / PAGE_SIZE + bitmap_pages) as usize;
+    state.hint = (bitmap_phys / PAGE_SIZE + metadata_pages) as usize;
     HHDM.store(hhdm, Ordering::Release);
 }
 
@@ -136,6 +161,31 @@ pub fn stats() -> Stats {
     }
 }
 
+fn span(physical: u64, pages: usize) -> Result<(usize, usize), &'static str> {
+    if !physical.is_multiple_of(PAGE_SIZE) || pages == 0 {
+        return Err("invalid frame span");
+    }
+    let first = (physical / PAGE_SIZE) as usize;
+    let end = first.checked_add(pages).ok_or("frame span overflow")?;
+    Ok((first, end))
+}
+
+fn check_allocated(state: &State, first: usize, end: usize) -> Result<(), &'static str> {
+    if first == 0 || end > state.frames {
+        return Err("frame span out of bounds");
+    }
+    for frame in first..end {
+        if !state.bit(state.usable_addr, frame) || !state.bit(state.used_addr, frame) {
+            return Err("frame not allocated");
+        }
+        if state.ref_count(frame) == 0 {
+            return Err("frame refcount zero");
+        }
+    }
+    Ok(())
+}
+
+/// Allocation is exclusive: the frame starts with one reference.
 pub fn alloc(pages: usize) -> Option<u64> {
     if pages == 0 {
         return None;
@@ -162,6 +212,8 @@ pub fn alloc(pages: usize) -> Option<u64> {
                 let first = frame + 1 - pages;
                 for index in first..=frame {
                     state.set_bit(state.used_addr, index, true);
+                    debug_assert_eq!(state.ref_count(index), 0);
+                    state.set_ref_count(index, 1);
                 }
                 state.free -= pages;
                 state.hint = (frame + 1).min(state.frames);
@@ -172,28 +224,71 @@ pub fn alloc(pages: usize) -> Option<u64> {
     None
 }
 
+/// Free an exclusively owned frame span. Shared frames must go through
+/// `release`; returning an error here prevents a double free from silently
+/// dropping another mapping's page.
 pub fn free(physical: u64, pages: usize) -> Result<(), &'static str> {
-    if !physical.is_multiple_of(PAGE_SIZE) || pages == 0 {
-        return Err("invalid frame span");
-    }
-    let first = (physical / PAGE_SIZE) as usize;
+    let (first, end) = span(physical, pages)?;
     let mut state = PMM.lock();
-    if first == 0
-        || first
-            .checked_add(pages)
-            .is_none_or(|end| end > state.frames)
-    {
-        return Err("frame span out of bounds");
-    }
-    for frame in first..first + pages {
-        if !state.bit(state.usable_addr, frame) || !state.bit(state.used_addr, frame) {
-            return Err("frame not allocated");
+    check_allocated(&state, first, end)?;
+    for frame in first..end {
+        if state.ref_count(frame) != 1 {
+            return Err("frame is shared");
         }
     }
-    for frame in first..first + pages {
+    for frame in first..end {
         state.set_bit(state.used_addr, frame, false);
+        state.set_ref_count(frame, 0);
     }
-    state.free += pages;
+    state.free += end - first;
     state.hint = state.hint.min(first);
     Ok(())
+}
+
+/// Add one reference to every frame in a span. Used by CoW fork before the
+/// parent/child page tables are published.
+pub fn retain(physical: u64, pages: usize) -> Result<(), &'static str> {
+    let (first, end) = span(physical, pages)?;
+    let state = PMM.lock();
+    check_allocated(&state, first, end)?;
+    if (first..end).any(|frame| state.ref_count(frame) == u16::MAX) {
+        return Err("frame refcount overflow");
+    }
+    for frame in first..end {
+        state.set_ref_count(frame, state.ref_count(frame) + 1);
+    }
+    Ok(())
+}
+
+/// Drop one reference from every frame in a span. Frames reaching zero return
+/// to the free pool; shared frames stay allocated.
+pub fn release(physical: u64, pages: usize) -> Result<(), &'static str> {
+    let (first, end) = span(physical, pages)?;
+    let mut state = PMM.lock();
+    check_allocated(&state, first, end)?;
+    let mut freed = 0;
+    for frame in first..end {
+        let next = state.ref_count(frame) - 1;
+        state.set_ref_count(frame, next);
+        if next == 0 {
+            state.set_bit(state.used_addr, frame, false);
+            freed += 1;
+        }
+    }
+    state.free += freed;
+    state.hint = state.hint.min(first);
+    Ok(())
+}
+
+/// Current reference count for a 4 KiB frame.
+pub fn refcount(physical: u64) -> Result<u16, &'static str> {
+    let (first, _) = span(physical, 1)?;
+    let state = PMM.lock();
+    if first == 0 || first >= state.frames {
+        return Err("frame out of bounds");
+    }
+    if !state.bit(state.usable_addr, first) || !state.bit(state.used_addr, first) {
+        return Err("frame not allocated");
+    }
+    Ok(state.ref_count(first))
 }

@@ -80,6 +80,21 @@ pub fn run() {
     mm::pmm::free(frame, 2).expect("PMM free failed");
     assert_eq!(mm::pmm::stats().free, before);
 
+    // CoW prerequisite: alloc starts at one reference, retain/release balance,
+    // and a shared frame cannot be freed as if it were exclusive.
+    let shared = mm::pmm::alloc(2).expect("shared PMM allocation failed");
+    mm::pmm::retain(shared, 2).expect("PMM retain failed");
+    assert_eq!(mm::pmm::refcount(shared).expect("refcount"), 2);
+    assert!(mm::pmm::free(shared, 2).is_err(), "shared frame was freed");
+    mm::pmm::release(shared, 2).expect("PMM release failed");
+    assert_eq!(mm::pmm::refcount(shared).expect("refcount"), 1);
+    mm::pmm::free(shared, 2).expect("PMM free after release failed");
+    assert_eq!(mm::pmm::stats().free, before);
+    let dropped = mm::pmm::alloc(1).expect("release allocation failed");
+    mm::pmm::release(dropped, 1).expect("PMM release to zero failed");
+    assert_eq!(mm::pmm::stats().free, before);
+    assert!(mm::pmm::refcount(dropped).is_err());
+
     let region = mm::vmm::reserve(1).expect("VMM reservation failed");
     assert_eq!(region.pages(), 1);
     let mapped_frame = mm::pmm::alloc(1).expect("VMM backing frame failed");

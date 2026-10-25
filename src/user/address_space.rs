@@ -26,6 +26,7 @@ pub const PROT_WRITE: u32 = 2;
 pub const PROT_EXEC: u32 = 4;
 const MAX_MAPPING: u64 = 256 * 1024 * 1024;
 
+#[derive(Clone)]
 struct Mapping {
     physical: u64,
     kernel: u64,
@@ -33,6 +34,7 @@ struct Mapping {
     prot: u32,
     max_prot: u32,
     owned: bool,
+    cow: bool,
     owner: Option<Arc<dyn Inode>>,
 }
 
@@ -84,6 +86,118 @@ impl UserAddressSpace {
             brk: 0x2000_0000,
             image: None,
         })
+    }
+
+    /// Copy this address space for `fork`/`clone` without CLONE_VM.
+    ///
+    /// Every privately owned page is retained and mapped read-only in both
+    /// parent and child.  The first write fault copies the page.  Shared
+    /// device/file mappings keep their physical page and are not refcounted;
+    /// their `Inode` owner already outlives the mapping.
+    pub fn fork_copy(&mut self) -> Result<Self, &'static str> {
+        let mut child = Self::new()?;
+        child.brk_base = self.brk_base;
+        child.brk = self.brk;
+        child.image = self.image.clone();
+
+        for (&address, mapping) in &self.mapped_frames {
+            let mut copy = mapping.clone();
+            if mapping.owned {
+                pmm::retain(mapping.physical, 1)?;
+                copy.cow = true;
+            } else {
+                copy.cow = false;
+            }
+            if let Err(error) = child.install_mapping(address, copy) {
+                if mapping.owned {
+                    let _ = pmm::release(mapping.physical, 1);
+                }
+                return Err(error);
+            }
+        }
+
+        // Publish the parent side only after the child is complete, so a
+        // failed fork never leaves the parent with dangling COW state.
+        let owned: Vec<(u64, u64, u32)> = self
+            .mapped_frames
+            .iter()
+            .filter(|(_, mapping)| mapping.owned)
+            .map(|(&address, mapping)| (address, mapping.physical, mapping.prot))
+            .collect();
+        for (address, physical, prot) in owned {
+            let leaf = self.leaf(address, false)?;
+            // SAFETY: the address is present in mapped_frames and the leaf
+            // belongs to this private address space.
+            unsafe { leaf.write_volatile(user_leaf(physical, prot & !PROT_WRITE)) };
+            if let Some(mapping) = self.mapped_frames.get_mut(&address) {
+                mapping.cow = true;
+            }
+            arch::tlb_shootdown(address, 1);
+        }
+        Ok(child)
+    }
+
+    /// Resolve a write fault on a COW page.  Returns false when the address is
+    /// not a writable COW mapping, so the arch fault path can deliver SIGSEGV.
+    pub fn cow_break(&mut self, address: u64) -> Result<bool, VfsError> {
+        let page = address & !4095;
+        let Some(mapping) = self.mapped_frames.get(&page) else {
+            return Err(VfsError::Fault);
+        };
+        if !mapping.cow || mapping.prot & PROT_WRITE == 0 {
+            return Ok(false);
+        }
+        let old = mapping.physical;
+        let prot = mapping.prot;
+        let references = pmm::refcount(old).map_err(|_| VfsError::IoError)?;
+        let leaf = self.leaf(page, false).map_err(|_| VfsError::Fault)?;
+        if references == 1 {
+            // The other sharers exited; reuse the frame and restore write.
+            // SAFETY: the leaf is present and owned by this address space.
+            unsafe { leaf.write_volatile(user_leaf(old, prot)) };
+            if let Some(mapping) = self.mapped_frames.get_mut(&page) {
+                mapping.cow = false;
+            }
+            arch::flush_page(page);
+            return Ok(true);
+        }
+        let fresh = pmm::alloc(1).ok_or(VfsError::NoMemory)?;
+        // SAFETY: both frames are exclusively referenced for the duration of
+        // the copy; the old frame stays readable until the PTE is replaced.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                pmm::phys_to_virt(old) as *const u8,
+                pmm::phys_to_virt(fresh) as *mut u8,
+                PAGE_SIZE as usize,
+            );
+        }
+        if pmm::release(old, 1).is_err() {
+            let _ = pmm::free(fresh, 1);
+            return Err(VfsError::IoError);
+        }
+        // SAFETY: as above; the new frame is now owned by this mapping.
+        unsafe { leaf.write_volatile(user_leaf(fresh, prot)) };
+        if let Some(mapping) = self.mapped_frames.get_mut(&page) {
+            mapping.physical = fresh;
+            mapping.kernel = pmm::phys_to_virt(fresh) as u64;
+            mapping.owned = true;
+            mapping.cow = false;
+        }
+        arch::flush_page(page);
+        Ok(true)
+    }
+
+    fn ensure_writable(&mut self, address: u64, length: usize) -> Result<(), VfsError> {
+        if length == 0 {
+            return Ok(());
+        }
+        let end = address.checked_add(length as u64).ok_or(VfsError::Fault)?;
+        let mut page = address & !4095;
+        while page < end {
+            self.cow_break(page)?;
+            page += PAGE_SIZE;
+        }
+        Ok(())
     }
 
     pub fn root_physical(&self) -> u64 {
@@ -224,29 +338,41 @@ impl UserAddressSpace {
         owned: bool,
         owner: Option<Arc<dyn Inode>>,
     ) -> Result<(), &'static str> {
-        if physical % PAGE_SIZE != 0
-            || !arch::paging_geometry().valid_physical(physical)
-            || prot & !7 != 0
+        let mapping = Mapping {
+            physical,
+            kernel: pmm::phys_to_virt(physical) as u64,
+            uncached: false,
+            prot,
+            max_prot: if owner.is_some() { 3 } else { 7 },
+            owned,
+            cow: false,
+            owner,
+        };
+        self.install_mapping(address, mapping)
+    }
+
+    fn install_mapping(&mut self, address: u64, mapping: Mapping) -> Result<(), &'static str> {
+        if mapping.physical % PAGE_SIZE != 0
+            || !arch::paging_geometry().valid_physical(mapping.physical)
+            || mapping.prot & !7 != 0
             || self.mapped_frames.contains_key(&address)
         {
             return Err("invalid or overlapping mapping");
         }
         let leaf = self.leaf(address, true)?;
-        let value = user_leaf(physical, prot);
+        let pte_prot = if mapping.cow {
+            mapping.prot & !PROT_WRITE
+        } else {
+            mapping.prot
+        };
+        let value = if mapping.uncached {
+            external_leaf(mapping.physical, pte_prot, true)
+        } else {
+            user_leaf(mapping.physical, pte_prot)
+        };
         // SAFETY: exclusively owned leaf; frame is retained in mapped_frames.
         unsafe { leaf.write_volatile(value) };
-        self.mapped_frames.insert(
-            address,
-            Mapping {
-                physical,
-                kernel: pmm::phys_to_virt(physical) as u64,
-                uncached: false,
-                prot,
-                max_prot: if owner.is_some() { 3 } else { 7 },
-                owned,
-                owner,
-            },
-        );
+        self.mapped_frames.insert(address, mapping);
         arch::flush_page(address);
         Ok(())
     }
@@ -362,7 +488,8 @@ impl UserAddressSpace {
         self.copy_pages(address, dst.as_mut_ptr(), dst.len(), false)
     }
 
-    pub fn write_bytes(&self, address: u64, src: &[u8]) -> Result<(), VfsError> {
+    pub fn write_bytes(&mut self, address: u64, src: &[u8]) -> Result<(), VfsError> {
+        self.ensure_writable(address, src.len())?;
         self.validate(address, src.len(), true)?;
         self.copy_pages(address, src.as_ptr() as *mut u8, src.len(), true)
     }
@@ -428,7 +555,7 @@ impl UserAddressSpace {
         for page in keys {
             if let Some(m) = self.mapped_frames.remove(&page) {
                 if m.owned {
-                    let _ = pmm::free(m.physical, 1);
+                    let _ = pmm::release(m.physical, 1);
                 }
             }
         }
@@ -475,7 +602,8 @@ impl UserAddressSpace {
         for page in (address..address + length).step_by(4096) {
             let m = self.mapped_frames.get_mut(&page).unwrap();
             m.prot = prot;
-            let value = external_leaf(m.physical, prot, m.uncached);
+            let pte_prot = if m.cow { prot & !PROT_WRITE } else { prot };
+            let value = external_leaf(m.physical, pte_prot, m.uncached);
             let leaf = self.leaf(page, false).map_err(|_| VfsError::Fault)?;
             unsafe { leaf.write_volatile(value) };
         }
@@ -552,10 +680,11 @@ impl UserAddressSpace {
 
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
-        // Free mapped physical frames
+        // Drop one reference from privately owned frames; COW pages may
+        // still be mapped by another address space.
         for m in self.mapped_frames.values() {
             if m.owned {
-                let _ = pmm::free(m.physical, 1);
+                let _ = pmm::release(m.physical, 1);
             }
         }
         // Free intermediate page table frames
