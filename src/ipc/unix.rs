@@ -685,6 +685,9 @@ impl UnixSocket {
         if max == 0 {
             return Ok(Received::default());
         }
+        if self.state.lock().peer.is_none() {
+            return Err(VfsError::NotConnected);
+        }
         loop {
             {
                 let mut state = self.state.lock();
@@ -749,6 +752,9 @@ impl UnixSocket {
     }
 
     fn receive_packet(&self, max: usize, peek: bool, dontwait: bool) -> Result<Received, VfsError> {
+        if self.kind() == SocketKind::Seqpacket && self.state.lock().peer.is_none() {
+            return Err(VfsError::NotConnected);
+        }
         loop {
             {
                 let mut state = self.state.lock();
