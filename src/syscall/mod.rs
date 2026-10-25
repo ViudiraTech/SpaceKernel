@@ -664,6 +664,58 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
             Err(e) => e.to_errno(),
         };
     }
+    if matches!(cmd, abi::TIOCGPGRP | abi::TIOCSPGRP | abi::TIOCGSID) {
+        if entry.file.abs_path != "/dev/console" {
+            return -abi::ENOTTY;
+        }
+        let Some(task) = sched::current() else {
+            return -abi::ESRCH;
+        };
+        let stats = task.stats();
+        if !stats.user {
+            return -abi::ENOTTY;
+        }
+        match cmd {
+            abi::TIOCGPGRP => {
+                if crate::tty::controlling_session() != stats.sid {
+                    return -abi::ENOTTY;
+                }
+                let pgrp = crate::tty::foreground_pgrp() as u32;
+                return match uaccess::write_value(arg, &pgrp) {
+                    Ok(()) => 0,
+                    Err(e) => e.to_errno(),
+                };
+            }
+            abi::TIOCGSID => {
+                if crate::tty::controlling_session() != stats.sid {
+                    return -abi::ENOTTY;
+                }
+                let sid = stats.sid as u32;
+                return match uaccess::write_value(arg, &sid) {
+                    Ok(()) => 0,
+                    Err(e) => e.to_errno(),
+                };
+            }
+            _ => {
+                let pgrp = match uaccess::read_value::<u32>(arg) {
+                    Ok(pgrp) => pgrp as u64,
+                    Err(e) => return e.to_errno(),
+                };
+                let caller = stats.sid;
+                let same_session = sched::tasks().into_iter().any(|task| {
+                    let other = task.stats();
+                    other.user && other.pgid == pgrp && other.sid == caller
+                });
+                if pgrp == 0 || !same_session {
+                    return -abi::EPERM;
+                }
+                if !crate::tty::set_foreground_pgrp(caller, pgrp) {
+                    return -abi::EPERM;
+                }
+                return 0;
+            }
+        }
+    }
     match entry.file.inode.ioctl(cmd, arg) {
         Ok(val) => {
             if cmd == abi::TCGETS && arg != 0 {

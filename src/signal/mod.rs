@@ -260,6 +260,43 @@ pub fn send_to_process(pid: u64, signal: Signal) -> bool {
     if members.is_empty() {
         return false;
     }
+    if signal.number == SIGCONT {
+        // SIGCONT is not blockable and resumes every thread even when it is
+        // parked in the default stop action.
+        for member in &members {
+            let thread = member.thread_signals();
+            {
+                let mut state = thread.lock();
+                state.stopped = false;
+                state.stop_signal = 0;
+            }
+            send_to_thread(member, signal);
+        }
+        let leader = members
+            .iter()
+            .find(|member| {
+                let stats = member.stats();
+                stats.ltid == stats.tgid
+            })
+            .cloned()
+            .unwrap_or_else(|| members[0].clone());
+        let stats = leader.stats();
+        {
+            let mut task = leader.lock();
+            task.stop_signal = 0;
+            task.stop_reported = false;
+            task.continue_pending = true;
+        }
+        notify_parent_event(stats.ppid, stats.tgid, CLD_CONTINUED);
+        return true;
+    }
+    if is_stop_signal(signal.number) {
+        // Process-directed stop applies to every thread in the group.
+        for member in &members {
+            send_to_thread(member, signal);
+        }
+        return true;
+    }
     let bit = signal_bit(signal.number);
     for member in &members {
         let state = member.thread_signals();
@@ -274,6 +311,32 @@ pub fn send_to_process(pid: u64, signal: Signal) -> bool {
     let mut queue = shared.shared_pending();
     enqueue(&mut queue, signal);
     true
+}
+
+/// Deliver a kernel-generated signal to a process group (TTY control).
+pub fn send_to_pgrp(pgid: u64, number: u32) -> bool {
+    if number == 0 || number > SIGRTMAX {
+        return false;
+    }
+    send_to_group(pgid, Signal::kernel(number))
+}
+
+fn is_stop_signal(number: u32) -> bool {
+    matches!(number, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
+}
+
+fn notify_parent_event(ppid: u64, pid: u64, code: i32) {
+    if ppid == 0 {
+        return;
+    }
+    let signal = Signal {
+        number: SIGCHLD,
+        code,
+        pid: pid as u32,
+        uid: 0,
+        value: 0,
+    };
+    let _ = send_to_process(ppid, signal);
 }
 
 pub fn current_pid() -> u32 {
@@ -768,13 +831,22 @@ fn terminate_group(task: &sched::TaskRef, signal: u32, core: bool) -> ! {
 
 #[cfg(target_arch = "x86_64")]
 fn stop_current(task: &sched::TaskRef, signal: u32) {
+    let stats = task.stats();
     let thread = task.thread_signals();
     {
         let mut state = thread.lock();
         state.stopped = true;
         state.stop_signal = signal;
     }
-    while thread.lock().stopped {
+    if stats.user && stats.ltid == stats.tgid {
+        let mut task = task.lock();
+        task.stop_signal = signal;
+        task.stop_reported = false;
+    }
+    notify_parent_event(stats.ppid, stats.tgid, CLD_STOPPED);
+    // SIGCONT clears `stopped` from the sender side; a fatal pending signal
+    // also ends the park so the delivery loop can terminate the task.
+    while thread.lock().stopped && !pending_for_current() {
         crate::sched::sleep_micros(1000);
     }
 }

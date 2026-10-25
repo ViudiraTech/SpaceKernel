@@ -22,6 +22,8 @@ pub struct Termios {
     pub kill: u8,
     pub eof: u8,
     pub interrupt: u8,
+    pub quit: u8,
+    pub suspend: u8,
 }
 
 impl Default for Termios {
@@ -35,6 +37,8 @@ impl Default for Termios {
             kill: 0x15,
             eof: 0x04,
             interrupt: 0x03,
+            quit: 0x1c,
+            suspend: 0x1a,
         }
     }
 }
@@ -45,6 +49,8 @@ pub enum InputEvent {
     Echo { bytes: [u8; 3], length: usize },
     LineReady,
     Interrupt,
+    Quit,
+    Suspend,
     Overflow,
 }
 

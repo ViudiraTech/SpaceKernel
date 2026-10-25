@@ -122,7 +122,10 @@ pub const DT_SOCK: u8 = 12;
 
 // Common ioctl Requests
 pub const TCGETS: u64 = 0x5401;
+pub const TIOCGPGRP: u64 = 0x540F;
+pub const TIOCSPGRP: u64 = 0x5410;
 pub const TIOCGWINSZ: u64 = 0x5413;
+pub const TIOCGSID: u64 = 0x5429;
 pub const BLKROGET: u64 = 0x125E;
 pub const BLKGETSIZE: u64 = 0x1260;
 pub const BLKSSZGET: u64 = 0x1268;

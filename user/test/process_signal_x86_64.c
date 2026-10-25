@@ -230,6 +230,88 @@ int main(void) {
         fail("E:status2\n");
     }
 
+    /* Job control: SIGSTOP parks the child, WUNTRACED reports it, SIGCONT
+     * resumes it and WCONTINUED reports the transition. */
+    child = sys_fork();
+    if (child == 0) {
+        for (;;) {
+            __asm__ volatile("pause");
+        }
+    }
+    if (child < 0) {
+        fail("E:fork3\n");
+    }
+    wait_frames(20000);
+    if (sys_kill(child, SIGSTOP) != 0) {
+        fail("E:stopkill\n");
+    }
+    status = 0;
+    reaped = sys_wait4(child, &status, WUNTRACED, 0);
+    if (reaped != child || ((status >> 8) & 0xff) != SIGSTOP || (status & 0xff) != 0x7f) {
+        fail("E:stopwait\n");
+    }
+    if (sys_kill(child, SIGCONT) != 0) {
+        fail("E:contkill\n");
+    }
+    status = 0;
+    reaped = sys_wait4(child, &status, WCONTINUED, 0);
+    if (reaped != child || (status & 0xffff) != 0xffff) {
+        fail("E:contwait\n");
+    }
+    if (sys_kill(child, 9) != 0) {
+        fail("E:stopkill2\n");
+    }
+    if (sys_wait4(child, &status, 0, 0) != child) {
+        fail("E:stopreap\n");
+    }
+
+    /* Controlling terminal: claim it, read back the foreground pgrp and the
+     * session id through the console ioctls. */
+    i32 pgrp = (i32)me;
+    if (sys_ioctl(0, TIOCSPGRP, (u64)&pgrp) != 0) {
+        fail("E:spgrp\n");
+    }
+    pgrp = 0;
+    if (sys_ioctl(0, TIOCGPGRP, (u64)&pgrp) != 0 || pgrp != (i32)me) {
+        fail("E:gpgrp\n");
+    }
+    u32 session = 0;
+    if (sys_ioctl(0, TIOCGSID, (u64)&session) != 0 || session != (u32)me) {
+        fail("E:gsid\n");
+    }
+
+    /* A background process group reading the console gets SIGTTIN. */
+    child = sys_fork();
+    if (child == 0) {
+        if (sys_setpgid(0, 0) != 0) {
+            fail("E:bgpgid\n");
+        }
+        char byte;
+        sys_read(0, &byte, 1);
+        for (;;) {
+            __asm__ volatile("pause");
+        }
+    }
+    if (child < 0) {
+        fail("E:fork4\n");
+    }
+    wait_frames(20000);
+    status = 0;
+    reaped = sys_wait4(child, &status, WUNTRACED, 0);
+    if (reaped != child || ((status >> 8) & 0xff) != SIGTTIN) {
+        fail("E:ttin\n");
+    }
+    if (sys_kill(child, SIGCONT) != 0) {
+        fail("E:ttincont\n");
+    }
+    wait_frames(2000);
+    if (sys_kill(child, 9) != 0) {
+        fail("E:ttinkill\n");
+    }
+    if (sys_wait4(child, &status, 0, 0) != child) {
+        fail("E:ttinreap\n");
+    }
+
     const char ok[] = "process/signal ok\n";
     sys_write(1, ok, sizeof(ok) - 1);
     sys_exit_group(42);

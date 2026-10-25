@@ -15,7 +15,7 @@ SECTIONS
 {
     . = 0x200000;
     .text : { *(.text*) *(.rodata*) } :text
-    . = 0x201000;
+    . = 0x210000;
     .data : { *(.data*) *(.bss*) *(COMMON) } :data
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }

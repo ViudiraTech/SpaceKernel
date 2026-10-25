@@ -16,9 +16,11 @@ typedef unsigned short u16;
 
 #define SYS_READ 0
 #define SYS_WRITE 1
+#define SYS_READ 0
 #define SYS_RT_SIGACTION 13
 #define SYS_RT_SIGPROCMASK 14
 #define SYS_RT_SIGRETURN 15
+#define SYS_IOCTL 16
 #define SYS_SCHED_YIELD 24
 #define SYS_GETPID 39
 #define SYS_CLONE 56
@@ -37,6 +39,10 @@ typedef unsigned short u16;
 #define SIGUSR1 10
 #define SIGUSR2 12
 #define SIGTERM 15
+#define SIGSTOP 19
+#define SIGCONT 18
+#define SIGTTIN 21
+#define SIGQUIT 3
 
 #define SIG_BLOCK 0
 #define SIG_UNBLOCK 1
@@ -49,6 +55,13 @@ typedef unsigned short u16;
 #define FUTEX_PRIVATE_FLAG 128
 
 #define ETIMEDOUT 110
+
+#define TIOCGPGRP 0x540F
+#define TIOCSPGRP 0x5410
+#define TIOCGSID 0x5429
+
+#define WUNTRACED 2
+#define WCONTINUED 8
 
 #define SA_SIGINFO 4
 #define SA_RESTORER 0x04000000
@@ -105,6 +118,12 @@ static inline i64 sys_setpgid(i64 pid, i64 pgid) {
 static inline i64 sys_getpgid(i64 pid) { return syscall3(SYS_GETPGID, pid, 0, 0); }
 static inline i64 sys_getsid(i64 pid) { return syscall3(SYS_GETSID, pid, 0, 0); }
 static inline i64 sys_sched_yield(void) { return syscall3(SYS_SCHED_YIELD, 0, 0, 0); }
+static inline i64 sys_read(i64 fd, void *buffer, u64 length) {
+    return syscall3(SYS_READ, fd, (i64)buffer, (i64)length);
+}
+static inline i64 sys_ioctl(i64 fd, u64 command, u64 argument) {
+    return syscall3(SYS_IOCTL, fd, (i64)command, (i64)argument);
+}
 static inline i64 sys_rt_sigaction(i64 sig, const void *act, void *old, u64 size) {
     return syscall6(SYS_RT_SIGACTION, sig, (i64)act, (i64)old, size, 0, 0);
 }

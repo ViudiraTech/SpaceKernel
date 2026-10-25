@@ -36,6 +36,18 @@ impl Inode for ConsoleInode {
         if buf.is_empty() {
             return Ok(0);
         }
+        if let Some(task) = crate::sched::current() {
+            let stats = task.stats();
+            let session = tty::controlling_session();
+            if stats.user
+                && session != 0
+                && stats.sid == session
+                && stats.pgid != tty::foreground_pgrp()
+            {
+                let _ = crate::signal::send_to_pgrp(stats.pgid, crate::signal::SIGTTIN);
+                return Err(VfsError::WouldBlock);
+            }
+        }
         tty::poll_serial();
         match tty::read(TtyDevice::Serial0, buf) {
             Ok(n) if n > 0 => Ok(n),

@@ -218,38 +218,40 @@ const WNOHANG: u32 = 1;
 const WUNTRACED: u32 = 2;
 const WCONTINUED: u32 = 8;
 
-/// Linux wait4 subset.  Stopped/continued states are not implemented yet and
-/// are rejected rather than treated as absent.
+/// Linux wait4.  rusage accounting is not implemented yet and is rejected
+/// rather than filled with fabricated values; stopped/continued states are
+/// reported for WUNTRACED/WCONTINUED.
 pub fn wait4(pid: i64, status: u64, options: u32, rusage: u64) -> i64 {
-    if rusage != 0 || options & !WNOHANG != 0 {
+    if rusage != 0 {
         return -abi::ENOSYS;
     }
-    let _ = (WUNTRACED, WCONTINUED);
+    if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
+        return -abi::EINVAL;
+    }
     let Some(current) = crate::sched::current() else {
         return -abi::ESRCH;
     };
     let parent = current.stats().tgid;
     let pgid = current.stats().pgid;
+    let matches = |child: u64, child_pgid: u64| -> bool {
+        if pid == -1 {
+            true
+        } else if pid == 0 {
+            child_pgid == pgid
+        } else if pid > 0 {
+            child == pid as u64
+        } else {
+            child_pgid == pid.unsigned_abs()
+        }
+    };
     loop {
         for zombie in crate::sched::zombies() {
             let stats = zombie.stats();
-            if stats.ppid != parent {
+            if stats.ppid != parent || !matches(stats.tgid, stats.pgid) {
                 continue;
             }
             // A process with live threads cannot be reaped yet.
             if crate::sched::group_has_live_threads(stats.tgid) {
-                continue;
-            }
-            let matches = if pid == -1 {
-                true
-            } else if pid == 0 {
-                stats.pgid == pgid
-            } else if pid > 0 {
-                stats.tgid == pid as u64
-            } else {
-                stats.pgid == pid.unsigned_abs()
-            };
-            if !matches {
                 continue;
             }
             let Some(zombie) = crate::sched::take_zombie(stats.tgid) else {
@@ -263,11 +265,71 @@ pub fn wait4(pid: i64, status: u64, options: u32, rusage: u64) -> i64 {
             }
             return stats.tgid as i64;
         }
+        if options & WUNTRACED != 0 {
+            for task in crate::sched::tasks() {
+                let stats = task.stats();
+                if !stats.user
+                    || stats.ppid != parent
+                    || stats.ltid != stats.tgid
+                    || stats.state == crate::sched::TaskState::Zombie
+                    || !matches(stats.tgid, stats.pgid)
+                {
+                    continue;
+                }
+                let stopped = {
+                    let mut task = task.lock();
+                    if task.stop_signal != 0 && !task.stop_reported {
+                        task.stop_reported = true;
+                        Some(task.stop_signal)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(signal) = stopped {
+                    let encoded = ((signal as i32) << 8) | 0x7f;
+                    if status != 0
+                        && let Err(error) = uaccess::write_value(status, &encoded)
+                    {
+                        return error.to_errno();
+                    }
+                    return stats.tgid as i64;
+                }
+            }
+        }
+        if options & WCONTINUED != 0 {
+            for task in crate::sched::tasks() {
+                let stats = task.stats();
+                if !stats.user
+                    || stats.ppid != parent
+                    || stats.ltid != stats.tgid
+                    || stats.state == crate::sched::TaskState::Zombie
+                    || !matches(stats.tgid, stats.pgid)
+                {
+                    continue;
+                }
+                let continued = {
+                    let mut task = task.lock();
+                    core::mem::take(&mut task.continue_pending)
+                };
+                if continued {
+                    let encoded = 0xffffi32;
+                    if status != 0
+                        && let Err(error) = uaccess::write_value(status, &encoded)
+                    {
+                        return error.to_errno();
+                    }
+                    return stats.tgid as i64;
+                }
+            }
+        }
         if !crate::sched::has_children(parent) {
             return -abi::ECHILD;
         }
         if options & WNOHANG != 0 {
             return 0;
+        }
+        if crate::signal::pending_for_current() {
+            return -abi::EINTR;
         }
         crate::sched::sleep_micros(1000);
     }

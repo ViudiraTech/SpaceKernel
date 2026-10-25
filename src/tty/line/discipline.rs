@@ -43,6 +43,8 @@ impl LineDiscipline {
                 kill: 0x15,
                 eof: 0x04,
                 interrupt: 0x03,
+                quit: 0x1c,
+                suspend: 0x1a,
             },
             pending: [0; INPUT_CAPACITY],
             pending_len: 0,
@@ -73,6 +75,14 @@ impl LineDiscipline {
         if self.termios.signals && byte == self.termios.interrupt {
             self.pending_len = 0;
             return InputEvent::Interrupt;
+        }
+        if self.termios.signals && byte == self.termios.quit {
+            self.pending_len = 0;
+            return InputEvent::Quit;
+        }
+        if self.termios.signals && byte == self.termios.suspend {
+            self.pending_len = 0;
+            return InputEvent::Suspend;
         }
         if !self.termios.canonical {
             if !self.push(byte) {

@@ -94,6 +94,19 @@ pub fn receive(device: TtyDevice, byte: u8) -> InputEvent {
             }
         }
     }
+    let control_signal = match event {
+        InputEvent::Interrupt => Some(crate::signal::SIGINT),
+        InputEvent::Quit => Some(crate::signal::SIGQUIT),
+        InputEvent::Suspend => Some(crate::signal::SIGTSTP),
+        _ => None,
+    };
+    let foreground = state.foreground_pgrp;
+    drop(state);
+    if let Some(number) = control_signal
+        && foreground != 0
+    {
+        let _ = crate::signal::send_to_pgrp(foreground, number);
+    }
     event
 }
 

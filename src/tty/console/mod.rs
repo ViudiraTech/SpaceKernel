@@ -33,6 +33,8 @@ struct State {
     framebuffer_unavailable: bool,
     serial_line: LineDiscipline,
     virtual_lines: [LineDiscipline; VT_COUNT],
+    session: u64,
+    foreground_pgrp: u64,
 }
 
 impl State {
@@ -47,6 +49,8 @@ impl State {
             framebuffer_unavailable: false,
             serial_line: LineDiscipline::new(),
             virtual_lines: [const { LineDiscipline::new() }; VT_COUNT],
+            session: 0,
+            foreground_pgrp: 0,
         }
     }
 }
@@ -116,6 +120,38 @@ pub fn init() {
     if let Some(framebuffer) = state.framebuffer.as_mut() {
         framebuffer.switch_to(active);
     }
+}
+
+/// Session that owns this console, or 0 when unclaimed.
+pub fn controlling_session() -> u64 {
+    CONSOLE.lock().session
+}
+
+pub fn foreground_pgrp() -> u64 {
+    CONSOLE.lock().foreground_pgrp
+}
+
+/// Claim the console for `sid` if it has no owner yet.
+pub fn assign_session(sid: u64) -> bool {
+    let mut state = CONSOLE.lock();
+    if state.session == 0 {
+        state.session = sid;
+    }
+    state.session == sid
+}
+
+/// Set the foreground process group. The caller has already checked that the
+/// group belongs to this session.
+pub fn set_foreground_pgrp(sid: u64, pgrp: u64) -> bool {
+    let mut state = CONSOLE.lock();
+    if state.session == 0 {
+        state.session = sid;
+    }
+    if state.session != sid {
+        return false;
+    }
+    state.foreground_pgrp = pgrp;
+    true
 }
 
 pub fn status() -> ConsoleStatus {
