@@ -45,6 +45,23 @@ pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
+pub const EPROTO: i64 = 71;
+pub const ENOTSOCK: i64 = 88;
+pub const EDESTADDRREQ: i64 = 89;
+pub const EMSGSIZE: i64 = 90;
+pub const EPROTOTYPE: i64 = 91;
+pub const ENOPROTOOPT: i64 = 92;
+pub const EPROTONOSUPPORT: i64 = 93;
+pub const ESOCKTNOSUPPORT: i64 = 94;
+pub const EAFNOSUPPORT: i64 = 97;
+pub const EADDRINUSE: i64 = 98;
+pub const EADDRNOTAVAIL: i64 = 99;
+pub const ECONNRESET: i64 = 104;
+pub const ENOBUFS: i64 = 105;
+pub const EISCONN: i64 = 106;
+pub const ENOTCONN: i64 = 107;
+pub const ETOOMANYREFS: i64 = 109;
+pub const ECONNREFUSED: i64 = 111;
 
 // Open Flags (O_*)
 pub const O_RDONLY: u32 = 0;
@@ -100,6 +117,7 @@ pub const DT_DIR: u8 = 4;
 pub const DT_BLK: u8 = 6;
 pub const DT_REG: u8 = 8;
 pub const DT_LNK: u8 = 10;
+pub const DT_SOCK: u8 = 12;
 
 // Common ioctl Requests
 pub const TCGETS: u64 = 0x5401;
@@ -194,6 +212,7 @@ impl From<Stat> for LinuxStat {
             InodeKind::BlockDevice => S_IFBLK,
             InodeKind::Symlink => S_IFLNK,
             InodeKind::Fifo => S_IFIFO,
+            InodeKind::Socket => S_IFSOCK,
         };
         let mode = type_bits | (s.mode & 0o7777);
         #[cfg(target_arch = "x86_64")]
@@ -310,6 +329,7 @@ pub fn encode_dirents64(
             InodeKind::BlockDevice => DT_BLK,
             InodeKind::Symlink => DT_LNK,
             InodeKind::Fifo => DT_FIFO,
+            InodeKind::Socket => DT_SOCK,
         };
         let next_off = (idx + 1) as i64;
         let slot = &mut out_buf[written..written + reclen];

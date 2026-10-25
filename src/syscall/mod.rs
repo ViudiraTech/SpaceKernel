@@ -76,6 +76,22 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
         SYS_DUP3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as u32),
         SYS_PIPE2 => sys_pipe2(arg0 as *mut i32, arg1 as u32),
         SYS_EVENTFD2 => crate::ipc::eventfd2(arg0 as u32, arg1 as u32),
+        SYS_SOCKETPAIR => crate::ipc::socketpair(arg0, arg1, arg2, arg3),
+        SYS_SENDMSG => crate::ipc::sendmsg(arg0, arg1, arg2),
+        SYS_RECVMSG => crate::ipc::recvmsg(arg0, arg1, arg2),
+        SYS_SHUTDOWN => crate::ipc::shutdown(arg0, arg1 as u32),
+        SYS_SOCKET => crate::ipc::socket(arg0, arg1, arg2),
+        SYS_BIND => crate::ipc::bind(arg0, arg1, arg2),
+        SYS_LISTEN => crate::ipc::listen(arg0, arg1),
+        SYS_CONNECT => crate::ipc::connect(arg0, arg1, arg2),
+        SYS_ACCEPT => crate::ipc::accept4(arg0, arg1, arg2, 0),
+        SYS_ACCEPT4 => crate::ipc::accept4(arg0, arg1, arg2, arg3),
+        SYS_GETSOCKNAME => crate::ipc::getsockname(arg0, arg1, arg2),
+        SYS_GETPEERNAME => crate::ipc::getpeername(arg0, arg1, arg2),
+        SYS_SENDTO => crate::ipc::sendto(arg0, arg1, arg2, arg3, arg4, arg5),
+        SYS_RECVFROM => crate::ipc::recvfrom(arg0, arg1, arg2, arg3, arg4, arg5),
+        SYS_SETSOCKOPT => crate::ipc::setsockopt(arg0, arg1, arg2, arg3, arg4),
+        SYS_GETSOCKOPT => crate::ipc::getsockopt(arg0, arg1, arg2, arg3, arg4),
         SYS_FCNTL => sys_fcntl(arg0 as i32, arg1 as u32, arg2),
         SYS_IOCTL => sys_ioctl(arg0 as i32, arg1, arg2),
 
@@ -571,10 +587,10 @@ fn sys_fcntl(fd: i32, cmd: u32, arg: u64) -> i64 {
             }
         }
         abi::F_GETFL => entry.file.flags() as i64,
-        abi::F_SETFL => {
-            entry.file.set_flags(arg as u32);
-            0
-        }
+        abi::F_SETFL => match entry.file.set_flags(arg as u32) {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
+        },
         _ => -abi::EINVAL,
     }
 }
@@ -672,6 +688,16 @@ fn sys_newfstatat(dirfd: i32, path_ptr: *const u8, stat_ptr: *mut LinuxStat, fla
     let follow = (flags & abi::AT_SYMLINK_NOFOLLOW) == 0;
     let (inode, _) = match vfs::lookup_abs(&abs_path, follow) {
         Ok(r) => r,
+        Err(VfsError::NotFound) => {
+            if let Some(meta) = crate::ipc::unix::path_metadata(&abs_path) {
+                let lstat = LinuxStat::from(meta);
+                return match uaccess::write_value(stat_ptr as u64, &lstat) {
+                    Ok(()) => 0,
+                    Err(e) => e.to_errno(),
+                };
+            }
+            return -abi::ENOENT;
+        }
         Err(e) => return e.to_errno(),
     };
     match inode.metadata() {
@@ -746,6 +772,15 @@ fn sys_unlinkat(dirfd: i32, path_ptr: *const u8, flags: u32) -> i64 {
     let remove_dir = (flags & abi::AT_REMOVEDIR) != 0;
     match vfs::unlink_abs(&abs_path, remove_dir) {
         Ok(()) => 0,
+        Err(VfsError::NotFound) if !remove_dir => {
+            // Pathname AF_UNIX sockets have no VFS directory entry in this
+            // single-namespace implementation; unlink removes the binding.
+            if crate::ipc::unix::unbind_path(&abs_path) {
+                0
+            } else {
+                -abi::ENOENT
+            }
+        }
         Err(e) => e.to_errno(),
     }
 }

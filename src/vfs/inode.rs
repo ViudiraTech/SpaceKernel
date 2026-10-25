@@ -40,6 +40,19 @@ pub enum VfsError {
     NoDevice,
     TimedOut,
     ExecFormat,
+    AddressInUse,
+    AddressNotAvailable,
+    NotASocket,
+    ConnectionRefused,
+    ConnectionReset,
+    AlreadyConnected,
+    NotConnected,
+    ProtocolType,
+    AddressFamilyNotSupported,
+    MessageTooLong,
+    TooManyReferences,
+    NoProtocolOption,
+    DestinationRequired,
 }
 
 impl VfsError {
@@ -70,6 +83,19 @@ impl VfsError {
             Self::NoDevice => -abi::ENODEV,
             Self::TimedOut => -110,
             Self::ExecFormat => -8,
+            Self::AddressInUse => -abi::EADDRINUSE,
+            Self::AddressNotAvailable => -abi::EADDRNOTAVAIL,
+            Self::NotASocket => -abi::ENOTSOCK,
+            Self::ConnectionRefused => -abi::ECONNREFUSED,
+            Self::ConnectionReset => -abi::ECONNRESET,
+            Self::AlreadyConnected => -abi::EISCONN,
+            Self::NotConnected => -abi::ENOTCONN,
+            Self::ProtocolType => -abi::EPROTOTYPE,
+            Self::AddressFamilyNotSupported => -abi::EAFNOSUPPORT,
+            Self::MessageTooLong => -abi::EMSGSIZE,
+            Self::TooManyReferences => -abi::ETOOMANYREFS,
+            Self::NoProtocolOption => -abi::ENOPROTOOPT,
+            Self::DestinationRequired => -abi::EDESTADDRREQ,
         }
     }
 }
@@ -82,6 +108,7 @@ pub enum InodeKind {
     BlockDevice,
     Symlink,
     Fifo,
+    Socket,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -230,6 +257,11 @@ pub trait Inode: Send + Sync + core::any::Any {
 
     fn ioctl(&self, _cmd: u64, _arg: u64) -> Result<u64, VfsError> {
         Err(VfsError::NotATty)
+    }
+
+    /// Status-flag propagation for `fcntl(F_SETFL)`.
+    fn set_nonblock(&self, _nonblock: bool) -> Result<(), VfsError> {
+        Ok(())
     }
 
     fn sync(&self) -> Result<(), VfsError> {

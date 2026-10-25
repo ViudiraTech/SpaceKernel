@@ -205,9 +205,12 @@ impl OpenFile {
         *self.flags.lock()
     }
 
-    pub fn set_flags(&self, new_flags: u32) {
+    pub fn set_flags(&self, new_flags: u32) -> Result<(), VfsError> {
         let mut f = self.flags.lock();
-        *f = (*f & abi::O_ACCMODE) | (new_flags & !abi::O_ACCMODE);
+        let updated = (*f & abi::O_ACCMODE) | (new_flags & !abi::O_ACCMODE);
+        *f = updated;
+        self.inode.set_nonblock(updated & abi::O_NONBLOCK != 0)?;
+        Ok(())
     }
 
     pub fn offset(&self) -> u64 {
@@ -232,9 +235,15 @@ impl OpenFile {
         if meta.kind == InodeKind::Directory {
             return Err(VfsError::IsADirectory);
         }
-        let mut off = self.offset.lock();
-        let n = self.inode.read_at(*off, buf)?;
-        *off = off.saturating_add(n as u64);
+        if matches!(meta.kind, InodeKind::Regular | InodeKind::BlockDevice) {
+            let mut off = self.offset.lock();
+            let n = self.inode.read_at(*off, buf)?;
+            *off = off.saturating_add(n as u64);
+            return Ok(n);
+        }
+        // Sockets, pipes and character devices may block; their inode offset is
+        // unused, so never hold the open-file offset lock across the call.
+        let n = self.inode.read_at(0, buf)?;
         Ok(n)
     }
 
@@ -246,13 +255,17 @@ impl OpenFile {
         if meta.kind == InodeKind::Directory {
             return Err(VfsError::IsADirectory);
         }
-        let mut off = self.offset.lock();
-        if (self.flags() & abi::O_APPEND) != 0 {
-            *off = meta.size;
+        if matches!(meta.kind, InodeKind::Regular | InodeKind::BlockDevice) {
+            let mut off = self.offset.lock();
+            if (self.flags() & abi::O_APPEND) != 0 {
+                *off = meta.size;
+            }
+            let n = self.inode.write_at(*off, buf)?;
+            *off = off.saturating_add(n as u64);
+            return Ok(n);
         }
-        let n = self.inode.write_at(*off, buf)?;
-        *off = off.saturating_add(n as u64);
-        Ok(n)
+        // Blocking socket/pipe writes must not run under the offset spin lock.
+        self.inode.write_at(0, buf)
     }
 
     pub fn pread(&self, pos: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
@@ -263,7 +276,10 @@ impl OpenFile {
         if meta.kind == InodeKind::Directory {
             return Err(VfsError::IsADirectory);
         }
-        if meta.kind == InodeKind::Fifo {
+        if matches!(
+            meta.kind,
+            InodeKind::Fifo | InodeKind::Socket | InodeKind::CharDevice
+        ) {
             return Err(VfsError::IllegalSeek);
         }
         self.inode.read_at(pos, buf)
@@ -277,7 +293,10 @@ impl OpenFile {
         if meta.kind == InodeKind::Directory {
             return Err(VfsError::IsADirectory);
         }
-        if meta.kind == InodeKind::Fifo {
+        if matches!(
+            meta.kind,
+            InodeKind::Fifo | InodeKind::Socket | InodeKind::CharDevice
+        ) {
             return Err(VfsError::IllegalSeek);
         }
         self.inode.write_at(pos, buf)
@@ -285,7 +304,10 @@ impl OpenFile {
 
     pub fn seek(&self, offset: i64, whence: u32) -> Result<u64, VfsError> {
         let meta = self.inode.metadata()?;
-        if meta.kind == InodeKind::Fifo || meta.kind == InodeKind::CharDevice {
+        if matches!(
+            meta.kind,
+            InodeKind::Fifo | InodeKind::Socket | InodeKind::CharDevice
+        ) {
             return Err(VfsError::IllegalSeek);
         }
         let mut cur = self.offset.lock();

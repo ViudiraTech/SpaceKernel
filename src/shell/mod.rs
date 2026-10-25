@@ -231,6 +231,7 @@ fn cmd_ls(target: Option<&str>) {
                     InodeKind::BlockDevice => "blk ",
                     InodeKind::Symlink => "link",
                     InodeKind::Fifo => "fifo",
+                    InodeKind::Socket => "sock",
                 };
                 print_tty(&format!(
                     "{} {:7} {:8}  {}\n",

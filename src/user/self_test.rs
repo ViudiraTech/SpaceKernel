@@ -154,6 +154,16 @@ pub fn syscalls() {
     let scratch = Arc::new(SpinLock::new(UserAddressSpace::new().unwrap()));
     scratch.lock().map_zeroed(0x10000, 16384, 3).unwrap();
     task.lock().set_address_space(scratch.clone());
+    let read_i32 = |address: u64| -> i32 {
+        let mut bytes = [0u8; 4];
+        scratch.lock().read_bytes(address, &mut bytes).unwrap();
+        i32::from_le_bytes(bytes)
+    };
+    let read_u32 = |address: u64| -> u32 {
+        let mut bytes = [0u8; 4];
+        scratch.lock().read_bytes(address, &mut bytes).unwrap();
+        u32::from_le_bytes(bytes)
+    };
     assert_eq!(
         dispatch(SYS_WRITE, 1, UserAddressSpace::user_limit(), 8, 0, 0, 0),
         -abi::EFAULT
@@ -277,6 +287,469 @@ pub fn syscalls() {
         .unwrap();
     assert_eq!(u64::from_le_bytes(event_value), 1);
     assert_eq!(dispatch(SYS_CLOSE, sem as u64, 0, 0, 0, 0, 0), 0);
+
+    // AF_UNIX socketpair: byte stream, SCM_RIGHTS, shutdown/EOF
+    assert_eq!(dispatch(SYS_SOCKETPAIR, 1, 1, 0, 0x10300, 0, 0), 0);
+    let mut pair = [0i32; 2];
+    scratch
+        .lock()
+        .read_bytes(0x10300, unsafe {
+            core::slice::from_raw_parts_mut(pair.as_mut_ptr() as *mut u8, 8)
+        })
+        .unwrap();
+    scratch.lock().write_bytes(0x10310, b"hello").unwrap();
+    assert_eq!(dispatch(SYS_WRITE, pair[0] as u64, 0x10310, 5, 0, 0, 0), 5);
+    assert_eq!(dispatch(SYS_READ, pair[1] as u64, 0x10320, 5, 0, 0, 0), 5);
+    let mut stream = [0u8; 5];
+    scratch.lock().read_bytes(0x10320, &mut stream).unwrap();
+    assert_eq!(&stream, b"hello");
+
+    let carried = dispatch(SYS_EVENTFD2, 7, 0, 0, 0, 0, 0);
+    assert!(carried >= 0);
+    // sendmsg: one byte + SCM_RIGHTS(fd=carried)
+    let mut send_iovec = [0u8; 16];
+    send_iovec[0..8].copy_from_slice(&0x10310u64.to_le_bytes());
+    send_iovec[8..16].copy_from_slice(&1u64.to_le_bytes());
+    scratch.lock().write_bytes(0x10380, &send_iovec).unwrap();
+    let mut cmsg = [0u8; 24];
+    cmsg[0..8].copy_from_slice(&20u64.to_le_bytes());
+    cmsg[8..12].copy_from_slice(&1i32.to_le_bytes());
+    cmsg[12..16].copy_from_slice(&1i32.to_le_bytes());
+    cmsg[16..20].copy_from_slice(&(carried as i32).to_le_bytes());
+    scratch.lock().write_bytes(0x10390, &cmsg).unwrap();
+    let mut send_header = [0u8; 56];
+    send_header[16..24].copy_from_slice(&0x10380u64.to_le_bytes());
+    send_header[24..32].copy_from_slice(&1u64.to_le_bytes());
+    send_header[32..40].copy_from_slice(&0x10390u64.to_le_bytes());
+    send_header[40..48].copy_from_slice(&20u64.to_le_bytes());
+    scratch.lock().write_bytes(0x10340, &send_header).unwrap();
+    assert_eq!(
+        dispatch(SYS_SENDMSG, pair[0] as u64, 0x10340, 0, 0, 0, 0),
+        1
+    );
+
+    let mut recv_iovec = [0u8; 16];
+    recv_iovec[0..8].copy_from_slice(&0x10480u64.to_le_bytes());
+    recv_iovec[8..16].copy_from_slice(&1u64.to_le_bytes());
+    scratch.lock().write_bytes(0x103F0, &recv_iovec).unwrap();
+    let mut recv_header = [0u8; 56];
+    recv_header[16..24].copy_from_slice(&0x103F0u64.to_le_bytes());
+    recv_header[24..32].copy_from_slice(&1u64.to_le_bytes());
+    recv_header[32..40].copy_from_slice(&0x103B0u64.to_le_bytes());
+    recv_header[40..48].copy_from_slice(&64u64.to_le_bytes());
+    scratch.lock().write_bytes(0x10400, &recv_header).unwrap();
+    assert_eq!(
+        dispatch(SYS_RECVMSG, pair[1] as u64, 0x10400, 0, 0, 0, 0),
+        1
+    );
+    let mut received_byte = [0u8; 1];
+    scratch
+        .lock()
+        .read_bytes(0x10480, &mut received_byte)
+        .unwrap();
+    assert_eq!(received_byte[0], b'h');
+    let mut received_cmsg = [0u8; 20];
+    scratch
+        .lock()
+        .read_bytes(0x103B0, &mut received_cmsg)
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(received_cmsg[0..8].try_into().unwrap()),
+        20
+    );
+    let received_fd = i32::from_le_bytes(received_cmsg[16..20].try_into().unwrap());
+    assert!(received_fd >= 0);
+    scratch
+        .lock()
+        .write_bytes(0x10450, &9u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatch(SYS_WRITE, received_fd as u64, 0x10450, 8, 0, 0, 0),
+        8
+    );
+    assert_eq!(dispatch(SYS_READ, carried as u64, 0x10458, 8, 0, 0, 0), 8);
+    let mut carried_value = [0u8; 8];
+    scratch
+        .lock()
+        .read_bytes(0x10458, &mut carried_value)
+        .unwrap();
+    assert_eq!(u64::from_le_bytes(carried_value), 16);
+    assert_eq!(dispatch(SYS_CLOSE, received_fd as u64, 0, 0, 0, 0, 0), 0);
+    assert_eq!(dispatch(SYS_CLOSE, carried as u64, 0, 0, 0, 0, 0), 0);
+
+    assert_eq!(dispatch(SYS_SHUTDOWN, pair[0] as u64, 1, 0, 0, 0, 0), 0);
+    assert_eq!(dispatch(SYS_READ, pair[1] as u64, 0x10320, 1, 0, 0, 0), 0);
+    assert_eq!(dispatch(SYS_CLOSE, pair[0] as u64, 0, 0, 0, 0, 0), 0);
+    assert_eq!(dispatch(SYS_CLOSE, pair[1] as u64, 0, 0, 0, 0, 0), 0);
+
+    // SOCK_DGRAM socketpair preserves message boundaries and MSG_TRUNC length.
+    assert_eq!(dispatch(SYS_SOCKETPAIR, 1, 2, 0, 0x10500, 0, 0), 0);
+    let dgram_left = read_i32(0x10500);
+    let dgram_right = read_i32(0x10504);
+    scratch.lock().write_bytes(0x10510, b"one").unwrap();
+    assert_eq!(
+        dispatch(SYS_SENDTO, dgram_left as u64, 0x10510, 3, 0, 0, 0),
+        3
+    );
+    scratch.lock().write_bytes(0x10510, b"two!").unwrap();
+    assert_eq!(
+        dispatch(SYS_SENDTO, dgram_left as u64, 0x10510, 4, 0, 0, 0),
+        4
+    );
+    assert_eq!(
+        dispatch(SYS_RECVFROM, dgram_right as u64, 0x10520, 2, 0x20, 0, 0),
+        3,
+        "MSG_TRUNC must report the full datagram length"
+    );
+    let mut stream = [0u8; 8];
+    scratch
+        .lock()
+        .read_bytes(0x10520, &mut stream[..2])
+        .unwrap();
+    assert_eq!(&stream[..2], b"on");
+    assert_eq!(
+        dispatch(SYS_RECVFROM, dgram_right as u64, 0x10520, 16, 0, 0, 0),
+        4
+    );
+    scratch
+        .lock()
+        .read_bytes(0x10520, &mut stream[..4])
+        .unwrap();
+    assert_eq!(&stream[..4], b"two!");
+    assert_eq!(dispatch(SYS_CLOSE, dgram_left as u64, 0, 0, 0, 0, 0), 0);
+    assert_eq!(dispatch(SYS_CLOSE, dgram_right as u64, 0, 0, 0, 0, 0), 0);
+
+    // Pathname stream socket: bind/listen/connect/accept, getsockname,
+    // getpeername and SO_PEERCRED.
+    let path = b"/tmp/afunix-test.sock\0";
+    let mut address = [0u8; 32];
+    address[0] = 1;
+    address[2..2 + path.len()].copy_from_slice(path);
+    let address_len = 2 + path.len();
+    scratch
+        .lock()
+        .write_bytes(0x10600, &address[..address_len])
+        .unwrap();
+    let server = dispatch(SYS_SOCKET, 1, 1 | 0x80000, 0, 0, 0, 0);
+    assert!(server >= 0);
+    assert_eq!(
+        dispatch(
+            SYS_BIND,
+            server as u64,
+            0x10600,
+            address_len as u64,
+            0,
+            0,
+            0
+        ),
+        0
+    );
+    assert_eq!(dispatch(SYS_LISTEN, server as u64, 4, 0, 0, 0, 0), 0);
+    let client = dispatch(SYS_SOCKET, 1, 1, 0, 0, 0, 0);
+    assert!(client >= 0);
+    assert_eq!(
+        dispatch(
+            SYS_CONNECT,
+            client as u64,
+            0x10600,
+            address_len as u64,
+            0,
+            0,
+            0
+        ),
+        0
+    );
+    scratch
+        .lock()
+        .write_bytes(0x10770, &110u32.to_le_bytes())
+        .unwrap();
+    let accepted = dispatch(SYS_ACCEPT4, server as u64, 0x10700, 0x10770, 0x80000, 0, 0);
+    assert!(accepted >= 0);
+    assert!(read_u32(0x10770) > 2);
+    scratch.lock().write_bytes(0x10620, b"path").unwrap();
+    assert_eq!(dispatch(SYS_WRITE, client as u64, 0x10620, 4, 0, 0, 0), 4);
+    assert_eq!(dispatch(SYS_READ, accepted as u64, 0x10630, 4, 0, 0, 0), 4);
+    let mut payload = [0u8; 4];
+    scratch.lock().read_bytes(0x10630, &mut payload).unwrap();
+    assert_eq!(&payload, b"path");
+    scratch
+        .lock()
+        .write_bytes(0x10770, &110u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatch(SYS_GETPEERNAME, client as u64, 0x10700, 0x10770, 0, 0, 0),
+        0
+    );
+    let mut peer_address = [0u8; 32];
+    scratch
+        .lock()
+        .read_bytes(0x10700, &mut peer_address[..address_len])
+        .unwrap();
+    assert_eq!(u16::from_le_bytes([peer_address[0], peer_address[1]]), 1);
+    assert_eq!(&peer_address[2..2 + path.len()], path);
+    scratch
+        .lock()
+        .write_bytes(0x10780, &12u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatch(SYS_GETSOCKOPT, accepted as u64, 1, 17, 0x10790, 0x10780, 0),
+        0
+    );
+    let mut credentials = [0u8; 12];
+    scratch
+        .lock()
+        .read_bytes(0x10790, &mut credentials)
+        .unwrap();
+    assert_eq!(
+        u32::from_le_bytes(credentials[0..4].try_into().unwrap()),
+        task.stats().tgid as u32
+    );
+    assert_eq!(u32::from_le_bytes(credentials[4..8].try_into().unwrap()), 0);
+
+    // Abstract namespace: same flow without a filesystem path.
+    let abstract_address = [1u8, 0, 0, b'a', b'b', b's'];
+    scratch
+        .lock()
+        .write_bytes(0x10680, &abstract_address)
+        .unwrap();
+    let abstract_server = dispatch(SYS_SOCKET, 1, 1, 0, 0, 0, 0);
+    assert!(abstract_server >= 0);
+    assert_eq!(
+        dispatch(SYS_BIND, abstract_server as u64, 0x10680, 6, 0, 0, 0),
+        0
+    );
+    assert_eq!(
+        dispatch(SYS_LISTEN, abstract_server as u64, 4, 0, 0, 0, 0),
+        0
+    );
+    let abstract_client = dispatch(SYS_SOCKET, 1, 1, 0, 0, 0, 0);
+    assert_eq!(
+        dispatch(SYS_CONNECT, abstract_client as u64, 0x10680, 6, 0, 0, 0),
+        0
+    );
+    let abstract_accepted = dispatch(SYS_ACCEPT, abstract_server as u64, 0, 0, 0, 0, 0);
+    assert!(abstract_accepted >= 0);
+    scratch.lock().write_bytes(0x106A0, b"abs").unwrap();
+    assert_eq!(
+        dispatch(SYS_WRITE, abstract_client as u64, 0x106A0, 3, 0, 0, 0),
+        3
+    );
+    assert_eq!(
+        dispatch(SYS_READ, abstract_accepted as u64, 0x106B0, 3, 0, 0, 0),
+        3
+    );
+    scratch
+        .lock()
+        .read_bytes(0x106B0, &mut payload[..3])
+        .unwrap();
+    assert_eq!(&payload[..3], b"abs");
+
+    // unlink removes the pathname binding and later connects fail with ENOENT.
+    let path_string = b"/tmp/afunix-test.sock\0";
+    scratch.lock().write_bytes(0x106C0, path_string).unwrap();
+    assert_eq!(
+        dispatch(
+            SYS_UNLINKAT,
+            abi::AT_FDCWD as i64 as u64,
+            0x106C0,
+            0,
+            0,
+            0,
+            0
+        ),
+        0
+    );
+    let late_client = dispatch(SYS_SOCKET, 1, 1, 0, 0, 0, 0);
+    assert_eq!(
+        dispatch(
+            SYS_CONNECT,
+            late_client as u64,
+            0x10600,
+            address_len as u64,
+            0,
+            0,
+            0
+        ),
+        -abi::ENOENT
+    );
+
+    // SCM_RIGHTS with a control buffer too small: MSG_CTRUNC and no fd.
+    assert_eq!(dispatch(SYS_SOCKETPAIR, 1, 1, 0, 0x10800, 0, 0), 0);
+    let rights_left = read_i32(0x10800);
+    let rights_right = read_i32(0x10804);
+    let carried = dispatch(SYS_EVENTFD2, 7, 0, 0, 0, 0, 0);
+    assert!(carried >= 0);
+    scratch.lock().write_bytes(0x10B00, b"R").unwrap();
+    let mut send_iovec = [0u8; 16];
+    send_iovec[0..8].copy_from_slice(&0x10B00u64.to_le_bytes());
+    send_iovec[8..16].copy_from_slice(&1u64.to_le_bytes());
+    scratch.lock().write_bytes(0x10940, &send_iovec).unwrap();
+    let mut cmsg = [0u8; 20];
+    cmsg[0..8].copy_from_slice(&20u64.to_le_bytes());
+    cmsg[8..12].copy_from_slice(&1i32.to_le_bytes());
+    cmsg[12..16].copy_from_slice(&1i32.to_le_bytes());
+    cmsg[16..20].copy_from_slice(&(carried as i32).to_le_bytes());
+    scratch.lock().write_bytes(0x10950, &cmsg).unwrap();
+    let mut send_header = [0u8; 56];
+    send_header[16..24].copy_from_slice(&0x10940u64.to_le_bytes());
+    send_header[24..32].copy_from_slice(&1u64.to_le_bytes());
+    send_header[32..40].copy_from_slice(&0x10950u64.to_le_bytes());
+    send_header[40..48].copy_from_slice(&20u64.to_le_bytes());
+    scratch.lock().write_bytes(0x10900, &send_header).unwrap();
+    assert_eq!(
+        dispatch(SYS_SENDMSG, rights_left as u64, 0x10900, 0, 0, 0, 0),
+        1
+    );
+    let mut recv_iovec = [0u8; 16];
+    recv_iovec[0..8].copy_from_slice(&0x10B10u64.to_le_bytes());
+    recv_iovec[8..16].copy_from_slice(&8u64.to_le_bytes());
+    scratch.lock().write_bytes(0x10A40, &recv_iovec).unwrap();
+    let mut recv_header = [0u8; 56];
+    recv_header[16..24].copy_from_slice(&0x10A40u64.to_le_bytes());
+    recv_header[24..32].copy_from_slice(&1u64.to_le_bytes());
+    recv_header[32..40].copy_from_slice(&0x10A50u64.to_le_bytes());
+    recv_header[40..48].copy_from_slice(&16u64.to_le_bytes());
+    scratch.lock().write_bytes(0x10A00, &recv_header).unwrap();
+    assert_eq!(
+        dispatch(SYS_RECVMSG, rights_right as u64, 0x10A00, 0, 0, 0, 0),
+        1
+    );
+    assert_eq!(read_i32(0x10A30) & 0x20, 0x20);
+    assert_eq!(read_u32(0x10A28), 0);
+
+    // MSG_CMSG_CLOEXEC marks the installed descriptor close-on-exec.
+    assert_eq!(
+        dispatch(SYS_SENDMSG, rights_left as u64, 0x10900, 0, 0, 0, 0),
+        1
+    );
+    let mut recv_header = [0u8; 56];
+    recv_header[16..24].copy_from_slice(&0x10A40u64.to_le_bytes());
+    recv_header[24..32].copy_from_slice(&1u64.to_le_bytes());
+    recv_header[32..40].copy_from_slice(&0x10A50u64.to_le_bytes());
+    recv_header[40..48].copy_from_slice(&64u64.to_le_bytes());
+    scratch.lock().write_bytes(0x10A00, &recv_header).unwrap();
+    assert_eq!(
+        dispatch(
+            SYS_RECVMSG,
+            rights_right as u64,
+            0x10A00,
+            0x4000_0000,
+            0,
+            0,
+            0
+        ),
+        1
+    );
+    assert_eq!(read_i32(0x10A30) & 0x20, 0);
+    let mut control = [0u8; 20];
+    scratch.lock().read_bytes(0x10A50, &mut control).unwrap();
+    let received_fd = i32::from_le_bytes(control[16..20].try_into().unwrap());
+    assert!(received_fd >= 0);
+    assert_eq!(
+        dispatch(
+            SYS_FCNTL,
+            received_fd as u64,
+            abi::F_GETFD as u64,
+            0,
+            0,
+            0,
+            0
+        ),
+        1
+    );
+    assert_eq!(dispatch(SYS_CLOSE, received_fd as u64, 0, 0, 0, 0, 0), 0);
+
+    // SO_PASSCRED delivers SCM_CREDENTIALS.
+    scratch
+        .lock()
+        .write_bytes(0x10810, &1i32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatch(SYS_SETSOCKOPT, rights_right as u64, 1, 16, 0x10810, 4, 0),
+        0
+    );
+    let mut credentials_cmsg = [0u8; 28];
+    credentials_cmsg[0..8].copy_from_slice(&28u64.to_le_bytes());
+    credentials_cmsg[8..12].copy_from_slice(&1i32.to_le_bytes());
+    credentials_cmsg[12..16].copy_from_slice(&2i32.to_le_bytes());
+    scratch
+        .lock()
+        .write_bytes(0x10950, &credentials_cmsg)
+        .unwrap();
+    let mut send_header = [0u8; 56];
+    send_header[16..24].copy_from_slice(&0x10940u64.to_le_bytes());
+    send_header[24..32].copy_from_slice(&1u64.to_le_bytes());
+    send_header[32..40].copy_from_slice(&0x10950u64.to_le_bytes());
+    send_header[40..48].copy_from_slice(&28u64.to_le_bytes());
+    scratch.lock().write_bytes(0x10900, &send_header).unwrap();
+    assert_eq!(
+        dispatch(SYS_SENDMSG, rights_left as u64, 0x10900, 0, 0, 0, 0),
+        1
+    );
+    let mut recv_header = [0u8; 56];
+    recv_header[16..24].copy_from_slice(&0x10A40u64.to_le_bytes());
+    recv_header[24..32].copy_from_slice(&1u64.to_le_bytes());
+    recv_header[32..40].copy_from_slice(&0x10A50u64.to_le_bytes());
+    recv_header[40..48].copy_from_slice(&64u64.to_le_bytes());
+    scratch.lock().write_bytes(0x10A00, &recv_header).unwrap();
+    assert_eq!(
+        dispatch(SYS_RECVMSG, rights_right as u64, 0x10A00, 0, 0, 0, 0),
+        1
+    );
+    let mut control = [0u8; 28];
+    scratch.lock().read_bytes(0x10A50, &mut control).unwrap();
+    assert_eq!(u64::from_le_bytes(control[0..8].try_into().unwrap()), 28);
+    assert_eq!(i32::from_le_bytes(control[8..12].try_into().unwrap()), 1);
+    assert_eq!(i32::from_le_bytes(control[12..16].try_into().unwrap()), 2);
+    assert_eq!(
+        u32::from_le_bytes(control[16..20].try_into().unwrap()),
+        task.stats().tgid as u32
+    );
+
+    // fcntl(F_SETFL, O_NONBLOCK) changes socket blocking behavior.
+    assert_eq!(
+        dispatch(
+            SYS_FCNTL,
+            rights_right as u64,
+            abi::F_SETFL as u64,
+            abi::O_NONBLOCK as u64,
+            0,
+            0,
+            0
+        ),
+        0
+    );
+    assert_ne!(
+        dispatch(
+            SYS_FCNTL,
+            rights_right as u64,
+            abi::F_GETFL as u64,
+            0,
+            0,
+            0,
+            0
+        ) & abi::O_NONBLOCK as i64,
+        0
+    );
+    assert_eq!(
+        dispatch(SYS_READ, rights_right as u64, 0x10B20, 8, 0, 0, 0),
+        -abi::EAGAIN
+    );
+
+    for fd in [
+        server,
+        client,
+        accepted,
+        abstract_server,
+        abstract_client,
+        abstract_accepted,
+        late_client,
+        rights_left as i64,
+        rights_right as i64,
+        carried,
+    ] {
+        assert_eq!(dispatch(SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0), 0);
+    }
 
     // Verify getrandom matches hardware RNG support without hanging
     let gr = dispatch(SYS_GETRANDOM, 0x10200, 16, 0, 0, 0, 0);
