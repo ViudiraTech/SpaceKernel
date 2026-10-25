@@ -28,8 +28,8 @@ const SYSTEM: &[&str] = &[
     "loadavg",
 ];
 const PROCESS: &[&str] = &[
-    "status", "stat", "statm", "cmdline", "environ", "maps", "auxv", "cwd", "exe", "root", "fd",
-    "fdinfo", "task", "mounts",
+    "status", "stat", "statm", "comm", "cmdline", "environ", "maps", "auxv", "cwd", "exe", "root",
+    "fd", "fdinfo", "task", "mounts",
 ];
 const SYS_FS: &[&str] = &["dentry-state", "inode-nr", "inode-state"];
 enum View {
@@ -90,6 +90,7 @@ impl Node {
                     "cmdline" => return Ok(image.map(|i| i.argv.clone()).unwrap_or_default()),
                     "environ" => return Ok(image.map(|i| i.environ.clone()).unwrap_or_default()),
                     "auxv" => return Ok(image.map(|i| i.auxv.clone()).unwrap_or_default()),
+                    "comm" => format!("{}\n", taskname),
                     "status" => format!(
                         "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nVmSize:\t{} kB\nVmRSS:\t{} kB\nvoluntary_ctxt_switches:\t{}\nnonvoluntary_ctxt_switches:\t{}\n",
                         taskname,
@@ -412,8 +413,9 @@ impl Inode for Node {
         match &self.view {
             View::Link(None, name) => {
                 let tid = sched::current().ok_or(VfsError::NotFound)?.stats().tid;
+                let tgid = sched::current().ok_or(VfsError::NotFound)?.stats().tgid;
                 Ok(if name == "self" {
-                    format!("{}", tid)
+                    format!("{}", tgid)
                 } else {
                     format!("{}/task/{}", tid, tid)
                 })
@@ -467,11 +469,13 @@ impl Inode for Node {
                         100 + index as u64,
                     ));
                 }
-                let tid = name.parse::<u64>().map_err(|_| VfsError::NotFound)?;
-                let task = sched::find_task(tid).ok_or(VfsError::NotFound)?;
+                let pid = name.parse::<u64>().map_err(|_| VfsError::NotFound)?;
+                let task = sched::find_tgid(pid)
+                    .or_else(|| sched::find_task(pid))
+                    .ok_or(VfsError::NotFound)?;
                 Ok(Self::make(
                     View::Process(task.downgrade()),
-                    0x10000 + tid * 64,
+                    0x10000 + pid * 64,
                 ))
             }
             View::Sys => {
@@ -533,13 +537,22 @@ impl Inode for Node {
     }
     fn readdir(&self) -> Result<Vec<DirEntry>, VfsError> {
         let names: Vec<String> = match &self.view {
-            View::Root => SYSTEM
-                .iter()
-                .copied()
-                .chain(["self", "thread-self", "sys"])
-                .map(String::from)
-                .chain(sched::task_list().into_iter().map(|t| format!("{}", t.tid)))
-                .collect(),
+            View::Root => {
+                let mut process_ids: Vec<u64> = sched::task_list()
+                    .iter()
+                    .filter(|task| task.user)
+                    .map(|task| task.tgid)
+                    .collect();
+                process_ids.sort_unstable();
+                process_ids.dedup();
+                SYSTEM
+                    .iter()
+                    .copied()
+                    .chain(["self", "thread-self", "sys"])
+                    .map(String::from)
+                    .chain(process_ids.into_iter().map(|pid| format!("{}", pid)))
+                    .collect()
+            }
             View::Sys => alloc::vec![String::from("fs")],
             View::SysFs => SYS_FS.iter().map(|name| String::from(*name)).collect(),
             View::Process(w) => {

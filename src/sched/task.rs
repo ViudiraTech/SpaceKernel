@@ -71,6 +71,21 @@ pub fn find(tid: u64) -> Option<TaskRef> {
         Some(task)
     }
 }
+
+/// Linux `/proc/<pid>`: locate a process by thread-group id.  User tasks are
+/// preferred so an idle/kernel task with the same numeric id cannot shadow
+/// PID 1 or a user process.
+pub fn find_tgid(tgid: u64) -> Option<TaskRef> {
+    let tasks = all();
+    tasks
+        .iter()
+        .find(|task| {
+            let stats = task.stats();
+            stats.user && stats.tgid == tgid
+        })
+        .cloned()
+        .or_else(|| tasks.into_iter().find(|task| task.stats().tgid == tgid))
+}
 pub fn all() -> Vec<TaskRef> {
     let weak: Vec<_> = TASKS.lock().iter().map(|(_, w)| w.clone()).collect();
     weak.into_iter()

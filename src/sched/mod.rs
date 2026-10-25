@@ -36,6 +36,7 @@ use rbtree::{Node, RBTree};
 use task::Task;
 pub use task::alloc_pid;
 pub use task::find as find_task;
+pub use task::find_tgid;
 pub use task::last_tid;
 pub use task::{CpuMask, Credentials, TaskRef, TaskState, TaskStats, TaskWeak, comm_from_path};
 
