@@ -1324,6 +1324,20 @@ pub fn ipc_advanced() {
         -abi::ENOENT
     );
 
+    // Unconnected stream sockets report ENOTCONN for send/recv.
+    let unconnected = dispatch(SYS_SOCKET, 1, 1, 0, 0, 0, 0);
+    assert!(unconnected >= 0);
+    scratch.lock().write_bytes(0x10920, b"x").unwrap();
+    assert_eq!(
+        dispatch(SYS_WRITE, unconnected as u64, 0x10920, 1, 0, 0, 0),
+        -abi::ENOTCONN
+    );
+    assert_eq!(
+        dispatch(SYS_READ, unconnected as u64, 0x10930, 1, 0, 0, 0),
+        -abi::ENOTCONN
+    );
+    assert_eq!(dispatch(SYS_CLOSE, unconnected as u64, 0, 0, 0, 0, 0), 0);
+
     for fd in [epfd, ep2, ep3, efd, tfd] {
         assert_eq!(dispatch(SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0), 0);
     }

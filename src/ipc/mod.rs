@@ -781,11 +781,11 @@ fn install_rights(
                 },
             ) {
                 Ok(fd) => installed.push(fd as i32),
-                Err(error) => {
-                    for fd in installed.drain(..) {
-                        let _ = table.close(fd as usize);
-                    }
-                    return Err(error);
+                // Linux scm_detach_fds installs as many descriptors as fit,
+                // closes the rest and sets MSG_CTRUNC instead of failing.
+                Err(_) => {
+                    truncated = true;
+                    break;
                 }
             }
         }

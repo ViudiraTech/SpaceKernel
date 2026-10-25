@@ -538,8 +538,14 @@ impl UnixSocket {
         if bytes.is_empty() {
             return Ok(0);
         }
-        if self.state.lock().write_shutdown {
-            return Err(VfsError::BrokenPipe);
+        {
+            let state = self.state.lock();
+            if state.peer.is_none() {
+                return Err(VfsError::NotConnected);
+            }
+            if state.write_shutdown {
+                return Err(VfsError::BrokenPipe);
+            }
         }
         loop {
             let peer = {
@@ -547,6 +553,7 @@ impl UnixSocket {
                 state.peer.as_ref().and_then(Weak::upgrade)
             };
             let Some(peer) = peer else {
+                // The weak link existed but the peer object is gone.
                 return Err(VfsError::BrokenPipe);
             };
             {
