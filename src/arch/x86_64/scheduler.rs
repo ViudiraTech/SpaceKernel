@@ -13,7 +13,7 @@ use core::{
     arch::asm,
     sync::atomic::{AtomicU32, Ordering},
 };
-const TIMER: u32 = 0xf0;
+pub(crate) const TIMER: u32 = 0xf0;
 const IPI: u32 = 0xf1;
 #[repr(C)]
 pub struct CpuLocal {
@@ -68,6 +68,9 @@ pub fn current_cpu_index() -> Option<usize> {
         asm!("mov {}, gs:[0]",out(reg) index,options(nomem,nostack,preserves_flags));
     }
     Some(index)
+}
+pub(crate) const fn timer_vector() -> u8 {
+    TIMER as u8
 }
 pub fn register_scheduler_irqs() -> Result<(), irq::IrqError> {
     irq::register(TIMER, crate::sched::timer_interrupt)?;

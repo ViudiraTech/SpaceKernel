@@ -185,7 +185,7 @@ fn socket_inode(fd: u64) -> Result<Arc<unix::UnixSocket>, VfsError> {
 }
 
 fn current_cwd() -> String {
-    String::from(vfs::current_fd_table().lock().cwd())
+    vfs::current_cwd()
 }
 
 fn read_sockaddr(pointer: u64, length: u64) -> Result<unix::UnixAddress, VfsError> {

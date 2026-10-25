@@ -18,6 +18,7 @@ pub mod fpu;
 mod interrupts;
 mod paging;
 mod serial;
+mod signal;
 pub mod syscall;
 
 pub use context::{Context, context_init, switch};
@@ -30,4 +31,6 @@ pub use paging::{
 };
 pub use scheduler::set_kernel_stack;
 pub use serial::{serial_enable_irq, serial_init, serial_try_read, serial_write};
+#[allow(unused_imports)]
+pub use signal::{GprFrame, InterruptFrame, SyscallFrame, spacekernel_x86_64_timer_stub};
 pub use syscall::enter_user_mode;

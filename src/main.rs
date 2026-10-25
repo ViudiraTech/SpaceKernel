@@ -34,6 +34,7 @@ pub mod sched;
 #[cfg(feature = "boot-self-test")]
 pub mod self_test;
 pub mod shell;
+pub mod signal;
 mod smp;
 mod sync;
 pub mod syscall;

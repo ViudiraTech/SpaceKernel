@@ -20,40 +20,41 @@ spacekernel_x86_64_syscall_entry:
     swapgs
     mov gs:[16], rsp
     mov rsp, gs:[8]
-    push qword ptr gs:[16]
-
-    push r15
-    push r14
-    push r13
-    push r12
-    push rbp
-    push rbx
-    push r11
-    push rcx
-
+    push qword ptr gs:[16]   /* user RSP */
+    push rax
+    push rdi
+    push rsi
+    push rdx
+    push r10
+    push r8
     push r9
-    mov qword ptr gs:[24], rsp
-    mov r9, r8
-    mov r8, r10
-    mov rcx, rdx
-    mov rdx, rsi
-    mov rsi, rdi
-    mov rdi, rax
-
+    push rcx
+    push r11
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov gs:[24], rsp
+    mov rdi, rsp
     call spacekernel_syscall_c
-
     mov qword ptr gs:[24], 0
-    add rsp, 8
-
-    pop rcx
-    pop r11
-    pop rbx
-    pop rbp
-    pop r12
-    pop r13
-    pop r14
     pop r15
-
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    pop r11
+    pop rcx
+    pop r9
+    pop r8
+    pop r10
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rax
     pop rsp
     swapgs
     sysretq
@@ -224,18 +225,20 @@ pub fn capture_user_context() -> Option<UserContext> {
     if frame.is_null() {
         return None;
     }
-    // SAFETY: the syscall entry pushed these exact slots before dispatching.
+    // SAFETY: the syscall entry publishes its live full-register frame at
+    // GS:24 before calling into Rust.
     unsafe {
+        let frame = &*(frame as *const crate::arch::SyscallFrame);
         Some(UserContext {
-            rip: frame.add(1).read(),
-            rflags: frame.add(2).read(),
-            rsp: frame.add(9).read(),
-            rbx: frame.add(3).read(),
-            rbp: frame.add(4).read(),
-            r12: frame.add(5).read(),
-            r13: frame.add(6).read(),
-            r14: frame.add(7).read(),
-            r15: frame.add(8).read(),
+            rip: frame.gpr.rcx,
+            rflags: frame.gpr.r11,
+            rsp: frame.rsp,
+            rbx: frame.gpr.rbx,
+            rbp: frame.gpr.rbp,
+            r12: frame.gpr.r12,
+            r13: frame.gpr.r13,
+            r14: frame.gpr.r14,
+            r15: frame.gpr.r15,
             fs_base: read_msr(0xc000_0100),
             gs_base: read_msr(0xc000_0102),
         })

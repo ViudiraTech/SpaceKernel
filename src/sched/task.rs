@@ -24,6 +24,16 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::signal::{SignalState, ThreadSignals};
+use crate::vfs::FsContext;
+
+static NEXT_PID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a Linux PID/TID. Kernel tasks never consume this namespace.
+pub fn alloc_pid() -> u64 {
+    NEXT_PID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Opaque ownership handle; callers can inspect metadata without borrowing the
 /// scheduler-private context or changing task/queue identity.
 #[derive(Clone)]
@@ -74,16 +84,18 @@ pub(crate) fn push_zombie(task: TaskRef) {
 pub(crate) fn zombies() -> Vec<TaskRef> {
     ZOMBIES.lock().clone()
 }
-pub(crate) fn take_zombie(tid: u64) -> Option<TaskRef> {
+pub(crate) fn take_zombie(pid: u64) -> Option<TaskRef> {
     let mut list = ZOMBIES.lock();
-    let index = list.iter().position(|task| task.stats().tid == tid)?;
+    let index = list.iter().position(|task| task.stats().tgid == pid)?;
     Some(list.remove(index))
 }
 pub(crate) fn has_children(ppid: u64) -> bool {
     if ZOMBIES.lock().iter().any(|task| task.stats().ppid == ppid) {
         return true;
     }
-    all().iter().any(|task| task.stats().ppid == ppid)
+    all()
+        .iter()
+        .any(|task| task.stats().user && task.stats().ppid == ppid)
 }
 /// Re-parent live children and already-exited zombies after their parent dies.
 pub(crate) fn reparent_children(old: u64, new: u64) {
@@ -107,7 +119,11 @@ pub fn last_tid() -> u64 {
 pub struct TaskStats {
     pub tid: u64,
     pub tgid: u64,
+    pub ltid: u64,
     pub ppid: u64,
+    pub pgid: u64,
+    pub sid: u64,
+    pub user: bool,
     pub nice: i32,
     pub start_ns: u64,
     pub state: TaskState,
@@ -138,12 +154,83 @@ impl TaskRef {
     pub fn files(&self) -> Arc<SpinLock<crate::vfs::FileDescriptorTable>> {
         self.lock().fd_table.clone()
     }
+    pub fn fs(&self) -> Arc<SpinLock<FsContext>> {
+        self.lock().fs.clone()
+    }
+    pub fn signals(&self) -> Arc<SignalState> {
+        self.lock().signals.clone()
+    }
+    pub fn thread_signals(&self) -> Arc<SpinLock<ThreadSignals>> {
+        self.lock().thread_signals.clone()
+    }
+    pub fn clear_child_tid(&self) -> u64 {
+        self.lock().clear_child_tid
+    }
+    pub fn exit_signal(&self) -> u32 {
+        self.lock().exit_signal
+    }
+    pub fn files_shared(&self) -> bool {
+        self.lock().files_shared
+    }
+    pub fn is_user(&self) -> bool {
+        self.lock().user
+    }
+
+    /// Copy the saved extended-register image for a signal frame.
+    pub(crate) fn fpu_image(&self, out: &mut [u8]) -> usize {
+        let task = self.lock();
+        // SAFETY: the task is the current task (or an off-CPU retiring task);
+        // its FPU image is only mutated by the owning CPU.
+        unsafe {
+            match (&*task.fpu_state.get()).as_ref() {
+                Some(state) => {
+                    let bytes = state.bytes();
+                    let count = bytes.len().min(out.len());
+                    out[..count].copy_from_slice(&bytes[..count]);
+                    count
+                }
+                None => 0,
+            }
+        }
+    }
+
+    pub(crate) fn fpu_size(&self) -> usize {
+        let task = self.lock();
+        // SAFETY: see `fpu_image`.
+        unsafe {
+            (&*task.fpu_state.get())
+                .as_ref()
+                .map(|state| state.bytes().len())
+                .unwrap_or(0)
+        }
+    }
+
+    /// Import and activate an image from `rt_sigreturn`.  IRQs are masked and
+    /// this CPU exclusively owns the task.
+    pub(crate) fn restore_fpu_image(&self, bytes: &[u8]) -> bool {
+        let flags = arch::irq_save();
+        let task = self.lock();
+        // SAFETY: the caller runs with IRQs masked on the owning CPU.
+        let result = unsafe {
+            match (&mut *task.fpu_state.get()).as_mut() {
+                Some(state) => state.import(bytes).is_ok() && fpu::restore_current(state).is_ok(),
+                None => false,
+            }
+        };
+        drop(task);
+        arch::irq_restore(flags);
+        result
+    }
     pub fn stats(&self) -> TaskStats {
         let task = self.lock();
         TaskStats {
             tid: task.tid,
             tgid: task.tgid,
+            ltid: task.ltid,
             ppid: task.ppid,
+            pgid: task.pgid,
+            sid: task.sid,
+            user: task.user,
             nice: task.nice,
             start_ns: task.start_ns,
             state: task.state,
@@ -219,7 +306,14 @@ impl CpuMask {
 pub(crate) struct Task {
     pub tid: u64,
     pub tgid: u64,
+    pub ltid: u64,
     pub ppid: u64,
+    pub pgid: u64,
+    pub sid: u64,
+    pub user: bool,
+    pub exit_signal: u32,
+    pub clear_child_tid: u64,
+    pub files_shared: bool,
     pub nice: i32,
     pub start_ns: u64,
     pub(crate) state: TaskState,
@@ -239,6 +333,9 @@ pub(crate) struct Task {
     pub(crate) stack: Option<KernelStack>,
     pub(crate) address_space: Option<Arc<SpinLock<crate::user::UserAddressSpace>>>,
     pub(crate) fd_table: Arc<SpinLock<crate::vfs::FileDescriptorTable>>,
+    pub(crate) fs: Arc<SpinLock<FsContext>>,
+    pub(crate) signals: Arc<SignalState>,
+    pub(crate) thread_signals: Arc<SpinLock<ThreadSignals>>,
 }
 
 pub(crate) struct KernelStack {
@@ -332,12 +429,18 @@ impl Task {
             }
         }
         let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
-        let ppid = super::current().map(|t| t.stats().tid).unwrap_or(0);
         let start_ns = crate::time::uptime_micros().saturating_mul(1000);
         let result = TaskRef(Arc::new(SpinLock::new(Self {
             tid,
             tgid: tid,
-            ppid,
+            ltid: tid,
+            ppid: 0,
+            pgid: 0,
+            sid: 0,
+            user: false,
+            exit_signal: 0,
+            clear_child_tid: 0,
+            files_shared: false,
             nice: 0,
             start_ns,
             state: TaskState::Ready,
@@ -361,6 +464,9 @@ impl Task {
                     crate::vfs::FileDescriptorTable::new_with_stdio(),
                 ))
             }),
+            fs: crate::vfs::kernel_fs(),
+            signals: Arc::new(SignalState::new()),
+            thread_signals: Arc::new(SpinLock::new(ThreadSignals::new())),
         })));
         let tid = result.stats().tid;
         let mut tasks = TASKS.lock();
@@ -368,6 +474,87 @@ impl Task {
         tasks.push((tid, Arc::downgrade(&result.0)));
         Ok(result)
     }
+
+    /// Create a Linux user task with identity, shared resources and address
+    /// space installed before the task can run on another CPU.
+    pub(crate) fn create_user(
+        entry: Box<dyn FnOnce() + Send>,
+        cpu: usize,
+        affinity: CpuMask,
+        spec: UserTaskSpec,
+    ) -> Result<TaskRef, &'static str> {
+        let stack = Some(KernelStack::new()?);
+        let fpu_state = match fpu::State::new() {
+            Ok(state) => Some(state),
+            Err(fpu::Error::Unsupported) => None,
+            Err(_) => return Err("task FPU allocation failed"),
+        };
+        let mut context = arch::Context::new();
+        if let Some(stack) = &stack {
+            // SAFETY: exclusive stack, entry trampoline obtains the closure
+            // from this CPU's current task.
+            unsafe {
+                arch::context_init(&mut context, stack.top(), task_entry as *const () as usize);
+            }
+        }
+        let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+        let start_ns = crate::time::uptime_micros().saturating_mul(1000);
+        let result = TaskRef(Arc::new(SpinLock::new(Self {
+            tid,
+            tgid: spec.tgid,
+            ltid: spec.ltid,
+            ppid: spec.ppid,
+            pgid: spec.pgid,
+            sid: spec.sid,
+            user: true,
+            exit_signal: spec.exit_signal,
+            clear_child_tid: spec.clear_child_tid,
+            files_shared: spec.files_shared,
+            nice: 0,
+            start_ns,
+            state: TaskState::Ready,
+            on_cpu: cpu,
+            affinity,
+            runtime_ns: 0,
+            user_ns: 0,
+            system_ns: 0,
+            switches: 0,
+            voluntary_switches: 0,
+            involuntary_switches: 0,
+            migrations: 0,
+            exit_code: 0,
+            context: UnsafeCell::new(context),
+            fpu_state: UnsafeCell::new(fpu_state),
+            entry: Some(entry),
+            stack,
+            address_space: Some(spec.address_space),
+            fd_table: spec.fd_table,
+            fs: spec.fs,
+            signals: spec.signals,
+            thread_signals: spec.thread_signals,
+        })));
+        let tid = result.stats().tid;
+        let mut tasks = TASKS.lock();
+        tasks.retain(|(_, w)| w.strong_count() != 0);
+        tasks.push((tid, Arc::downgrade(&result.0)));
+        Ok(result)
+    }
+}
+
+pub(crate) struct UserTaskSpec {
+    pub tgid: u64,
+    pub ltid: u64,
+    pub ppid: u64,
+    pub pgid: u64,
+    pub sid: u64,
+    pub exit_signal: u32,
+    pub clear_child_tid: u64,
+    pub fd_table: Arc<SpinLock<crate::vfs::FileDescriptorTable>>,
+    pub files_shared: bool,
+    pub fs: Arc<SpinLock<FsContext>>,
+    pub signals: Arc<SignalState>,
+    pub thread_signals: Arc<SpinLock<ThreadSignals>>,
+    pub address_space: Arc<SpinLock<crate::user::UserAddressSpace>>,
 }
 extern "C" fn task_entry() -> ! {
     super::finish_switch();

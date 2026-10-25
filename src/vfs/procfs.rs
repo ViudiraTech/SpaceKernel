@@ -388,7 +388,7 @@ impl Inode for Node {
             View::Link(Some(w), name) => {
                 let task = Self::task(w)?;
                 match name.as_str() {
-                    "cwd" => Ok(String::from(task.files().lock().cwd())),
+                    "cwd" => Ok(task.fs().lock().cwd.clone()),
                     "root" => Ok(String::from("/")),
                     "exe" => {
                         let space = task.address_space().ok_or(VfsError::NotFound)?;

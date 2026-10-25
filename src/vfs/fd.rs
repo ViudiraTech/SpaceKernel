@@ -349,11 +349,11 @@ pub struct FdEntry {
     pub cloexec: bool,
 }
 
-/// Per-process file descriptor table and working directory (`struct files_struct` + `fs_struct`).
+/// Per-process file descriptor table (`struct files_struct`).  The working
+/// directory lives in the task's separate `FsContext` (`struct fs_struct`).
 #[derive(Clone)]
 pub struct FileDescriptorTable {
     entries: Vec<Option<FdEntry>>,
-    cwd: String,
 }
 
 impl Default for FileDescriptorTable {
@@ -395,16 +395,12 @@ impl FileDescriptorTable {
             cloexec: false,
         }));
 
-        Self {
-            entries,
-            cwd: String::from("/"),
-        }
+        Self { entries }
     }
 
     pub fn empty() -> Self {
         Self {
             entries: Vec::new(),
-            cwd: String::from("/"),
         }
     }
 
@@ -424,13 +420,6 @@ impl FileDescriptorTable {
     }
     pub fn close_all(&mut self) {
         self.entries.clear();
-    }
-    pub fn cwd(&self) -> &str {
-        &self.cwd
-    }
-
-    pub fn set_cwd(&mut self, abs_path: String) {
-        self.cwd = abs_path;
     }
 
     pub fn get(&self, fd: usize) -> Option<FdEntry> {

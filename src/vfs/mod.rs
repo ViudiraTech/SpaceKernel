@@ -37,6 +37,69 @@ use alloc::{format, string::String, sync::Arc, vec::Vec};
 
 const MAX_SYMLINK_DEPTH: usize = 8;
 
+/// `struct fs_struct`: per-process working directory, root and umask.  Threads
+/// created without CLONE_FS get a copy, with it share this object.
+pub struct FsContext {
+    pub cwd: String,
+    pub root: String,
+    pub umask: u32,
+}
+
+impl FsContext {
+    pub fn new() -> Self {
+        Self {
+            cwd: String::from("/"),
+            root: String::from("/"),
+            umask: 0o022,
+        }
+    }
+}
+
+impl Default for FsContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for FsContext {
+    fn clone(&self) -> Self {
+        Self {
+            cwd: self.cwd.clone(),
+            root: self.root.clone(),
+            umask: self.umask,
+        }
+    }
+}
+
+static KERNEL_FS: SpinLock<Option<Arc<SpinLock<FsContext>>>> = SpinLock::new(None);
+
+/// Kernel fallback context for early boot and kernel threads.
+pub fn kernel_fs() -> Arc<SpinLock<FsContext>> {
+    let mut guard = KERNEL_FS.lock();
+    if let Some(fs) = guard.as_ref() {
+        return fs.clone();
+    }
+    let fs = Arc::new(SpinLock::new(FsContext::new()));
+    *guard = Some(fs.clone());
+    fs
+}
+
+pub fn current_fs() -> Arc<SpinLock<FsContext>> {
+    sched::current_fs().unwrap_or_else(kernel_fs)
+}
+
+pub fn current_cwd() -> String {
+    current_fs().lock().cwd.clone()
+}
+
+pub fn set_current_cwd(path: String) {
+    current_fs().lock().cwd = path;
+}
+
+pub fn current_umask() -> u32 {
+    current_fs().lock().umask
+}
+
 #[derive(Clone)]
 pub struct MountEntry {
     pub device: String,
@@ -158,7 +221,7 @@ pub fn resolve_at_path(
         return Ok(normalize_path("/", user_path));
     }
     if dirfd == abi::AT_FDCWD {
-        return Ok(normalize_path(table.cwd(), user_path));
+        return Ok(normalize_path(&current_cwd(), user_path));
     }
     if dirfd < 0 {
         return Err(VfsError::BadFileDescriptor);
@@ -501,7 +564,9 @@ pub fn run_self_test() {
     assert!(!mounts.is_empty());
 
     // 4. Test FAT32 (/mnt) create, LFN support, write, read, mkdir, unlink, rmdir
-    mkdir_abs("/mnt/testdir", 0o755).expect("FAT32 mkdir failed");
+    if let Err(error) = mkdir_abs("/mnt/testdir", 0o755) {
+        panic!("FAT32 mkdir failed: {:?}", error);
+    }
     write_file("/mnt/testdir/long_file_name_test.txt", b"FAT32-LFN-OK")
         .expect("FAT32 LFN write failed");
     let fat_read =

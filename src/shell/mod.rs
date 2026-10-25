@@ -74,8 +74,7 @@ fn shell_task() {
 }
 
 fn current_cwd() -> String {
-    let tbl = vfs::current_fd_table();
-    let cwd = String::from(tbl.lock().cwd());
+    let cwd = vfs::current_cwd();
     cwd
 }
 
@@ -180,7 +179,7 @@ fn cmd_cd(target: &str) {
     match vfs::lookup_abs(&abs, true) {
         Ok((inode, final_path)) => match inode.metadata() {
             Ok(meta) if meta.kind == InodeKind::Directory => {
-                vfs::current_fd_table().lock().set_cwd(final_path);
+                vfs::set_current_cwd(final_path);
             }
             Ok(_) => print_tty(&format!("cd: {}: Not a directory\n", target)),
             Err(e) => print_tty(&format!("cd: {}: {:?}\n", target, e)),

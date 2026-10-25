@@ -44,32 +44,36 @@ pub fn spawn_user_elf(data: &[u8], name: &str) -> Result<u64, &'static str> {
     let user_sp = stack::setup_user_stack(&mut space, &loaded, name)?;
     let space_arc = Arc::new(SpinLock::new(space));
 
-    let space_clone = space_arc.clone();
     let entry_va = loaded.initial_pc;
     let tls_tp = loaded.tls_tp;
+    let pid = sched::alloc_pid();
+    let spec = sched::UserTaskSpec {
+        tgid: pid,
+        ltid: pid,
+        ppid: 1,
+        pgid: pid,
+        sid: pid,
+        exit_signal: crate::signal::SIGCHLD,
+        clear_child_tid: 0,
+        fd_table: Arc::new(SpinLock::new(
+            crate::vfs::FileDescriptorTable::new_with_stdio(),
+        )),
+        files_shared: false,
+        fs: Arc::new(SpinLock::new(crate::vfs::FsContext::new())),
+        signals: Arc::new(crate::signal::SignalState::new()),
+        thread_signals: Arc::new(SpinLock::new(crate::signal::ThreadSignals::new())),
+        address_space: space_arc,
+    };
 
-    // Spawn a new task in the scheduler
-    let tid = sched::spawn(
+    let task = sched::spawn_user(
         move || {
-            // Bind address space and configure kernel stack for current task
-            if let Some(current_task) = sched::current() {
-                let mut task = current_task.lock();
-                task.set_address_space(space_clone.clone());
-                if let Some(stack_top) = task.kernel_stack_top() {
-                    arch::set_kernel_stack(crate::smp::current_cpu(), stack_top as u64);
-                }
-            }
-
-            // Activate user address space
-            space_clone.lock().activate();
-
             kinfo!(
                 "Entering user mode: entry={:#x} sp={:#x}",
                 entry_va,
                 user_sp
             );
-
-            // Drop to unprivileged user mode!
+            // SAFETY: the address space is installed and activated by the
+            // scheduler before this closure runs.
             unsafe {
                 install_tls(tls_tp);
                 let _ = crate::fpu::enable_user();
@@ -77,8 +81,10 @@ pub fn spawn_user_elf(data: &[u8], name: &str) -> Result<u64, &'static str> {
             }
         },
         0,
+        sched::CpuMask::all(),
+        spec,
     )
     .map_err(|_| "failed to spawn user task")?;
 
-    Ok(tid)
+    Ok(task.stats().tgid)
 }

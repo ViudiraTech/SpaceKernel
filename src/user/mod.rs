@@ -81,6 +81,24 @@ pub fn run_self_test() -> Result<(), &'static str> {
     Err("ELF interpreter handoff timed out")
 }
 
+/// x86_64 thread, POSIX signal, process-group and cross-process kill test.
+#[cfg(target_arch = "x86_64")]
+pub fn process_signal_self_test() -> Result<(), &'static str> {
+    crate::syscall::set_last_user_exit_code(-1);
+    let pid = spawn_user_elf(test_binaries::PROCESS_SIGNAL_TEST_ELF, "process_signal")?;
+    for _ in 0..8000 {
+        if crate::syscall::last_user_exit_code() == 42 {
+            let _ = crate::sched::take_zombie(pid);
+            crate::self_test::verbose_log(format_args!(
+                "thread/signal/process-group user self-test passed"
+            ));
+            return Ok(());
+        }
+        crate::sched::sleep_micros(1000);
+    }
+    Err("process/signal user self-test failed or timed out")
+}
+
 /// x86_64 vertical-slice test: fork, COW stack/data write, wait4, zombie reap.
 #[cfg(target_arch = "x86_64")]
 pub fn fork_wait_self_test() -> Result<(), &'static str> {

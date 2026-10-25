@@ -42,6 +42,9 @@ pub fn spawn_late() {
             crate::user::run_self_test().expect("user self-test failed");
             #[cfg(target_arch = "x86_64")]
             crate::user::fork_wait_self_test().expect("fork/wait4 self-test failed");
+            #[cfg(target_arch = "x86_64")]
+            crate::user::process_signal_self_test()
+                .expect("process/signal self-test failed");
             crate::vfs::pseudo_test::processes();
             crate::user::self_test::syscalls();
             let gpu_status = crate::gpu::self_test::run();

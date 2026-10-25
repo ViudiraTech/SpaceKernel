@@ -37,6 +37,36 @@ pub fn set_last_user_exit_code(code: i32) {
     LAST_USER_EXIT_CODE.store(code, Ordering::Release);
 }
 
+#[cfg(target_arch = "x86_64")]
+#[unsafe(no_mangle)]
+pub extern "C" fn spacekernel_syscall_c(frame: *mut crate::arch::SyscallFrame) {
+    // SAFETY: the assembly entry passes its live saved-register frame.
+    let frame = unsafe { &mut *frame };
+    crate::fpu::disable_current();
+    crate::arch::enable_interrupts();
+    if frame.gpr.rax == SYS_RT_SIGRETURN {
+        crate::signal::rt_sigreturn(frame);
+    } else {
+        let result = dispatch(
+            frame.gpr.rax,
+            frame.gpr.rdi,
+            frame.gpr.rsi,
+            frame.gpr.rdx,
+            frame.gpr.r10,
+            frame.gpr.r8,
+            frame.gpr.r9,
+        );
+        frame.gpr.rax = result as u64;
+    }
+    crate::arch::disable_interrupts();
+    crate::signal::deliver_on_syscall_return(frame);
+    // SAFETY: this CPU owns the task and interrupts are masked until SYSRETQ.
+    unsafe {
+        let _ = crate::fpu::enable_user();
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn spacekernel_syscall_c(
     num: u64,
@@ -51,7 +81,7 @@ pub extern "C" fn spacekernel_syscall_c(
     crate::arch::enable_interrupts();
     let result = dispatch(num, arg0, arg1, arg2, arg3, arg4, arg5);
     crate::arch::disable_interrupts();
-    // SAFETY: the scheduler restored the current task before resuming this syscall.
+    // SAFETY: the scheduler restored the current task before this return.
     unsafe {
         let _ = crate::fpu::enable_user();
     }
@@ -171,8 +201,25 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
         ),
 
         // Process, Memory & Scheduling
-        SYS_GETPID | SYS_GETTID => sys_getpid(),
+        SYS_GETPID => process::getpid(),
+        SYS_GETTID => process::gettid(),
         SYS_GETPPID => process::getppid(),
+        SYS_RT_SIGACTION => crate::signal::rt_sigaction(arg0, arg1, arg2, arg3),
+        SYS_RT_SIGPROCMASK => crate::signal::rt_sigprocmask(arg0, arg1, arg2, arg3),
+        SYS_RT_SIGPENDING => crate::signal::rt_sigpending(arg0, arg1),
+        SYS_RT_SIGSUSPEND => crate::signal::rt_sigsuspend(arg0, arg1),
+        SYS_SIGALTSTACK => crate::signal::sigaltstack(arg0, arg1),
+        SYS_KILL => crate::signal::kill(arg0 as i64, arg1),
+        SYS_TKILL => crate::signal::tkill(arg0, arg1),
+        SYS_TGKILL => crate::signal::tgkill(arg0, arg1, arg2),
+        #[cfg(target_arch = "x86_64")]
+        SYS_PAUSE => crate::signal::pause(),
+        SYS_SETPGID => process::setpgid(arg0 as i64, arg1 as i64),
+        SYS_GETPGID => process::getpgid(arg0 as i64),
+        SYS_SETSID => process::setsid(),
+        SYS_GETSID => process::getsid(arg0 as i64),
+        #[cfg(not(target_arch = "x86_64"))]
+        SYS_RT_SIGRETURN => -abi::ENOSYS,
         SYS_WAIT4 => process::wait4(arg0 as i64, arg1, arg2 as u32, arg3),
         #[cfg(target_arch = "x86_64")]
         SYS_CLONE => process::clone(arg0, arg1, arg2, arg3, arg4),
@@ -182,7 +229,8 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
         SYS_CLONE => -abi::ENOSYS,
         SYS_SCHED_YIELD => sys_sched_yield(),
         SYS_NANOSLEEP => sys_nanosleep(arg0),
-        SYS_EXIT | SYS_EXIT_GROUP => sys_exit(arg0 as i32),
+        SYS_EXIT => sys_exit(arg0 as i32, false),
+        SYS_EXIT_GROUP => sys_exit(arg0 as i32, true),
         SYS_SET_TID_ADDRESS => sys_set_tid_address(arg0),
         SYS_MKNODAT => metadata::mknodat(arg0 as i32, arg1, arg2 as u32, arg3),
         SYS_FCHMOD => metadata::fchmod(arg0 as i32, arg1 as u32),
@@ -889,8 +937,7 @@ fn sys_getcwd(buf: *mut u8, size: usize) -> i64 {
     if buf.is_null() {
         return -abi::EFAULT;
     }
-    let tbl = vfs::current_fd_table();
-    let cwd = String::from(tbl.lock().cwd());
+    let cwd = vfs::current_cwd();
     let bytes = cwd.as_bytes();
     if bytes.len() + 1 > size {
         return -abi::ERANGE;
@@ -922,7 +969,7 @@ fn sys_chdir(path_ptr: *const u8) -> i64 {
     };
     match inode.metadata() {
         Ok(meta) if meta.kind == vfs::InodeKind::Directory => {
-            tbl.lock().set_cwd(final_path);
+            vfs::set_current_cwd(final_path);
             0
         }
         Ok(_) => -abi::ENOTDIR,
@@ -1025,10 +1072,6 @@ fn sys_umount2(target_ptr: *const u8, _flags: u32) -> i64 {
     }
 }
 
-fn sys_getpid() -> i64 {
-    sched::current().map(|t| t.stats().tid).unwrap_or(1) as i64
-}
-
 fn sys_sched_yield() -> i64 {
     sched::yield_now();
     0
@@ -1047,18 +1090,40 @@ fn sys_nanosleep(req_ptr: u64) -> i64 {
         return -abi::EINVAL;
     }
     let micros = sec.saturating_mul(1_000_000).saturating_add(nsec / 1_000);
-    sched::sleep_micros(micros);
+    let mut remaining = micros;
+    while remaining != 0 {
+        if crate::signal::pending_for_current() {
+            return -abi::EINTR;
+        }
+        let slice = remaining.min(1000);
+        sched::sleep_micros(slice);
+        remaining -= slice;
+    }
     0
 }
 
-fn sys_exit(code: i32) -> i64 {
-    kinfo!("Linux ABI: user process exited with code {}", code);
-    set_last_user_exit_code(code);
-    sched::exit(code)
+fn sys_exit(code: i32, group: bool) -> i64 {
+    let leader = sched::current()
+        .map(|task| {
+            let stats = task.stats();
+            stats.ltid == stats.tgid
+        })
+        .unwrap_or(true);
+    if leader {
+        kinfo!("Linux ABI: user process exited with code {}", code);
+        set_last_user_exit_code(code);
+    }
+    // wait(2) encodes a normal exit in bits 8..15.
+    let status = (code & 0xff) << 8;
+    if group {
+        sched::exit_group(status)
+    } else {
+        sched::exit(status)
+    }
 }
 
-fn sys_set_tid_address(_tidptr: u64) -> i64 {
-    sys_getpid()
+fn sys_set_tid_address(tidptr: u64) -> i64 {
+    process::set_tid_address(tidptr)
 }
 
 fn sys_brk(addr: u64) -> i64 {

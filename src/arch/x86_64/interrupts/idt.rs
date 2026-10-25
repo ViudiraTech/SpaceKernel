@@ -13,7 +13,10 @@ use super::{
     gdt::{DOUBLE_FAULT_IST, MACHINE_CHECK_IST, NMI_IST},
     handlers::*,
 };
-use x86_64::structures::{gdt::SegmentSelector, idt::InterruptDescriptorTable};
+use x86_64::{
+    VirtAddr,
+    structures::{gdt::SegmentSelector, idt::InterruptDescriptorTable},
+};
 
 pub(super) fn install(idt: &mut InterruptDescriptorTable, code: SegmentSelector) {
     // SAFETY: code names the kernel code descriptor in this CPU's final GDT.
@@ -97,6 +100,13 @@ pub(super) fn install(idt: &mut InterruptDescriptorTable, code: SegmentSelector)
             235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251,
             252, 253, 254, 255
         );
+        // The timer vector uses a full-register stub so user signals can be
+        // delivered with a complete interrupted context.
+        idt[0xf0]
+            .set_handler_addr(VirtAddr::new(
+                crate::arch::spacekernel_x86_64_timer_stub as *const () as usize as u64,
+            ))
+            .set_code_selector(code);
         // SAFETY: each stack is 16-byte aligned, mapped, CPU-private and
         // owned by the corresponding table for its entire active lifetime.
         {

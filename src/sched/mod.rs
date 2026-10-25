@@ -34,10 +34,11 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering
 pub use eevdf::{NICE_0_WEIGHT, nice_to_weight};
 use rbtree::{Node, RBTree};
 use task::Task;
+pub use task::alloc_pid;
 pub use task::find as find_task;
 pub use task::last_tid;
 pub use task::{CpuMask, TaskRef, TaskState, TaskStats, TaskWeak};
-pub(crate) use task::{has_children, take_zombie, zombies};
+pub(crate) use task::{UserTaskSpec, has_children, take_zombie, zombies};
 pub use wait::WaitQueue;
 
 type Entity = Box<Node<TaskRef>>;
@@ -279,6 +280,80 @@ pub fn spawn_with_fds(
     Ok(tid)
 }
 
+/// Spawn a user task with fully-installed identity and shared resources.
+pub(crate) fn spawn_user(
+    entry: impl FnOnce() + Send + 'static,
+    nice: i32,
+    affinity: CpuMask,
+    spec: UserTaskSpec,
+) -> Result<TaskRef, &'static str> {
+    let sched = try_scheduler().ok_or("scheduler not initialized")?;
+    let cpu = loadbalance::select_cpu(sched, affinity, smp::current_cpu())
+        .ok_or("no online CPU in affinity")?;
+    let task = Task::create_user(Box::new(entry), cpu, affinity, spec)?;
+    {
+        let mut guard = task.lock();
+        guard.nice = nice.clamp(-20, 19);
+    }
+    let tid = task.stats().tid;
+    let entity = Node::new(tid, task.clone(), nice_to_weight(nice));
+    sched.cpus[cpu].queue.lock().admit(entity, true);
+    request_reschedule(cpu);
+    Ok(task)
+}
+
+/// Snapshot every task that is not retired.
+pub fn tasks() -> Vec<TaskRef> {
+    task::all()
+}
+
+/// Live threads of a thread group (zombies are not signal targets).
+pub fn tasks_in_group(tgid: u64) -> Vec<TaskRef> {
+    task::all()
+        .into_iter()
+        .filter(|task| {
+            let stats = task.stats();
+            stats.user && stats.tgid == tgid && stats.state != TaskState::Zombie
+        })
+        .collect()
+}
+
+pub fn find_by_ltid(ltid: u64) -> Option<TaskRef> {
+    task::all().into_iter().find(|task| {
+        let stats = task.stats();
+        stats.user && stats.ltid == ltid && stats.state != TaskState::Zombie
+    })
+}
+
+pub fn group_has_live_threads(tgid: u64) -> bool {
+    task::all().into_iter().any(|task| {
+        let stats = task.stats();
+        stats.user && stats.tgid == tgid && stats.state != TaskState::Zombie
+    })
+}
+
+pub fn current_fs() -> Option<Arc<SpinLock<crate::vfs::FsContext>>> {
+    current().map(|task| task.fs())
+}
+
+/// Terminate every other thread and then the current one.
+pub fn exit_group(status: i32) -> ! {
+    if let Some(current) = current() {
+        let stats = current.stats();
+        if stats.user {
+            for member in tasks_in_group(stats.tgid) {
+                if member.stats().ltid != stats.ltid {
+                    crate::signal::send_to_thread(
+                        &member,
+                        crate::signal::Signal::kernel(crate::signal::SIGKILL),
+                    );
+                }
+            }
+        }
+    }
+    exit(status)
+}
+
 /// Obtain an ownership handle for this task with a consistent CPU-local lookup.
 /// TaskRef::stats returns a snapshot without exposing context/FPU ownership.
 pub fn current() -> Option<TaskRef> {
@@ -412,7 +487,7 @@ fn dispatch(mut rq: Guard<'static, CpuQueue>, disposition: Disposition<'_>, volu
         Disposition::Exit(code) => {
             assert_ne!(previous.weight, 0, "idle cannot exit");
             let mut task = previous.value.lock();
-            if task.address_space.is_some() {
+            if task.user {
                 task.become_zombie(code);
             } else {
                 task.state = TaskState::Dead;
@@ -490,18 +565,51 @@ pub(crate) fn finish_switch() {
     }
     let retired = queue.lock().retired.take();
     if let Some(retired) = retired {
-        let exiting_tid = retired.value.stats().tid;
-        let user = retired.value.stats().state == TaskState::Zombie;
-        {
+        let stats = retired.value.stats();
+        if stats.user {
+            // CLONE_CHILD_CLEARTID must reach the exiting thread's address
+            // space before it is dropped.
+            let (space, address) = {
+                let mut task = retired.value.lock();
+                let clear = (task.address_space.clone(), task.clear_child_tid);
+                task.address_space = None;
+                if !task.files_shared {
+                    task.fd_table.lock().close_all();
+                }
+                clear
+            };
+            if let (Some(space), address) = (space, address)
+                && address != 0
+            {
+                let _ = space.lock().write_bytes(address, &0u32.to_le_bytes());
+                // Publish the cleared word before the exit becomes observable
+                // to another CPU waiting on it.
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
+        } else {
             let mut task = retired.value.lock();
             task.address_space = None;
-            task.fd_table.lock().close_all();
+            if !task.files_shared {
+                task.fd_table.lock().close_all();
+            }
         }
-        if user {
-            // The exiting task is now off-CPU.  Orphans are adopted by PID 1
-            // and the task is retained as a zombie until wait4 reaps it.
-            task::reparent_children(exiting_tid, 1);
-            task::push_zombie(retired.value.clone());
+        if stats.user && stats.state == TaskState::Zombie {
+            if stats.ltid == stats.tgid {
+                // The group leader is retained until the whole group exits.
+                task::push_zombie(retired.value.clone());
+            }
+            if !group_has_live_threads(stats.tgid) {
+                // Orphans are adopted by PID 1 once no thread remains.
+                task::reparent_children(stats.tgid, 1);
+                let code = if stats.exit_code & 0x7f == 0 {
+                    crate::signal::CLD_EXITED
+                } else if stats.exit_code & 0x80 != 0 {
+                    crate::signal::CLD_DUMPED
+                } else {
+                    crate::signal::CLD_KILLED
+                };
+                crate::signal::notify_child_exit(stats.ppid, stats.tgid, code);
+            }
         }
         drop(retired); // Never free the stack while it is still executing.
         COMPLETED.fetch_add(1, Ordering::Release);
