@@ -139,8 +139,12 @@ __spacekernel_aarch64_el0_sync_entry:
 
 __spacekernel_aarch64_exception_entry:
     mov x1, sp
+    mrs x17, spsr_el1
+    tst x17, #15
+    b.eq 2f
     mrs x17, tpidr_el1
     ldr x17, [x17]
     mov sp, x17
+2:
     mov x0, x16
     bl spacekernel_aarch64_exception

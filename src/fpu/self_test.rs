@@ -132,7 +132,9 @@ pub(crate) fn run() {
     assert!(!arch::fpu::is_enabled());
     if configured.format == Format::Unavailable {
         assert!(matches!(State::new(), Err(Error::Unsupported)));
-        crate::kinfo!("CPU/FPU self-test passed (no managed FP state)");
+        crate::self_test::verbose_log(format_args!(
+            "CPU/FPU self-test passed (no managed FP state)"
+        ));
         return;
     }
     let first = pattern(configured, 1);
@@ -207,5 +209,5 @@ pub(crate) fn run() {
     }
     saved.reset().unwrap();
     assert_eq!(saved.bytes(), clean.bytes());
-    crate::kinfo!("CPU/FPU self-test passed");
+    crate::self_test::verbose_log(format_args!("CPU/FPU self-test passed"));
 }

@@ -17,6 +17,7 @@
 //! for other architectures or when FPU borrowing is inactive.
 
 #[cfg(target_arch = "x86_64")]
+#[inline(never)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spacekernel_fpsimd_fb_clear(dst: *mut u8, bytes: usize, pattern32: u32) {
     let pattern64 = (pattern32 as u64) | ((pattern32 as u64) << 32);
@@ -106,6 +107,7 @@ pub unsafe extern "C" fn spacekernel_fpsimd_fb_clear(dst: *mut u8, bytes: usize,
 }
 
 #[cfg(target_arch = "x86_64")]
+#[inline(never)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spacekernel_fpsimd_fb_copy(dst: *mut u8, src: *const u8, bytes: usize) {
     let mut d = dst;

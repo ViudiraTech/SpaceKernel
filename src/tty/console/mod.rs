@@ -20,12 +20,14 @@ use super::{
 };
 use crate::{arch, boot, sync::SpinLock};
 
+pub static DIRTY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static CONSOLE: SpinLock<State> = SpinLock::new(State::new());
 
 struct State {
     initialized: bool,
     serial: bool,
     framebuffer: Option<FbConsole>,
+    framebuffer_owner: Option<alloc::sync::Arc<dyn crate::vfs::Inode>>,
     active_vt: usize,
     invalid_argument: bool,
     framebuffer_unavailable: bool,
@@ -39,6 +41,7 @@ impl State {
             initialized: false,
             serial: false,
             framebuffer: None,
+            framebuffer_owner: None,
             active_vt: 1,
             invalid_argument: false,
             framebuffer_unavailable: false,
@@ -135,6 +138,7 @@ pub fn status() -> ConsoleStatus {
 /// Console writes serialize each complete log record with terminal output.
 /// Serial and framebuffer are never written under the printk ring lock.
 pub fn write_kernel(bytes: &[u8]) {
+    DIRTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut state = CONSOLE.lock();
     if !state.initialized || state.serial {
         write_serial(bytes);
@@ -146,6 +150,7 @@ pub fn write_kernel(bytes: &[u8]) {
 }
 
 pub fn switch_to(tty_number: usize) -> bool {
+    DIRTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut state = CONSOLE.lock();
     if state
         .framebuffer
@@ -160,6 +165,7 @@ pub fn switch_to(tty_number: usize) -> bool {
 }
 
 pub fn scrollback(tty_number: usize, delta: isize) -> bool {
+    DIRTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     CONSOLE
         .lock()
         .framebuffer
@@ -174,4 +180,27 @@ fn write_serial(bytes: &[u8]) {
         }
         arch::serial_write(byte);
     }
+}
+
+/// # Safety
+/// `owner` must retain the contiguous virtual buffer until its final reference is dropped.
+pub unsafe fn install_gpu_console(
+    address: usize,
+    width: u32,
+    height: u32,
+    owner: alloc::sync::Arc<dyn crate::vfs::Inode>,
+) -> Result<(), super::fbcon::FbError> {
+    let framebuffer = unsafe { FbConsole::linear(address, width, height)? };
+    let (old, old_owner) = {
+        let mut state = CONSOLE.lock();
+        state.framebuffer_unavailable = false;
+        (
+            state.framebuffer.replace(framebuffer),
+            state.framebuffer_owner.replace(owner),
+        )
+    };
+    drop(old);
+    drop(old_owner);
+    DIRTY.fetch_add(1, core::sync::atomic::Ordering::Release);
+    Ok(())
 }

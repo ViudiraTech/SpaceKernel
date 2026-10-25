@@ -36,6 +36,10 @@ pub enum VfsError {
     TooManyOpenFiles,
     NotATty,
     BrokenPipe,
+    NoMemory,
+    NoDevice,
+    TimedOut,
+    ExecFormat,
 }
 
 impl VfsError {
@@ -52,7 +56,7 @@ impl VfsError {
             Self::ReadOnlyFs => -abi::EROFS,
             Self::NoSpace => -abi::ENOSPC,
             Self::IoError => -abi::EIO,
-            Self::NotSupported => -abi::ENOSYS,
+            Self::NotSupported => -95,
             Self::TooManySymlinks => -abi::ELOOP,
             Self::NameTooLong => -abi::ENAMETOOLONG,
             Self::Busy => -abi::EBUSY,
@@ -62,6 +66,10 @@ impl VfsError {
             Self::TooManyOpenFiles => -abi::EMFILE,
             Self::NotATty => -abi::ENOTTY,
             Self::BrokenPipe => -abi::EPIPE,
+            Self::NoMemory => -abi::ENOMEM,
+            Self::NoDevice => -abi::ENODEV,
+            Self::TimedOut => -110,
+            Self::ExecFormat => -8,
         }
     }
 }
@@ -129,8 +137,47 @@ pub struct DirEntry {
     pub kind: InodeKind,
 }
 
-pub trait Inode: Send + Sync {
+pub trait Inode: Send + Sync + core::any::Any {
     fn metadata(&self) -> Result<Stat, VfsError>;
+
+    /// A fresh open-file session; dup() retains the returned session.
+    fn open(&self, _flags: u32) -> Result<Option<Arc<dyn Inode>>, VfsError> {
+        Ok(None)
+    }
+
+    fn deactivate(&self) -> Result<(), VfsError> {
+        Ok(())
+    }
+
+    fn poll(&self) -> u32 {
+        1 | 4
+    }
+
+    fn mmap(
+        &self,
+        _space: &mut crate::user::UserAddressSpace,
+        _address: u64,
+        _length: u64,
+        _offset: u64,
+        _prot: u32,
+    ) -> Result<(), VfsError> {
+        Err(VfsError::NoDevice)
+    }
+
+    /// Internal device publication hook. Callers must own the device registry transaction.
+    fn remove_node(&self, _name: &str) -> Result<(), VfsError> {
+        Err(VfsError::ReadOnlyFs)
+    }
+    fn insert_node(&self, _name: &str, _node: Arc<dyn Inode>) -> Result<(), VfsError> {
+        Err(VfsError::ReadOnlyFs)
+    }
+
+    fn chmod(&self, _mode: u32) -> Result<(), VfsError> {
+        Err(VfsError::ReadOnlyFs)
+    }
+    fn chown(&self, _uid: u32, _gid: u32) -> Result<(), VfsError> {
+        Err(VfsError::ReadOnlyFs)
+    }
 
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, VfsError> {
         Err(VfsError::InvalidArgument)

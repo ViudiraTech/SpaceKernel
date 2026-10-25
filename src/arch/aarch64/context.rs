@@ -29,6 +29,7 @@ pub struct Context {
     pub x29: u64, // fp
     pub x30: u64, // lr
     pub sp: u64,
+    pub tpidr_el0: u64,
 }
 
 impl Context {
@@ -48,6 +49,7 @@ impl Context {
             x29: 0,
             x30: 0,
             sp: 0,
+            tpidr_el0: 0,
         }
     }
 }
@@ -79,6 +81,8 @@ pub unsafe extern "C" fn switch(_prev: *mut Context, _next: *const Context) {
         "stp x29, x30, [x0, #80]",
         "mov x9, sp",
         "str x9, [x0, #96]",
+        "mrs x9, tpidr_el0",
+        "str x9, [x0, #104]",
         // Load callee-saved registers from next
         "ldp x19, x20, [x1, #0]",
         "ldp x21, x22, [x1, #16]",
@@ -88,6 +92,8 @@ pub unsafe extern "C" fn switch(_prev: *mut Context, _next: *const Context) {
         "ldp x29, x30, [x1, #80]",
         "ldr x9, [x1, #96]",
         "mov sp, x9",
+        "ldr x9, [x1, #104]",
+        "msr tpidr_el0, x9",
         "ret",
     )
 }

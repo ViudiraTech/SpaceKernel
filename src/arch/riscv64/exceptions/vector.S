@@ -143,6 +143,12 @@ __spacekernel_riscv64_trap:
     ld t0, 240(sp)
     csrw sepc, t0
     ld t1, 248(sp)
+    li t2, 0x6000
+    and t0, t1, t2
+    xor t1, t1, t0
+    csrr t0, sstatus
+    and t0, t0, t2
+    or t1, t1, t0
     csrw sstatus, t1
 
     // Check if returning to user mode (sstatus.SPP == 0) or kernel mode

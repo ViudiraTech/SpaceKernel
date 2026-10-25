@@ -15,7 +15,8 @@ use crate::{arch, fpu, sync::SpinLock};
 use alloc::{
     alloc::{alloc, dealloc},
     boxed::Box,
-    sync::Arc,
+    sync::{Arc, Weak},
+    vec::Vec,
 };
 use core::{
     alloc::Layout,
@@ -27,13 +28,61 @@ use core::{
 /// scheduler-private context or changing task/queue identity.
 #[derive(Clone)]
 pub struct TaskRef(Arc<SpinLock<Task>>);
+static TASKS: SpinLock<Vec<(u64, Weak<SpinLock<Task>>)>> = SpinLock::new(Vec::new());
+#[derive(Clone)]
+pub struct TaskWeak {
+    tid: u64,
+    inner: Weak<SpinLock<Task>>,
+}
+impl TaskWeak {
+    pub fn upgrade(&self) -> Option<TaskRef> {
+        let task = TaskRef(self.inner.upgrade()?);
+        if task.stats().state == TaskState::Dead {
+            None
+        } else {
+            Some(task)
+        }
+    }
+    pub fn tid(&self) -> u64 {
+        self.tid
+    }
+}
+pub fn find(tid: u64) -> Option<TaskRef> {
+    let weak = TASKS
+        .lock()
+        .iter()
+        .find(|(id, _)| *id == tid)
+        .map(|(_, w)| w.clone())?;
+    let task = TaskRef(weak.upgrade()?);
+    if task.stats().state == TaskState::Dead {
+        None
+    } else {
+        Some(task)
+    }
+}
+pub fn all() -> Vec<TaskRef> {
+    let weak: Vec<_> = TASKS.lock().iter().map(|(_, w)| w.clone()).collect();
+    weak.into_iter()
+        .filter_map(|w| w.upgrade().map(TaskRef))
+        .filter(|t| t.stats().state != TaskState::Dead)
+        .collect()
+}
+pub fn last_tid() -> u64 {
+    NEXT_TID.load(Ordering::Relaxed).saturating_sub(1)
+}
 #[derive(Clone, Copy, Debug)]
 pub struct TaskStats {
     pub tid: u64,
+    pub tgid: u64,
+    pub ppid: u64,
+    pub nice: i32,
+    pub start_ns: u64,
     pub state: TaskState,
     pub cpu: usize,
     pub affinity: CpuMask,
     pub runtime_ns: u64,
+    pub user_ns: u64,
+    pub system_ns: u64,
     pub switches: u64,
     pub voluntary_switches: u64,
     pub involuntary_switches: u64,
@@ -44,14 +93,32 @@ impl TaskRef {
     pub(crate) fn lock(&self) -> crate::sync::Guard<'_, Task> {
         self.0.lock()
     }
+    pub fn downgrade(&self) -> TaskWeak {
+        TaskWeak {
+            tid: self.stats().tid,
+            inner: Arc::downgrade(&self.0),
+        }
+    }
+    pub fn address_space(&self) -> Option<Arc<SpinLock<crate::user::UserAddressSpace>>> {
+        self.lock().address_space.clone()
+    }
+    pub fn files(&self) -> Arc<SpinLock<crate::vfs::FileDescriptorTable>> {
+        self.lock().fd_table.clone()
+    }
     pub fn stats(&self) -> TaskStats {
         let task = self.lock();
         TaskStats {
             tid: task.tid,
+            tgid: task.tgid,
+            ppid: task.ppid,
+            nice: task.nice,
+            start_ns: task.start_ns,
             state: task.state,
             cpu: task.on_cpu,
             affinity: task.affinity,
             runtime_ns: task.runtime_ns,
+            user_ns: task.user_ns,
+            system_ns: task.system_ns,
             switches: task.switches,
             voluntary_switches: task.voluntary_switches,
             involuntary_switches: task.involuntary_switches,
@@ -117,10 +184,16 @@ impl CpuMask {
 
 pub(crate) struct Task {
     pub tid: u64,
+    pub tgid: u64,
+    pub ppid: u64,
+    pub nice: i32,
+    pub start_ns: u64,
     pub(crate) state: TaskState,
     pub(crate) on_cpu: usize,
     pub(crate) affinity: CpuMask,
     pub runtime_ns: u64,
+    pub user_ns: u64,
+    pub system_ns: u64,
     pub switches: u64,
     pub voluntary_switches: u64,
     pub involuntary_switches: u64,
@@ -212,12 +285,21 @@ impl Task {
                 arch::context_init(&mut context, stack.top(), task_entry as *const () as usize);
             }
         }
-        Ok(TaskRef(Arc::new(SpinLock::new(Self {
-            tid: NEXT_TID.fetch_add(1, Ordering::Relaxed),
+        let tid = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+        let ppid = super::current().map(|t| t.stats().tid).unwrap_or(0);
+        let start_ns = crate::time::uptime_micros().saturating_mul(1000);
+        let result = TaskRef(Arc::new(SpinLock::new(Self {
+            tid,
+            tgid: tid,
+            ppid,
+            nice: 0,
+            start_ns,
             state: TaskState::Ready,
             on_cpu: cpu,
             affinity,
             runtime_ns: 0,
+            user_ns: 0,
+            system_ns: 0,
             switches: 0,
             voluntary_switches: 0,
             involuntary_switches: 0,
@@ -231,7 +313,12 @@ impl Task {
             fd_table: Arc::new(SpinLock::new(
                 crate::vfs::FileDescriptorTable::new_with_stdio(),
             )),
-        }))))
+        })));
+        let tid = result.stats().tid;
+        let mut tasks = TASKS.lock();
+        tasks.retain(|(_, w)| w.strong_count() != 0);
+        tasks.push((tid, Arc::downgrade(&result.0)));
+        Ok(result)
     }
 }
 extern "C" fn task_entry() -> ! {

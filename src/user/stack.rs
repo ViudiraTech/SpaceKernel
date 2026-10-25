@@ -1,138 +1,149 @@
 /*
- *
  *       src/user/stack.rs
- *       Linux System V ABI user process stack setup with auxv and arguments
- *
- *       2026/9/30 By JiTianYu391
+ *       Bounded cross-page System V initial stack and auxiliary vectors
+ *       2026/10/24 By JiTianYu391
  *       Copyright (C) 2026 ViudiraTech.
- *
  */
+use super::{
+    address_space::{ProcessImage, UserAddressSpace},
+    elf::LoadedElf,
+};
+use alloc::{string::String, vec, vec::Vec};
+pub const USER_STACK_PAGES: usize = 64;
+pub fn stack_top() -> u64 {
+    UserAddressSpace::user_limit() - 0x10000
+}
 
-//! System V ABI user stack initialization.
-
-use super::address_space::UserAddressSpace;
-use crate::mm::pmm;
-
-#[cfg(target_arch = "riscv64")]
-pub const USER_STACK_TOP: u64 = 0x0000_003f_ffff_0000;
-
-#[cfg(not(target_arch = "riscv64"))]
-pub const USER_STACK_TOP: u64 = 0x0000_7fff_ffff_0000;
-pub const USER_STACK_PAGES: usize = 16; // 64 KiB user stack
-
-// ELF Auxiliary Vector Types
-const AT_NULL: u64 = 0;
-const AT_PAGESZ: u64 = 6;
-const AT_ENTRY: u64 = 9;
-const AT_RANDOM: u64 = 25;
-
-pub fn setup_user_stack(
-    address_space: &mut UserAddressSpace,
-    entry: u64,
-    program_name: &str,
+fn push(
+    space: &UserAddressSpace,
+    sp: &mut u64,
+    base: u64,
+    bytes: &[u8],
 ) -> Result<u64, &'static str> {
-    let stack_base = USER_STACK_TOP - (USER_STACK_PAGES as u64) * 4096;
-
-    // Allocate and map physical frames for the user stack
-    let mut top_frame_virt = 0 as *mut u8;
-    for i in 0..USER_STACK_PAGES {
-        let page_va = stack_base + (i as u64) * 4096;
-        let frame = pmm::alloc(1).ok_or("out of memory for user stack frame")?;
-        let virt = pmm::phys_to_virt(frame) as *mut u8;
-        unsafe {
-            core::ptr::write_bytes(virt, 0, 4096);
+    *sp = sp
+        .checked_sub(bytes.len() as u64)
+        .filter(|s| *s >= base)
+        .ok_or("arguments exceed user stack")?;
+    space
+        .initialize(*sp, bytes)
+        .map_err(|_| "stack copy failed")?;
+    Ok(*sp)
+}
+fn strings(
+    space: &UserAddressSpace,
+    sp: &mut u64,
+    base: u64,
+    items: &[&str],
+) -> Result<(Vec<u64>, Vec<u8>), &'static str> {
+    if items.len() > 4096 {
+        return Err("too many arguments");
+    }
+    let mut pointers = Vec::new();
+    let mut flat = Vec::new();
+    for item in items {
+        if item.as_bytes().contains(&0) {
+            return Err("NUL in arguments");
         }
-        if i == USER_STACK_PAGES - 1 {
-            top_frame_virt = virt;
+        let mut value = item.as_bytes().to_vec();
+        value.push(0);
+        pointers.push(push(space, sp, base, &value)?);
+        flat.extend_from_slice(&value);
+    }
+    Ok((pointers, flat))
+}
+pub fn setup_user_stack(
+    space: &mut UserAddressSpace,
+    loaded: &LoadedElf,
+    name: &str,
+) -> Result<u64, &'static str> {
+    setup(space, loaded, name, &[name], &[])
+}
+pub fn setup(
+    space: &mut UserAddressSpace,
+    loaded: &LoadedElf,
+    name: &str,
+    argv: &[&str],
+    env: &[&str],
+) -> Result<u64, &'static str> {
+    let top = stack_top();
+    let base = top - USER_STACK_PAGES as u64 * 4096;
+    // The page below base is deliberately absent and never used for payload.
+    if space.contains(base - 4096) {
+        return Err("ELF overlaps stack guard");
+    }
+    space.map_zeroed(base, top - base, 3)?;
+    let result = (|| {
+        let mut sp = top;
+        let (args, argv_flat) = strings(space, &mut sp, base, argv)?;
+        let (envp, env_flat) = strings(space, &mut sp, base, env)?;
+        let mut executable = name.as_bytes().to_vec();
+        executable.push(0);
+        let execfn = push(space, &mut sp, base, &executable)?;
+        #[cfg(target_arch = "x86_64")]
+        let platform_str = b"x86_64\0";
+        #[cfg(target_arch = "aarch64")]
+        let platform_str = b"aarch64\0";
+        #[cfg(target_arch = "riscv64")]
+        let platform_str = b"riscv64\0";
+        let platform = push(space, &mut sp, base, platform_str)?;
+        let mut aux = vec![
+            (3, loaded.phdr),
+            (4, 56),
+            (5, loaded.phnum as u64),
+            (6, 4096),
+            (7, loaded.interpreter_base),
+            (8, 0),
+            (9, loaded.entry),
+            (11, 0),
+            (12, 0),
+            (13, 0),
+            (14, 0),
+            (15, platform),
+            (17, 100),
+            (23, 0),
+            (31, execfn),
+        ];
+        let mut random = [0; 16];
+        if crate::random::fill(&mut random).is_ok() {
+            let p = push(space, &mut sp, base, &random)?;
+            aux.push((25, p));
         }
-        address_space.map_page(page_va, frame, true, false)?;
+        aux.push((0, 0));
+        let mut values = vec![args.len() as u64];
+        values.extend(args);
+        values.push(0);
+        values.extend(envp);
+        values.push(0);
+        let mut auxbytes = Vec::new();
+        for &(key, value) in &aux {
+            values.extend([key, value]);
+            auxbytes.extend_from_slice(&key.to_le_bytes());
+            auxbytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let length = values.len().checked_mul(8).ok_or("stack vector overflow")?;
+        sp = sp
+            .checked_sub(length as u64)
+            .filter(|&v| v >= base)
+            .ok_or("stack overflow")?
+            & !15;
+        if sp < base {
+            return Err("stack alignment overflow");
+        }
+        for (index, value) in values.iter().enumerate() {
+            space
+                .initialize(sp + index as u64 * 8, &value.to_le_bytes())
+                .map_err(|_| "stack vector copy failed")?;
+        }
+        space.image = Some(ProcessImage {
+            executable: String::from(name),
+            argv: argv_flat,
+            environ: env_flat,
+            auxv: auxbytes,
+        });
+        Ok(sp)
+    })();
+    if result.is_err() {
+        let _ = space.unmap(base, top - base);
     }
-
-    // Now format the initial System V stack frame at the top of the stack
-    // Frame layout (pushed from top to bottom):
-    // [strings]
-    // [AT_NULL, 0]
-    // [AT_ENTRY, entry]
-    // [AT_PAGESZ, 4096]
-    // [AT_RANDOM, rand_ptr]
-    // [NULL] (envp terminator)
-    // [NULL] (argv terminator)
-    // [argv[0]] -> ptr to prog_name
-    // [argc] = 1
-
-    let mut sp = USER_STACK_TOP;
-
-    // 1. Push 16-byte random bytes for AT_RANDOM
-    sp -= 16;
-    let rand_va = sp;
-    let rand_offset_in_top_page = (sp % 4096) as usize;
-    unsafe {
-        let rand_dst = top_frame_virt.add(rand_offset_in_top_page);
-        core::ptr::copy_nonoverlapping(b"SpaceKernelRandom".as_ptr(), rand_dst, 16);
-    }
-
-    // 2. Push program name string
-    let name_bytes = program_name.as_bytes();
-    let name_len = name_bytes.len() + 1; // with null terminator
-    sp -= name_len as u64;
-    let name_va = sp;
-    let name_offset = (sp % 4096) as usize;
-    unsafe {
-        let dst = top_frame_virt.add(name_offset);
-        core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), dst, name_bytes.len());
-        *dst.add(name_bytes.len()) = 0; // null terminate
-    }
-
-    // Align stack pointer to 16 bytes
-    sp &= !15;
-
-    // 3. Prepare auxv, envp, argv, argc
-    let mut stack_values = [0u64; 32];
-    let mut idx = 0;
-
-    // argc
-    stack_values[idx] = 1;
-    idx += 1;
-    // argv[0]
-    stack_values[idx] = name_va;
-    idx += 1;
-    // argv terminator (NULL)
-    stack_values[idx] = 0;
-    idx += 1;
-    // envp terminator (NULL)
-    stack_values[idx] = 0;
-    idx += 1;
-
-    // auxv pairs
-    stack_values[idx] = AT_PAGESZ;
-    idx += 1;
-    stack_values[idx] = 4096;
-    idx += 1;
-
-    stack_values[idx] = AT_ENTRY;
-    idx += 1;
-    stack_values[idx] = entry;
-    idx += 1;
-
-    stack_values[idx] = AT_RANDOM;
-    idx += 1;
-    stack_values[idx] = rand_va;
-    idx += 1;
-
-    stack_values[idx] = AT_NULL;
-    idx += 1;
-    stack_values[idx] = 0;
-    idx += 1;
-
-    let payload_bytes = idx * 8;
-    sp -= payload_bytes as u64;
-    sp &= !15; // 16-byte align
-
-    let payload_offset = (sp % 4096) as usize;
-    unsafe {
-        let dst = top_frame_virt.add(payload_offset) as *mut u64;
-        core::ptr::copy_nonoverlapping(stack_values.as_ptr(), dst, idx);
-    }
-
-    Ok(sp)
+    result
 }

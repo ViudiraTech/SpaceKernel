@@ -1,0 +1,7 @@
+c33892cd4ffc9f067d048b5a0dd7ae807875fed109c286b2434d9dbc3d85e9ff  vendor/linux-uapi/drm/drm.h
+992f33804acda60b0b46f1a272942c3592484ea3217d469239f1cb12249de2eb  vendor/linux-uapi/drm/drm_fourcc.h
+d31f97c9f3bab0966f2877c4426e65e5553345a5251d6e7c7627ed980e38169f  vendor/linux-uapi/drm/drm_mode.h
+297d6ac774fdcd2c912c7c615f66cb643fcdeb804262eca0e68f20d508854a55  vendor/linux-uapi/drm/virtgpu_drm.h
+c847089630fad9e30bdbe91c527f3ad2bbd3528723ca32e3192fb9110fe765bb  vendor/linux-uapi/linux/virtio_gpu.h
+fbe121a1bdfedfe6bc511d293cdbff1de37db5acf62cd35048e81309de6dd512  vendor/linux-uapi/linux/virtio_pci.h
+37a41ddca1c8832ce55c097ded42984f58489381b3273753ac42d5bbad43dc2c  vendor/linux-uapi/linux/virtio_ring.h

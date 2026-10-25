@@ -58,6 +58,10 @@ impl Inode for ConsoleInode {
             _ => Err(VfsError::InvalidArgument),
         }
     }
+
+    fn poll(&self) -> u32 {
+        0x04
+    }
 }
 
 struct PipeBuffer {
@@ -112,6 +116,22 @@ impl Inode for PipeEndInode {
         }
         Ok(buf.len())
     }
+
+    fn poll(&self) -> u32 {
+        let pipe = self.shared.lock();
+        if self.is_writer {
+            if pipe.read_closed { 0x08 } else { 0x04 }
+        } else {
+            let mut revents = 0;
+            if !pipe.queue.is_empty() {
+                revents |= 0x01;
+            }
+            if pipe.write_closed {
+                revents |= 0x10;
+            }
+            revents
+        }
+    }
 }
 
 impl Drop for PipeEndInode {
@@ -126,30 +146,37 @@ impl Drop for PipeEndInode {
 }
 
 pub fn create_pipe_pair() -> (Arc<OpenFile>, Arc<OpenFile>) {
+    create_pipe_pair_with_flags(0)
+}
+
+pub fn create_pipe_pair_with_flags(extra_flags: u32) -> (Arc<OpenFile>, Arc<OpenFile>) {
+    let status_flags = extra_flags & abi::O_NONBLOCK;
     let shared = Arc::new(SpinLock::new(PipeBuffer {
         queue: VecDeque::with_capacity(4096),
         write_closed: false,
         read_closed: false,
     }));
+    let r_ino = super::tree::ino();
+    let w_ino = super::tree::ino();
     let read_inode: Arc<dyn Inode> = Arc::new(PipeEndInode {
         shared: shared.clone(),
         is_writer: false,
-        ino: 0x9000_0001,
+        ino: r_ino,
     });
     let write_inode: Arc<dyn Inode> = Arc::new(PipeEndInode {
         shared,
         is_writer: true,
-        ino: 0x9000_0002,
+        ino: w_ino,
     });
     let reader = Arc::new(OpenFile::new(
         read_inode,
-        String::from("pipe:[r]"),
-        abi::O_RDONLY,
+        alloc::format!("pipe:[{}]", r_ino),
+        abi::O_RDONLY | status_flags,
     ));
     let writer = Arc::new(OpenFile::new(
         write_inode,
-        String::from("pipe:[w]"),
-        abi::O_WRONLY,
+        alloc::format!("pipe:[{}]", w_ino),
+        abi::O_WRONLY | status_flags,
     ));
     (reader, writer)
 }
@@ -352,6 +379,23 @@ impl FileDescriptorTable {
         }
     }
 
+    pub fn snapshot(&self) -> Vec<(usize, FdEntry)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.clone().map(|e| (i, e)))
+            .collect()
+    }
+    pub fn close_on_exec(&mut self) {
+        for slot in &mut self.entries {
+            if slot.as_ref().is_some_and(|e| e.cloexec) {
+                *slot = None;
+            }
+        }
+    }
+    pub fn close_all(&mut self) {
+        self.entries.clear();
+    }
     pub fn cwd(&self) -> &str {
         &self.cwd
     }

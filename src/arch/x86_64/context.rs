@@ -18,6 +18,8 @@ pub struct Context {
     rbx: u64,
     rbp: u64,
     rsp: u64,
+    fs_base: u64,
+    user_gs_base: u64,
 }
 impl Context {
     pub const fn new() -> Self {
@@ -29,6 +31,8 @@ impl Context {
             rbx: 0,
             rbp: 0,
             rsp: 0,
+            fs_base: 0,
+            user_gs_base: 0,
         }
     }
 }
@@ -55,6 +59,27 @@ pub unsafe extern "C" fn switch(_previous: *mut Context, _next: *const Context) 
         "mov [rdi + 32], rbx",
         "mov [rdi + 40], rbp",
         "mov [rdi + 48], rsp",
+        // FS and the user GS base (parked by SWAPGS) belong to the task.
+        "mov ecx, 0xc0000100",
+        "rdmsr",
+        "shl rdx, 32",
+        "or rax, rdx",
+        "mov [rdi + 56], rax",
+        "mov ecx, 0xc0000102",
+        "rdmsr",
+        "shl rdx, 32",
+        "or rax, rdx",
+        "mov [rdi + 64], rax",
+        "mov rax, [rsi + 56]",
+        "mov rdx, rax",
+        "shr rdx, 32",
+        "mov ecx, 0xc0000100",
+        "wrmsr",
+        "mov rax, [rsi + 64]",
+        "mov rdx, rax",
+        "shr rdx, 32",
+        "mov ecx, 0xc0000102",
+        "wrmsr",
         "mov r15, [rsi]",
         "mov r14, [rsi + 8]",
         "mov r13, [rsi + 16]",

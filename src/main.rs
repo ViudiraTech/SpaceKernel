@@ -20,15 +20,18 @@ mod arch;
 pub mod block;
 mod boot;
 pub mod cpuid;
+pub mod device;
 pub mod fpu;
+pub mod gpu;
 mod hardware;
 pub mod irq;
 mod mm;
 pub mod pci;
 pub mod printk;
+mod random;
 pub mod sched;
 #[cfg(feature = "boot-self-test")]
-mod self_test;
+pub mod self_test;
 pub mod shell;
 mod smp;
 mod sync;
@@ -157,34 +160,21 @@ pub extern "C" fn kmain() -> ! {
         Err(error) => kwarn!("PCI discovery unavailable: {error:?}"),
     }
 
-    #[cfg(feature = "boot-self-test")]
-    self_test::run();
     assert!(interrupt_ready, "scheduler requires interrupt controller");
     arch::serial_enable_irq();
     hardware::ps2::init();
     block::init();
     vfs::init();
+    gpu::init();
     #[cfg(feature = "boot-self-test")]
-    {
-        block::run_self_test();
-        vfs::run_self_test();
-        syscall::run_vfs_syscall_self_test();
-    }
+    self_test::run_early();
     sched::init(boot::cpu_count());
     smp::start();
     kinfo!("Scheduler: per-CPU EEVDF ready");
     shell::start();
+    gpu::start();
     #[cfg(feature = "boot-self-test")]
-    sched::spawn_on(
-        boot::bsp_cpu_index(),
-        || {
-            sched::sched_test::run();
-            user::run_self_test().expect("user self-test failed");
-            kinfo!("BOOT_OK");
-        },
-        0,
-    )
-    .expect("scheduler test task allocation failed");
+    self_test::spawn_late();
     #[cfg(not(feature = "boot-self-test"))]
     kinfo!("BOOT_OK");
     smp::release();

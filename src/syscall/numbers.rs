@@ -202,3 +202,56 @@ pub const SYS_BRK: u64 = 214;
 pub const SYS_MUNMAP: u64 = 215;
 #[cfg(not(target_arch = "x86_64"))]
 pub const SYS_MMAP: u64 = 222;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_MPROTECT: u64 = 10;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_MPROTECT: u64 = 226;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_EXECVE: u64 = 59;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_EXECVE: u64 = 221;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_PPOLL: u64 = 271;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_PPOLL: u64 = 73;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_CLOCK_GETTIME: u64 = 228;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_CLOCK_GETTIME: u64 = 113;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_GETRANDOM: u64 = 318;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_GETRANDOM: u64 = 278;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_POLL: u64 = 7;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_MKNODAT: u64 = 259;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_MKNODAT: u64 = 33;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_FCHMOD: u64 = 91;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_FCHMOD: u64 = 52;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_FCHMODAT: u64 = 268;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_FCHMODAT: u64 = 53;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_FCHOWN: u64 = 93;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_FCHOWN: u64 = 55;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_FCHOWNAT: u64 = 260;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_FCHOWNAT: u64 = 54;

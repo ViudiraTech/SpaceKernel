@@ -47,14 +47,22 @@ impl<T> SpinLock<T> {
     }
 
     pub fn lock(&self) -> Guard<'_, T> {
-        let flags = arch::irq_save();
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
+        let flags = loop {
+            let flags = arch::irq_save();
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break flags;
+            }
+            // Permit shootdown/IPI delivery while another CPU owns this lock.
+            // The successful owner still runs with local IRQs masked.
+            arch::irq_restore(flags);
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        };
         Guard {
             lock: self,
             flags,

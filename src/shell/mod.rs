@@ -100,6 +100,7 @@ fn execute_command(line: &str) {
         "cpuinfo" => cmd_cpuinfo(),
         "lspci" => cmd_lspci(),
         "lsblk" => cmd_lsblk(),
+        "blkbench" => cmd_blkbench(),
         "dmesg" => cmd_dmesg(),
         "uname" => cmd_uname(),
         "pwd" => print_tty(&format!("{}\n", current_cwd())),
@@ -159,6 +160,7 @@ fn cmd_help() {
     print_tty("  mount / umount        - List, mount or unmount filesystems\n");
     print_tty("  df                    - Display mounted filesystem usage\n");
     print_tty("  lsblk                 - Display IDE/AHCI/NVMe/RAM block devices & cache stats\n");
+    print_tty("  blkbench              - Run IDE / AHCI / NVMe / RAMDisk storage benchmark\n");
     print_tty("  sync                  - Flush all filesystem and block caches\n");
     print_tty("  ps                    - Display active kernel tasks and scheduler statistics\n");
     print_tty(
@@ -433,6 +435,31 @@ fn cmd_lsblk() {
         "\nBlock Cache: hits={} misses={} writes={} flushes={} evictions={}\n",
         cs.hits, cs.misses, cs.writes, cs.flushes, cs.evictions
     ));
+}
+
+fn cmd_blkbench() {
+    print_tty(
+        "Running storage driver benchmark (512 KiB 4K-DMA + 64 KiB 512B-Random + Cache + Flush)...\n",
+    );
+    print_tty(
+        "DEVICE    DRV   4K-READ(KiB/s) 4K-WRITE(KiB/s) 512B-R(IOPS) 512B-W(IOPS) CACHE-R(KiB/s) FLUSH(us)\n",
+    );
+    print_tty(
+        "---------+-----+--------------+---------------+------------+------------+--------------+---------\n",
+    );
+    for r in block::bench::run_all() {
+        print_tty(&format!(
+            "{:<9} {:<5} {:14} {:15} {:12} {:12} {:14} {:9}\n",
+            r.name,
+            r.kind,
+            r.seq_read_kib_s,
+            r.seq_write_kib_s,
+            r.rand_read_iops,
+            r.rand_write_iops,
+            r.cache_read_kib_s,
+            r.flush_lat_us
+        ));
+    }
 }
 
 fn cmd_ps() {

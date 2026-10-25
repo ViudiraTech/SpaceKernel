@@ -196,30 +196,37 @@ impl IdeChannelState {
         }
     }
 
-    fn transfer_dma_sector(
+    fn transfer_dma_sectors(
         &mut self,
         drive: u8,
         lba: u64,
+        sector_count: usize,
         lba48: bool,
         write: bool,
-        sector_buf: &mut [u8; SECTOR_SIZE],
+        buf: &mut [u8],
     ) -> Result<(), BlockError> {
-        if self.bm_base == 0 || self.dma_page_phys == 0 || self.dma_page_phys >= (1u64 << 32) {
+        let byte_len = sector_count * SECTOR_SIZE;
+        if self.bm_base == 0
+            || self.dma_page_phys == 0
+            || self.dma_page_phys + 8192 > (1u64 << 32)
+            || sector_count == 0
+            || byte_len > 4096
+        {
             return Err(BlockError::Unsupported);
         }
 
         let page_virt = pmm::phys_to_virt(self.dma_page_phys);
         let prdt_ptr = page_virt as *mut PrdEntry;
-        let data_phys = (self.dma_page_phys + 512) as u32;
-        let data_ptr = (page_virt + 512) as *mut u8;
+        let data_phys = (self.dma_page_phys + 4096) as u32;
+        let data_ptr = (page_virt + 4096) as *mut u8;
 
         unsafe {
             if write {
-                core::ptr::copy_nonoverlapping(sector_buf.as_ptr(), data_ptr, SECTOR_SIZE);
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), data_ptr, byte_len);
             }
             prdt_ptr.write_volatile(PrdEntry {
                 phys_addr: data_phys,
-                byte_count: SECTOR_SIZE as u16,
+                byte_count: byte_len as u16,
                 flags: 0x8000, // End of Table
             });
 
@@ -233,7 +240,7 @@ impl IdeChannelState {
         }
 
         self.wait_not_busy(100_000)?;
-        self.setup_lba(drive, lba, 1, lba48);
+        self.setup_lba(drive, lba, sector_count as u16, lba48);
         self.delay_400ns();
 
         let ata_cmd = match (write, lba48) {
@@ -280,7 +287,7 @@ impl IdeChannelState {
 
         if !write {
             unsafe {
-                core::ptr::copy_nonoverlapping(data_ptr, sector_buf.as_mut_ptr(), SECTOR_SIZE);
+                core::ptr::copy_nonoverlapping(data_ptr, buf.as_mut_ptr(), byte_len);
             }
         }
         Ok(())
@@ -370,26 +377,40 @@ impl BlockDevice for IdeDisk {
         }
 
         let mut ch = self.channel.lock();
-        let mut sector = [0u8; SECTOR_SIZE];
-        for i in 0..count {
-            let cur_lba = lba + i as u64;
-            let res = if self.dma_capable {
-                ch.transfer_dma_sector(self.drive_select, cur_lba, self.lba48, false, &mut sector)
-                    .or_else(|_| {
-                        ch.transfer_pio_sector(
-                            self.drive_select,
-                            cur_lba,
-                            self.lba48,
-                            false,
-                            &mut sector,
-                        )
-                    })
-            } else {
-                ch.transfer_pio_sector(self.drive_select, cur_lba, self.lba48, false, &mut sector)
-            };
-            res?;
-            let off = i * SECTOR_SIZE;
-            buf[off..off + SECTOR_SIZE].copy_from_slice(&sector);
+        let mut done = 0usize;
+        while done < count {
+            let batch = (count - done).min(8);
+            let bytes = batch * SECTOR_SIZE;
+            let off = done * SECTOR_SIZE;
+            let cur_lba = lba + done as u64;
+            if self.dma_capable
+                && ch
+                    .transfer_dma_sectors(
+                        self.drive_select,
+                        cur_lba,
+                        batch,
+                        self.lba48,
+                        false,
+                        &mut buf[off..off + bytes],
+                    )
+                    .is_ok()
+            {
+                done += batch;
+                continue;
+            }
+            let mut sector = [0u8; SECTOR_SIZE];
+            for i in 0..batch {
+                ch.transfer_pio_sector(
+                    self.drive_select,
+                    cur_lba + i as u64,
+                    self.lba48,
+                    false,
+                    &mut sector,
+                )?;
+                let sec_off = off + i * SECTOR_SIZE;
+                buf[sec_off..sec_off + SECTOR_SIZE].copy_from_slice(&sector);
+            }
+            done += batch;
         }
         Ok(())
     }
@@ -415,26 +436,42 @@ impl BlockDevice for IdeDisk {
         }
 
         let mut ch = self.channel.lock();
-        let mut sector = [0u8; SECTOR_SIZE];
-        for i in 0..count {
-            let cur_lba = lba + i as u64;
-            let off = i * SECTOR_SIZE;
-            sector.copy_from_slice(&buf[off..off + SECTOR_SIZE]);
-            let res = if self.dma_capable {
-                ch.transfer_dma_sector(self.drive_select, cur_lba, self.lba48, true, &mut sector)
-                    .or_else(|_| {
-                        ch.transfer_pio_sector(
-                            self.drive_select,
-                            cur_lba,
-                            self.lba48,
-                            true,
-                            &mut sector,
-                        )
-                    })
-            } else {
-                ch.transfer_pio_sector(self.drive_select, cur_lba, self.lba48, true, &mut sector)
-            };
-            res?;
+        let mut done = 0usize;
+        let mut temp = [0u8; 4096];
+        while done < count {
+            let batch = (count - done).min(8);
+            let bytes = batch * SECTOR_SIZE;
+            let off = done * SECTOR_SIZE;
+            let cur_lba = lba + done as u64;
+            temp[..bytes].copy_from_slice(&buf[off..off + bytes]);
+            if self.dma_capable
+                && ch
+                    .transfer_dma_sectors(
+                        self.drive_select,
+                        cur_lba,
+                        batch,
+                        self.lba48,
+                        true,
+                        &mut temp[..bytes],
+                    )
+                    .is_ok()
+            {
+                done += batch;
+                continue;
+            }
+            let mut sector = [0u8; SECTOR_SIZE];
+            for i in 0..batch {
+                let sec_off = off + i * SECTOR_SIZE;
+                sector.copy_from_slice(&buf[sec_off..sec_off + SECTOR_SIZE]);
+                ch.transfer_pio_sector(
+                    self.drive_select,
+                    cur_lba + i as u64,
+                    self.lba48,
+                    true,
+                    &mut sector,
+                )?;
+            }
+            done += batch;
         }
         Ok(())
     }
@@ -668,7 +705,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
             .into_iter()
             .enumerate()
             {
-                let dma_page_phys = pmm::alloc(1).unwrap_or(0);
+                let dma_page_phys = pmm::alloc(2).unwrap_or(0);
                 if dma_page_phys == 0 {
                     kwarn!(
                         "IDE: failed to allocate DMA bounce page for channel {}",
@@ -679,7 +716,7 @@ pub fn init() -> Vec<Arc<dyn BlockDevice>> {
                         core::ptr::write_bytes(
                             pmm::phys_to_virt(dma_page_phys) as *mut u8,
                             0,
-                            4096,
+                            8192,
                         );
                     }
                 }
