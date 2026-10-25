@@ -11,10 +11,10 @@
 //! Built-in test user programs executing via Linux ABI.
 
 #[cfg(target_arch = "x86_64")]
-pub const TEST_USER_ELF: &[u8] = include_bytes!("../../tools/user_test/test_x86_64.elf");
+pub const TEST_USER_ELF: &[u8] = include_bytes!("../../user/test/test_x86_64.elf");
 
 #[cfg(target_arch = "aarch64")]
-pub const TEST_USER_ELF: &[u8] = include_bytes!("../../tools/user_test/test_aarch64.elf");
+pub const TEST_USER_ELF: &[u8] = include_bytes!("../../user/test/test_aarch64.elf");
 
 #[cfg(target_arch = "riscv64")]
-pub const TEST_USER_ELF: &[u8] = include_bytes!("../../tools/user_test/test_riscv64.elf");
+pub const TEST_USER_ELF: &[u8] = include_bytes!("../../user/test/test_riscv64.elf");
