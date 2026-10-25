@@ -587,11 +587,13 @@ pub fn init() {
     let _ = write_file(
         "/etc/os-release",
         format!(
-            "NAME=\"{}\"\nVERSION=\"{}\"\nID=spaceos9\nPRETTY_NAME=\"{} {}\"\n",
-            crate::spk::NAME,
-            crate::spk::VERSION,
-            crate::spk::NAME,
-            crate::spk::VERSION
+            "NAME=\"{}\"\nVERSION=\"{}\"\nID={}\nVERSION_ID=\"{}\"\nPRETTY_NAME=\"{}\"\nHOME_URL=\"{}\"\n",
+            crate::spk::DISTRO_NAME,
+            crate::spk::DISTRO_VERSION,
+            crate::spk::DISTRO_ID,
+            crate::spk::DISTRO_VERSION,
+            crate::spk::DISTRO_PRETTY_NAME,
+            crate::spk::DISTRO_HOME_URL
         )
         .as_bytes(),
     );

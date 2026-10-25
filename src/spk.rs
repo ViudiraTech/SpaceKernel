@@ -19,6 +19,11 @@ use crate::sync::SpinLock;
 
 pub const NAME: &str = "SpaceKernel";
 pub const VERSION: &str = "3.0";
+pub const DISTRO_NAME: &str = "SpaceOS";
+pub const DISTRO_VERSION: &str = "9";
+pub const DISTRO_ID: &str = "spaceos9";
+pub const DISTRO_PRETTY_NAME: &str = "SpaceOS 9";
+pub const DISTRO_HOME_URL: &str = "https://github.com/ViudiraTech/SpaceOS-9";
 pub const UTS_SYSNAME: &str = "SpaceKernel";
 pub const UTS_DEFAULT_NODENAME: &str = "spaceos9";
 pub const UTS_DOMAINNAME: &str = "(none)";

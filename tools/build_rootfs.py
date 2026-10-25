@@ -114,6 +114,8 @@ def main() -> int:
         "group": "root:x:0:\n",
         "profile": "export PATH=/bin:/sbin\nexport HOME=/root\nexport PS1='\\u@\\h:\\w\\$ '\n",
         "fstab": "rootfs  /      vfat  defaults 0 0\nproc    /proc  proc  defaults 0 0\nsysfs   /sys   sysfs defaults 0 0\ndevtmpfs /dev  devtmpfs defaults 0 0\ntmpfs   /tmp   tmpfs defaults 0 0\n",
+        "os-release": "NAME=\"SpaceOS\"\nVERSION=\"9\"\nID=spaceos9\nVERSION_ID=\"9\"\nPRETTY_NAME=\"SpaceOS 9\"\nHOME_URL=\"https://github.com/ViudiraTech/SpaceOS-9\"\n",
+        "lsb-release": "DISTRIB_ID=SpaceOS\nDISTRIB_RELEASE=9\nDISTRIB_DESCRIPTION=\"SpaceOS 9\"\n",
     }
     for name, content in extra_files.items():
         path = staging / name
