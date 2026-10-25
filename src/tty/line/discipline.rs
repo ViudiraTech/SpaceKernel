@@ -60,6 +60,10 @@ impl LineDiscipline {
         self.termios
     }
 
+    pub fn readable(&self) -> bool {
+        self.ready_len != 0 || self.eof_pending
+    }
+
     pub fn set_termios(&mut self, settings: Termios) -> Result<(), ReadError> {
         if self.termios.canonical && !settings.canonical && !self.commit() {
             return Err(ReadError::BufferFull);

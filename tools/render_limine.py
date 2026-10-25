@@ -40,9 +40,11 @@ def main() -> None:
     if kaslr not in ("yes", "no"):
         raise SystemExit("KASLR must be yes or no")
     template = pathlib.Path(source).read_text()
+    modules = sys.argv[5] if len(sys.argv) > 5 else ""
     output = template.replace("@KASLR@", kaslr)
     output = output.replace("@KERNEL_CMDLINE@", configured_cmdline())
     output = output.replace("@DTB_LINE@", dtb_line)
+    output = output.replace("@MODULES@", modules)
     pathlib.Path(destination).write_text(output)
 
 

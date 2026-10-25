@@ -596,9 +596,18 @@ impl Gpu {
             crate::tty::install_gpu_console(region.base() as usize, width, height, backing.clone())
                 .map_err(|_| VfsError::NotSupported)?;
         }
-        self.call(0x105, 0, &[0, 0, width, height, 0, 0, resource.id, 0], 24)?;
-        self.call(0x104, 0, &[0, 0, width, height, resource.id, 0], 24)?;
-        self.call(0x103, 0, &[0, 0, width, height, 0, resource.id], 24)?;
+        let transfer = self.call(0x105, 0, &[0, 0, width, height, 0, 0, resource.id, 0], 24)?;
+        let flush = self.call(0x104, 0, &[0, 0, width, height, resource.id, 0], 24)?;
+        let scanout = self.call(0x103, 0, &[0, 0, width, height, 0, resource.id], 24)?;
+        crate::verbose::log(format_args!(
+            "GPU console: transfer={:#x} flush={:#x} set_scanout={:#x} resource={} {}x{}",
+            u32_at(&transfer, 0).unwrap_or(0),
+            u32_at(&flush, 0).unwrap_or(0),
+            u32_at(&scanout, 0).unwrap_or(0),
+            resource.id,
+            width,
+            height
+        ));
         kms::install_console(self, &resource);
         *self.console.lock() = Some(backing);
         self.console_visible.store(true, Ordering::Release);
@@ -967,7 +976,7 @@ impl Session {
                 for (length, pointer, text) in [
                     (16, 24, "virtio_gpu"),
                     (32, 40, "20261024"),
-                    (48, 56, "SpaceOS-9 VirtIO GPU"),
+                    (48, 56, "SpaceKernel VirtIO GPU"),
                 ] {
                     let capacity = arg.r64(length)? as usize;
                     let dst = arg.r64(pointer)?;
@@ -1542,7 +1551,22 @@ pub fn init() {
             gpu.capsets.lock().push(Capset { id, version, size });
         }
         kms::discover(&gpu)?;
-        gpu.install_console()?;
+        // The firmware framebuffer usually belongs to the primary display
+        // device.  Taking the console over to the virtio-gpu scanout would
+        // leave that visible display frozen, so only do it when there is no
+        // firmware framebuffer or the user explicitly requests it.
+        let gpu_console_requested = crate::boot::cmdline()
+            .split_ascii_whitespace()
+            .any(|word| word == "fbcon=gpu");
+        // The DRM self-test expects the console scanout to participate in
+        // request accounting and IRQ delivery, so keep the historical
+        // behaviour for self-test builds.
+        if cfg!(feature = "boot-self-test")
+            || crate::boot::framebuffer().is_none()
+            || gpu_console_requested
+        {
+            gpu.install_console()?;
+        }
         for (name, node, render) in [
             ("card0", "dri/card0", false),
             ("renderD128", "dri/renderD128", true),

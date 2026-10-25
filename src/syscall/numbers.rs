@@ -433,6 +433,191 @@ pub const SYS_FCHMODAT: u64 = 268;
 pub const SYS_FCHMODAT: u64 = 53;
 
 #[cfg(target_arch = "x86_64")]
+pub const SYS_SENDFILE: u64 = 40;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SENDFILE: u64 = 71;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_GETUID: u64 = 102;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_GETUID: u64 = 174;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_GETGID: u64 = 104;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_GETGID: u64 = 176;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_GETEUID: u64 = 107;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_GETEUID: u64 = 175;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_GETEGID: u64 = 108;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_GETEGID: u64 = 177;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SETUID: u64 = 105;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SETUID: u64 = 146;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SETGID: u64 = 106;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SETGID: u64 = 144;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SETREUID: u64 = 113;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SETREUID: u64 = 145;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SETREGID: u64 = 114;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SETREGID: u64 = 143;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_GETGROUPS: u64 = 115;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_GETGROUPS: u64 = 158;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SETGROUPS: u64 = 116;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SETGROUPS: u64 = 159;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SETRESUID: u64 = 117;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SETRESUID: u64 = 147;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_GETRESUID: u64 = 118;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_GETRESUID: u64 = 148;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SETRESGID: u64 = 119;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SETRESGID: u64 = 149;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_GETRESGID: u64 = 120;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_GETRESGID: u64 = 150;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SETFSUID: u64 = 122;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SETFSUID: u64 = 151;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SETFSGID: u64 = 123;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SETFSGID: u64 = 152;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_UNAME: u64 = 63;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_UNAME: u64 = 160;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SETHOSTNAME: u64 = 170;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SETHOSTNAME: u64 = 161;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SETDOMAINNAME: u64 = 171;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SETDOMAINNAME: u64 = 162;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_UMASK: u64 = 95;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_UMASK: u64 = 166;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_GETRLIMIT: u64 = 97;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_GETRLIMIT: u64 = 163;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SETRLIMIT: u64 = 160;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SETRLIMIT: u64 = 164;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_PRLIMIT64: u64 = 302;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_PRLIMIT64: u64 = 261;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SCHED_GETAFFINITY: u64 = 204;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SCHED_GETAFFINITY: u64 = 123;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SCHED_SETAFFINITY: u64 = 203;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SCHED_SETAFFINITY: u64 = 122;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_GETTIMEOFDAY: u64 = 96;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_GETTIMEOFDAY: u64 = 169;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_CLOCK_GETRES: u64 = 229;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_CLOCK_GETRES: u64 = 114;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_CLOCK_NANOSLEEP: u64 = 115;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_GETRUSAGE: u64 = 98;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_GETRUSAGE: u64 = 165;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SYSINFO: u64 = 99;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SYSINFO: u64 = 179;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_TIMES: u64 = 100;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_TIMES: u64 = 153;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_MADVISE: u64 = 28;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_MADVISE: u64 = 233;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_STATX: u64 = 332;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_STATX: u64 = 291;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_PRCTL: u64 = 157;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_PRCTL: u64 = 167;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_SET_ROBUST_LIST: u64 = 273;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_SET_ROBUST_LIST: u64 = 99;
+
+#[cfg(target_arch = "x86_64")]
+pub const SYS_GET_ROBUST_LIST: u64 = 274;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_GET_ROBUST_LIST: u64 = 100;
+
+#[cfg(target_arch = "x86_64")]
 pub const SYS_FCHOWN: u64 = 93;
 #[cfg(not(target_arch = "x86_64"))]
 pub const SYS_FCHOWN: u64 = 55;

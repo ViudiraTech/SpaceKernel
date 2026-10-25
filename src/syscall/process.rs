@@ -56,9 +56,10 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
             loaded.initial_pc,
             sp,
             loaded.tls_tp,
+            path,
         ))
     })();
-    let (space, pc, sp, tls_tp) = match prepared {
+    let (space, pc, sp, tls_tp, path) = match prepared {
         Ok(p) => p,
         Err(e) => return e.to_errno(),
     };
@@ -66,6 +67,7 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
         Some(t) => t,
         None => return -abi::ESRCH,
     };
+    task.set_comm_from_path(&path);
     let old = task.address_space();
     // No fallible operation remains after descriptor/image publication.
     if let Err(error) = crate::signal::prepare_exec(&task) {
@@ -521,6 +523,10 @@ pub fn clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
         sid: parent_stats.sid,
         exit_signal,
         clear_child_tid: cleared_tid,
+        creds: parent.credentials(),
+        groups: parent.groups(),
+        comm: parent.comm(),
+        no_new_privs: parent.no_new_privs(),
         fd_table: files,
         files_shared,
         fs,

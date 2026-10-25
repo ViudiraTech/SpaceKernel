@@ -204,8 +204,8 @@ pub fn run() -> &'static str {
         UserAddressSpace::deactivate();
     }
     drop(scratch);
-    crate::self_test::verbose_log(format_args!("VirtIO GPU resource self-test passed"));
-    crate::self_test::verbose_log(format_args!(
+    crate::verbose::log(format_args!("VirtIO GPU resource self-test passed"));
+    crate::verbose::log(format_args!(
         "DRM ioctl/GEM/PRIME/syncobj/IRQ self-test passed"
     ));
     if verified_venus && verified_virgl {
@@ -325,7 +325,7 @@ fn virgl(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<SpinLock<UserAddress
         "VirGL clear readback did not produce red"
     );
     space.lock().unmap(0x50000, 16384).unwrap();
-    crate::self_test::verbose_log(format_args!(
+    crate::verbose::log(format_args!(
         "VirGL host-rendered clear/readback self-test passed"
     ));
 }
@@ -470,7 +470,7 @@ fn venus(gpu: &Arc<Gpu>, space: &Arc<SpinLock<UserAddressSpace>>) {
     let mut ring_ev = [0u8; 8];
     assert_eq!(file.read_at(0, &mut ring_ev).unwrap(), 8);
     assert_eq!(u32_at(&ring_ev, 0).unwrap(), 0x90000000);
-    crate::self_test::verbose_log(format_args!(
+    crate::verbose::log(format_args!(
         "Venus capset/context/blob/ring-0 fence kernel self-test passed"
     ));
 }
@@ -608,7 +608,7 @@ fn modeset(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<SpinLock<UserAddre
     put32(&mut cursor_move, 8, 32);
     put32(&mut cursor_move, 12, 32);
     call(file, 0xa3, &mut cursor_move, space).unwrap();
-    crate::self_test::verbose_log(format_args!(
+    crate::verbose::log(format_args!(
         "KMS atomic TEST_ONLY/commit/event/out-fence self-test passed"
     ));
 }

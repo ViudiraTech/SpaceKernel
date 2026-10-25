@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 macro_rules! sched_log {
     ($($arg:tt)*) => {
-        $crate::self_test::verbose_log(format_args!($($arg)*))
+        $crate::verbose::log(format_args!($($arg)*))
     };
 }
 

@@ -172,6 +172,14 @@ pub fn start_cpu(index: usize, entry: limine::mp::MpGotoFunction) {
     MP.response().expect("MP required").cpus()[index].bootstrap(entry, index as u64);
 }
 
+pub fn init_path() -> Option<alloc::string::String> {
+    cmdline()
+        .split_ascii_whitespace()
+        .find_map(|word| word.strip_prefix("init="))
+        .filter(|path| !path.is_empty())
+        .map(alloc::string::String::from)
+}
+
 pub fn modules() -> &'static [&'static limine::file::File] {
     if let Some(resp) = MODULES.response() {
         resp.modules()

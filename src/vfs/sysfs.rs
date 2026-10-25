@@ -11,6 +11,9 @@ impl FileSystem for SysFs {
     fn fs_type(&self) -> &'static str {
         "sysfs"
     }
+    fn cache_mode(&self) -> super::CacheMode {
+        super::CacheMode::Revalidate
+    }
     fn root_inode(&self) -> Arc<dyn Inode> {
         crate::device::sys_root()
     }

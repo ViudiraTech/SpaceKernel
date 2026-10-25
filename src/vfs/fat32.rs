@@ -562,9 +562,20 @@ pub struct Fat32Inode {
     kind: InodeKind,
     attr: u8,
     meta: SpinLock<Fat32NodeMeta>,
+    chain: SpinLock<Option<Arc<Vec<u32>>>>,
 }
 
 impl Fat32Inode {
+    fn cached_chain(&self, first_cluster: u32) -> Result<Arc<Vec<u32>>, VfsError> {
+        let mut cache = self.chain.lock();
+        if let Some(chain) = cache.as_ref() {
+            return Ok(chain.clone());
+        }
+        let chain = Arc::new(self.vol.cluster_chain(first_cluster)?);
+        *cache = Some(chain.clone());
+        Ok(chain)
+    }
+
     fn from_record(vol: Arc<Fat32Volume>, rec: &ParsedDirRecord) -> Arc<Self> {
         let kind = if (rec.attr & ATTR_DIRECTORY) != 0 {
             InodeKind::Directory
@@ -583,6 +594,7 @@ impl Fat32Inode {
                 dir_cluster: rec.dir_cluster,
                 dir_offset: rec.dir_offset,
             }),
+            chain: SpinLock::new(None),
         })
     }
 }
@@ -593,9 +605,9 @@ impl Inode for Fat32Inode {
         let mode = if self.kind == InodeKind::Directory {
             0o755
         } else if (self.attr & ATTR_READ_ONLY) != 0 {
-            0o444
+            0o555
         } else {
-            0o644
+            0o755
         };
         let size = if self.kind == InodeKind::Directory {
             self.vol.bytes_per_cluster as u64
@@ -609,14 +621,16 @@ impl Inode for Fat32Inode {
         if self.kind == InodeKind::Directory {
             return Err(VfsError::IsADirectory);
         }
-        let m = self.meta.lock();
-        let file_size = u64::from(m.size);
-        if offset >= file_size || buf.is_empty() || m.first_cluster < 2 {
+        let (file_size, first_cluster) = {
+            let m = self.meta.lock();
+            (u64::from(m.size), m.first_cluster)
+        };
+        if offset >= file_size || buf.is_empty() || first_cluster < 2 {
             return Ok(0);
         }
 
         let to_read = (file_size - offset).min(buf.len() as u64) as usize;
-        let chain = self.vol.cluster_chain(m.first_cluster)?;
+        let chain = self.cached_chain(first_cluster)?;
         let bpc = self.vol.bytes_per_cluster;
         let mut cluster_buf = vec![0u8; bpc];
         let mut done = 0usize;
@@ -688,6 +702,7 @@ impl Inode for Fat32Inode {
             self.vol
                 .update_dir_entry_meta(m.dir_cluster, m.dir_offset, m.first_cluster, m.size)?;
         }
+        *self.chain.lock() = None;
         Ok(done)
     }
 
@@ -705,6 +720,7 @@ impl Inode for Fat32Inode {
             self.vol
                 .update_dir_entry_meta(m.dir_cluster, m.dir_offset, m.first_cluster, m.size)?;
         }
+        *self.chain.lock() = None;
         Ok(())
     }
 
@@ -941,6 +957,7 @@ impl Fat32Fs {
                 dir_cluster: 0,
                 dir_offset: 0,
             }),
+            chain: SpinLock::new(None),
         });
 
         Ok(Arc::new(Self { vol, root }))

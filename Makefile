@@ -88,8 +88,12 @@ LIMINE_URL ?= https://github.com/Limine-Bootloader/Limine/releases/download/$(LI
 DOWNLOAD_JOBS ?= 8
 QEMU_FLAGS := -machine $(MACHINE) $(QEMU_CPU) -m $(MEMORY_MIB) -smp $(CPUS) -serial stdio -monitor none -no-reboot
 QEMU_RESULT ?=
+WITH_ROOTFS ?= 0
+ROOTFS_SELFTEST ?= 0
+ROOTFS_IMG := build/rootfs/fat32.img
+ROOTFS_MODULE := $(if $(filter 1,$(WITH_ROOTFS)),module_path: boot():/rootfs.img,)
 
-.PHONY: all kernel iso run debug test test-single test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
+.PHONY: all kernel iso rootfs-image busybox run debug test test-single test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
 all: iso
 
 defconfig:
@@ -107,6 +111,17 @@ deps:
 	cargo fetch --target $(TARGET)
 
 kernel: deps
+	@mkdir -p build
+	@n=$$(cat build/kernel-build 2>/dev/null || echo 0); \
+	n=$$((n + 1)); \
+	echo $$n > build/kernel-build; \
+	touch src/spk.rs; \
+	SPK_BUILD_NUMBER="$$n" \
+	SPK_BUILD_TIME="$$(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
+	SPK_BUILD_COMMIT="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+	SPK_BUILD_USER="$$(id -un 2>/dev/null || echo unknown)" \
+	SPK_BUILD_HOST="$$(hostname 2>/dev/null || echo unknown)" \
+	SPK_BUILD_COMPILER="$$(rustc --version 2>/dev/null || echo rustc)" \
 	cargo build --target $(TARGET) $(CARGO_PROFILE) $(CARGO_FEATURES)
 
 $(LIMINE_ARCHIVE):
@@ -122,14 +137,21 @@ $(LIMINE_DIR)/.extracted: $(LIMINE_ARCHIVE)
 limine: $(LIMINE_DIR)/.extracted
 	$(MAKE) -C $(LIMINE_DIR)
 
-iso: kernel limine
+rootfs-image:
+	WITH_ROOTFS=$(WITH_ROOTFS) ROOTFS_SELFTEST=$(ROOTFS_SELFTEST) python3 tools/build_rootfs.py
+
+busybox:
+	tools/build_busybox.sh
+
+iso: kernel limine $(if $(filter 1,$(WITH_ROOTFS)),rootfs-image)
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/EFI/BOOT $(ISO_ROOT)/boot/limine
 	cp $(KERNEL) $(ISO_ROOT)/kernel.elf
 	cp $(LIMINE_DIR)/$(EFI) $(ISO_ROOT)/EFI/BOOT/$(EFI)
+	$(if $(filter 1,$(WITH_ROOTFS)),cp $(ROOTFS_IMG) $(ISO_ROOT)/rootfs.img,)
 	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
 	$(DTB_CMD)
-	python3 tools/render_limine.py boot/limine.conf.in $(ISO_ROOT)/limine.conf $(if $(filter y,$(CONFIG_KASLR)),yes,no) '$(DTB_LINE)'
+	python3 tools/render_limine.py boot/limine.conf.in $(ISO_ROOT)/limine.conf $(if $(filter y,$(CONFIG_KASLR)),yes,no) '$(DTB_LINE)' '$(ROOTFS_MODULE)'
 	xorriso -as mkisofs -R -r -J $(if $(filter x86_64,$(ARCH)),-b boot/limine/limine-bios-cd.bin -no-emul-boot -boot-load-size 4 -boot-info-table,) -hfsplus -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin -efi-boot-part --efi-boot-image --protective-msdos-label -o $(ISO) $(ISO_ROOT)
 	$(if $(filter x86_64,$(ARCH)),$(LIMINE_DIR)/limine bios-install $(ISO),true)
 	@printf 'ISO ready: %s\n' '$(ISO)'

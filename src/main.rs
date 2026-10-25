@@ -36,11 +36,13 @@ pub mod self_test;
 pub mod shell;
 pub mod signal;
 mod smp;
+pub mod spk;
 mod sync;
 pub mod syscall;
 mod time;
 pub mod tty;
 pub mod user;
+pub mod verbose;
 pub mod vfs;
 
 use core::panic::PanicInfo;
@@ -65,6 +67,7 @@ pub extern "C" fn kmain() -> ! {
     time::init();
     tty::init();
     kinfo!("SpaceKernel: Limine entry");
+    kinfo!("{}", spk::banner());
     let cpu = cpuid::info().expect("CPU discovery required");
     kinfo!(
         "CPU: {:?} {} {} id={:#x} PA={:?} VA={:?}",
@@ -173,7 +176,16 @@ pub extern "C" fn kmain() -> ! {
     sched::init(boot::cpu_count());
     smp::start();
     kinfo!("Scheduler: per-CPU EEVDF ready");
-    shell::start();
+    match boot::init_path() {
+        Some(path) => match vfs::read_file(&path) {
+            Ok(image) => match user::spawn_init(&image, &path) {
+                Ok(pid) => kinfo!("init started: {} (pid {})", path, pid),
+                Err(error) => kwarn!("init {} could not start: {}", path, error),
+            },
+            Err(_) => kwarn!("init image not found: {}", path),
+        },
+        None => shell::start(),
+    }
     gpu::start();
     #[cfg(feature = "boot-self-test")]
     self_test::spawn_late();

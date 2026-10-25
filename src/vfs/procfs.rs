@@ -31,8 +31,12 @@ const PROCESS: &[&str] = &[
     "status", "stat", "statm", "cmdline", "environ", "maps", "auxv", "cwd", "exe", "root", "fd",
     "fdinfo", "task", "mounts",
 ];
+const SYS_FS: &[&str] = &["dentry-state", "inode-nr", "inode-state"];
 enum View {
     Root,
+    Sys,
+    SysFs,
+    SysFsFile(String),
     Process(TaskWeak),
     Tasks(TaskWeak),
     Fds(TaskWeak, bool),
@@ -60,9 +64,21 @@ impl Node {
                 let space = task.address_space();
                 let space = space.as_ref().map(|s| s.lock());
                 let image = space.as_ref().and_then(|s| s.image.as_ref());
-                let taskname = image
-                    .map(|i| i.executable.rsplit('/').next().unwrap_or("process"))
-                    .unwrap_or("kthread");
+                let comm_len = stats
+                    .comm
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .unwrap_or(stats.comm.len());
+                let comm = String::from_utf8_lossy(&stats.comm[..comm_len]).into_owned();
+                let taskname = if comm.is_empty() {
+                    String::from(
+                        image
+                            .map(|i| i.executable.rsplit('/').next().unwrap_or("process"))
+                            .unwrap_or("kthread"),
+                    )
+                } else {
+                    comm
+                };
                 let state = match stats.state {
                     TaskState::Running | TaskState::Ready => "R",
                     TaskState::Blocked => "S",
@@ -180,6 +196,7 @@ impl Node {
                 Ok(text.into_bytes())
             }
             View::File(None, name) => Ok(system(name)?.into_bytes()),
+            View::SysFsFile(name) => Ok(sys_fs(name)?.into_bytes()),
             _ => Err(VfsError::IsADirectory),
         }
     }
@@ -196,10 +213,7 @@ fn mounts() -> String {
 }
 fn system(name: &str) -> Result<String, VfsError> {
     Ok(match name {
-        "version" => format!(
-            "SpaceOS-9 version 0.2.0 ({}) Rust SMP PREEMPT_EEVDF\n",
-            core::env!("CARGO_PKG_VERSION")
-        ),
+        "version" => crate::spk::version_line(),
         "cmdline" => format!("{}\n", boot::cmdline()),
         "mounts" => mounts(),
         "filesystems" => String::from(
@@ -331,10 +345,28 @@ fn system(name: &str) -> Result<String, VfsError> {
         _ => return Err(VfsError::NotFound),
     })
 }
+fn sys_fs(name: &str) -> Result<String, VfsError> {
+    let stats = super::dcache::stats();
+    Ok(match name {
+        // Linux /proc/sys/fs/dentry-state:
+        // nr_dentry nr_unused age_limit want_pages nr_negative
+        "dentry-state" => format!(
+            "{} {} 0 0 {}\n",
+            stats.dentries, stats.unused, stats.negative
+        ),
+        // Linux /proc/sys/fs/inode-nr: nr_inodes nr_free_inodes
+        "inode-nr" => format!("{} 0\n", stats.inodes),
+        // Linux /proc/sys/fs/inode-state:
+        // nr_inodes nr_free_inodes preshrink nr_unused
+        "inode-state" => format!("{} 0 0 0\n", stats.inodes),
+        _ => return Err(VfsError::NotFound),
+    })
+}
+
 impl Inode for Node {
     fn metadata(&self) -> Result<Stat, VfsError> {
         let kind = match &self.view {
-            View::Root => InodeKind::Directory,
+            View::Root | View::Sys | View::SysFs => InodeKind::Directory,
             View::Process(w) | View::Tasks(w) | View::Fds(w, _) => {
                 Self::task(w)?;
                 InodeKind::Directory
@@ -351,6 +383,7 @@ impl Inode for Node {
                 }
                 InodeKind::Regular
             }
+            View::SysFsFile(_) => InodeKind::Regular,
         };
         Ok(Stat::simple(
             self.id,
@@ -366,7 +399,7 @@ impl Inode for Node {
         ))
     }
     fn open(&self, _: u32) -> Result<Option<Arc<dyn Inode>>, VfsError> {
-        if matches!(self.view, View::File(..)) {
+        if matches!(self.view, View::File(..) | View::SysFsFile(_)) {
             Ok(Some(Snapshot::new(self.id, self.bytes()?)))
         } else {
             Ok(None)
@@ -425,6 +458,9 @@ impl Inode for Node {
                         if name == "self" { 20 } else { 21 },
                     ));
                 }
+                if name == "sys" {
+                    return Ok(Self::make(View::Sys, 30));
+                }
                 if let Some(index) = SYSTEM.iter().position(|n| *n == name) {
                     return Ok(Self::make(
                         View::File(None, String::from(name)),
@@ -436,6 +472,23 @@ impl Inode for Node {
                 Ok(Self::make(
                     View::Process(task.downgrade()),
                     0x10000 + tid * 64,
+                ))
+            }
+            View::Sys => {
+                if name == "fs" {
+                    Ok(Self::make(View::SysFs, 31))
+                } else {
+                    Err(VfsError::NotFound)
+                }
+            }
+            View::SysFs => {
+                let index = SYS_FS
+                    .iter()
+                    .position(|entry| *entry == name)
+                    .ok_or(VfsError::NotFound)?;
+                Ok(Self::make(
+                    View::SysFsFile(String::from(name)),
+                    300 + index as u64,
                 ))
             }
             View::Process(w) => {
@@ -483,10 +536,12 @@ impl Inode for Node {
             View::Root => SYSTEM
                 .iter()
                 .copied()
-                .chain(["self", "thread-self"])
+                .chain(["self", "thread-self", "sys"])
                 .map(String::from)
                 .chain(sched::task_list().into_iter().map(|t| format!("{}", t.tid)))
                 .collect(),
+            View::Sys => alloc::vec![String::from("fs")],
+            View::SysFs => SYS_FS.iter().map(|name| String::from(*name)).collect(),
             View::Process(w) => {
                 Self::task(w)?;
                 PROCESS.iter().map(|n| String::from(*n)).collect()
@@ -539,6 +594,9 @@ impl ProcFs {
 impl FileSystem for ProcFs {
     fn fs_type(&self) -> &'static str {
         "proc"
+    }
+    fn cache_mode(&self) -> super::CacheMode {
+        super::CacheMode::Revalidate
     }
     fn root_inode(&self) -> Arc<dyn Inode> {
         Node::make(View::Root, 1)

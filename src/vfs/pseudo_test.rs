@@ -126,7 +126,7 @@ pub fn devices() {
     let a = devtmpfs::DevTmpFs.root_inode();
     let b = devtmpfs::DevTmpFs.root_inode();
     assert_eq!(a.metadata().unwrap().ino, b.metadata().unwrap().ino);
-    crate::self_test::verbose_log(format_args!(
+    crate::verbose::log(format_args!(
         "devtmpfs/sysfs registry/snapshot/removal self-test passed"
     ));
 }
@@ -157,7 +157,7 @@ pub fn processes() {
     if let Some((inode, _)) = proc_dir {
         assert_eq!(inode.readdir().err(), Some(VfsError::NotFound));
     }
-    crate::self_test::verbose_log(format_args!(
+    crate::verbose::log(format_args!(
         "procfs identity/fd/task/symlink self-test passed"
     ));
 }

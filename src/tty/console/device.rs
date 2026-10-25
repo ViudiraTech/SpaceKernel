@@ -163,3 +163,18 @@ pub fn poll_serial() {
         receive(TtyDevice::Serial0, byte);
     }
 }
+
+pub fn readable(device: TtyDevice) -> bool {
+    let state = CONSOLE.lock();
+    match device {
+        TtyDevice::Serial0 => state.serial_line.readable(),
+        TtyDevice::Foreground => {
+            let active = state.active_vt;
+            state.virtual_lines[active - 1].readable()
+        }
+        TtyDevice::Virtual(number) if (1..=VT_COUNT).contains(&number) => {
+            state.virtual_lines[number - 1].readable()
+        }
+        _ => false,
+    }
+}

@@ -11,7 +11,7 @@
 //! User process creation and execution.
 
 use crate::{
-    arch, kinfo, sched,
+    arch, sched,
     sync::SpinLock,
     user::{address_space::UserAddressSpace, elf, stack},
 };
@@ -61,6 +61,10 @@ pub fn spawn_init(data: &[u8], name: &str) -> Result<u64, &'static str> {
         sid: 1,
         exit_signal: crate::signal::SIGCHLD,
         clear_child_tid: 0,
+        creds: sched::Credentials::default(),
+        groups: alloc::vec::Vec::new(),
+        comm: sched::comm_from_path(name),
+        no_new_privs: false,
         fd_table: Arc::new(SpinLock::new(
             crate::vfs::FileDescriptorTable::new_with_stdio(),
         )),
@@ -72,11 +76,10 @@ pub fn spawn_init(data: &[u8], name: &str) -> Result<u64, &'static str> {
     };
     sched::spawn_user(
         move || {
-            kinfo!(
+            crate::verbose::log(format_args!(
                 "Entering user mode: entry={:#x} sp={:#x}",
-                entry_va,
-                user_sp
-            );
+                entry_va, user_sp
+            ));
             // SAFETY: the scheduler installed and activated this address space.
             unsafe {
                 install_tls(tls_tp);
@@ -110,6 +113,10 @@ pub fn spawn_user_elf(data: &[u8], name: &str) -> Result<u64, &'static str> {
         sid: pid,
         exit_signal: crate::signal::SIGCHLD,
         clear_child_tid: 0,
+        creds: sched::Credentials::default(),
+        groups: alloc::vec::Vec::new(),
+        comm: sched::comm_from_path(name),
+        no_new_privs: false,
         fd_table: Arc::new(SpinLock::new(
             crate::vfs::FileDescriptorTable::new_with_stdio(),
         )),
@@ -122,11 +129,10 @@ pub fn spawn_user_elf(data: &[u8], name: &str) -> Result<u64, &'static str> {
 
     let task = sched::spawn_user(
         move || {
-            kinfo!(
+            crate::verbose::log(format_args!(
                 "Entering user mode: entry={:#x} sp={:#x}",
-                entry_va,
-                user_sp
-            );
+                entry_va, user_sp
+            ));
             // SAFETY: the address space is installed and activated by the
             // scheduler before this closure runs.
             unsafe {

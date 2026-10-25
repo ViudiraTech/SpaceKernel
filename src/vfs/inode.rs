@@ -275,11 +275,24 @@ pub trait Inode: Send + Sync + core::any::Any {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheMode {
+    /// Namespace entries are stable between explicit VFS create/unlink calls
+    /// and may be retained in the dentry and inode caches.
+    Stable,
+    /// Entries are generated from live kernel state and must be revalidated
+    /// with the filesystem on every path component (procfs, sysfs, devtmpfs).
+    Revalidate,
+}
+
 pub trait FileSystem: Send + Sync {
     fn fs_type(&self) -> &'static str;
     fn root_inode(&self) -> Arc<dyn Inode>;
     fn statfs(&self) -> Result<StatFs, VfsError>;
     fn sync(&self) -> Result<(), VfsError> {
         Ok(())
+    }
+    fn cache_mode(&self) -> CacheMode {
+        CacheMode::Stable
     }
 }

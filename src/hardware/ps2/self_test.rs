@@ -33,7 +33,7 @@ pub fn run() -> bool {
     test_mouse_sync_recovery();
     test_mouse_bounds_clamping();
 
-    crate::self_test::verbose_log(format_args!("ps2: all subsystem self-tests PASSED"));
+    crate::verbose::log(format_args!("ps2: all subsystem self-tests PASSED"));
     true
 }
 

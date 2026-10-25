@@ -10,17 +10,7 @@
 
 use alloc::{boxed::Box, vec::Vec};
 
-pub fn verbose() -> bool {
-    crate::boot::cmdline()
-        .split_whitespace()
-        .any(|arg| arg == "verbose" || arg == "selftest=verbose")
-}
-
-pub fn verbose_log(args: core::fmt::Arguments) {
-    if verbose() {
-        crate::printk::record(crate::printk::Level::Info, args);
-    }
-}
+use crate::verbose::log as verbose_log;
 
 pub fn run_early() {
     run();
@@ -46,6 +36,7 @@ pub fn spawn_late() {
             crate::user::process_signal_self_test()
                 .expect("process/signal self-test failed");
             crate::vfs::pseudo_test::processes();
+            crate::vfs::dcache::self_test();
             crate::user::self_test::syscalls();
             crate::user::self_test::ipc_advanced();
             let gpu_status = crate::gpu::self_test::run();
@@ -64,7 +55,7 @@ pub fn spawn_late() {
                 "unknown"
             };
             crate::kinfo!(
-                "SELFTEST_OK arch={} cpu_fpu=ok mm_irq_fdt=ok block=ok vfs_abi=ok dev_sys_proc=ok user_elf=ok sched=ok rng={} gpu={}",
+                "SELFTEST_OK arch={} cpu_fpu=ok mm_irq_fdt=ok block=ok vfs_abi=ok vfs_cache=ok dev_sys_proc=ok user_elf=ok sched=ok rng={} gpu={}",
                 arch_name,
                 rng_status,
                 gpu_status,

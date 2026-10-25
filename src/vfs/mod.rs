@@ -13,6 +13,7 @@
 //! ProcFS (`/proc`), and FAT32 (`/mnt`).
 
 pub mod abi;
+pub mod dcache;
 pub mod devfs;
 pub mod devtmpfs;
 pub mod fat32;
@@ -24,6 +25,7 @@ pub mod procfs;
 #[cfg(feature = "boot-self-test")]
 pub mod pseudo_test;
 pub mod ramfs;
+pub mod rootfs;
 pub mod sysfs;
 pub mod tree;
 
@@ -31,13 +33,14 @@ pub use fd::{
     FdEntry, FileDescriptorTable, OpenFile, create_pipe_pair, create_pipe_pair_with_flags,
 };
 pub use fifo::FifoInode;
-pub use inode::{DirEntry, FileSystem, Inode, InodeKind, Stat, StatFs, VfsError};
+pub use inode::{CacheMode, DirEntry, FileSystem, Inode, InodeKind, Stat, StatFs, VfsError};
 pub use path::{normalize_path, split_parent_name};
 
 use crate::{block, kinfo, sched, sync::SpinLock};
 use alloc::{format, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 
-const MAX_SYMLINK_DEPTH: usize = 8;
+const MAX_SYMLINK_DEPTH: usize = 40;
 
 /// `struct fs_struct`: per-process working directory, root and umask.  Threads
 /// created without CLONE_FS get a copy, with it share this object.
@@ -104,6 +107,7 @@ pub fn current_umask() -> u32 {
 
 #[derive(Clone)]
 pub struct MountEntry {
+    pub id: u64,
     pub device: String,
     pub mount_point: String,
     pub fs_type: &'static str,
@@ -111,6 +115,7 @@ pub struct MountEntry {
 }
 
 static MOUNTS: SpinLock<Vec<MountEntry>> = SpinLock::new(Vec::new());
+static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 static KERNEL_FD_TABLE: SpinLock<Option<Arc<SpinLock<FileDescriptorTable>>>> = SpinLock::new(None);
 
 /// Return the current task's file descriptor table, or the kernel fallback table.
@@ -137,12 +142,14 @@ pub fn mount_fs(device: &str, mount_point: &str, fs: Arc<dyn FileSystem>) -> Res
     let mp = normalize_path("/", mount_point);
     let mut mounts = MOUNTS.lock();
     if let Some(existing) = mounts.iter_mut().find(|m| m.mount_point == mp) {
+        dcache::invalidate_mount(existing.id);
         existing.device = String::from(device);
         existing.fs_type = fs.fs_type();
         existing.fs = fs;
         return Ok(());
     }
     mounts.push(MountEntry {
+        id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed),
         device: String::from(device),
         mount_point: mp,
         fs_type: fs.fs_type(),
@@ -187,6 +194,7 @@ pub fn umount(target: &str) -> Result<(), VfsError> {
         .ok_or(VfsError::InvalidArgument)?;
     let removed = mounts.remove(idx);
     drop(mounts);
+    dcache::invalidate_mount(removed.id);
     removed.fs.sync()
 }
 
@@ -261,7 +269,10 @@ fn lookup_abs_depth(
     }
 
     let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    let mount_id = mount.id;
+    let cacheable = mount.fs.cache_mode() == CacheMode::Stable;
     let mut cur_inode = mount.fs.root_inode();
+    let mut cur_ino = cur_inode.metadata()?.ino;
     let mut cur_path = if mount.mount_point == "/" {
         String::new()
     } else {
@@ -273,17 +284,42 @@ fn lookup_abs_depth(
         cur_path.push('/');
         cur_path.push_str(seg);
 
-        // Check if cur_path is itself a mount point
-        if let Ok((sub_mount, sub_rel)) = find_mount(&cur_path)
-            && sub_rel.is_empty()
-            && sub_mount.mount_point == cur_path
-        {
-            cur_inode = sub_mount.fs.root_inode();
-            continue;
-        }
-
-        let next_inode = cur_inode.lookup(seg)?;
-        let meta = next_inode.metadata()?;
+        let (next_inode, meta) = if cacheable {
+            let key = dcache::DentryKey::new(mount_id, cur_ino, seg);
+            match dcache::lookup(&key) {
+                dcache::Lookup::Positive(inode) => {
+                    let meta = inode.metadata()?;
+                    (inode, meta)
+                }
+                dcache::Lookup::Negative => return Err(VfsError::NotFound),
+                dcache::Lookup::Miss => {
+                    let fresh = match cur_inode.lookup(seg) {
+                        Ok(inode) => inode,
+                        Err(VfsError::NotFound) => {
+                            dcache::insert_negative(key, &cur_path);
+                            return Err(VfsError::NotFound);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let fresh_meta = fresh.metadata()?;
+                    let inode =
+                        if let Some(cached) = dcache::icache_lookup(mount_id, fresh_meta.ino) {
+                            cached
+                        } else {
+                            dcache::icache_insert(mount_id, fresh_meta.ino, &fresh);
+                            fresh
+                        };
+                    dcache::insert_positive(key, inode.clone(), &cur_path);
+                    (inode, fresh_meta)
+                }
+            }
+        } else {
+            // Procfs/sysfs/devtmpfs generate entries from live kernel state;
+            // never serve a stale namespace object from the cache.
+            let fresh = cur_inode.lookup(seg)?;
+            let meta = fresh.metadata()?;
+            (fresh, meta)
+        };
         if meta.kind == InodeKind::Symlink && (!is_last || follow_final_symlink) {
             let target = next_inode.readlink()?;
             let parent_dir = split_parent_name(&cur_path)
@@ -301,6 +337,7 @@ fn lookup_abs_depth(
             return lookup_abs_depth(&resolved, follow_final_symlink, depth + 1);
         }
         cur_inode = next_inode;
+        cur_ino = meta.ino;
     }
 
     Ok((cur_inode, norm))
@@ -339,6 +376,22 @@ pub fn readdir_with_mounts(
     Ok(entries)
 }
 
+/// Publish a newly created inode into the dentry and inode caches.
+fn publish_created(mount: u64, parent_ino: u64, name: &str, inode: &Arc<dyn Inode>, path: &str) {
+    let Ok(meta) = inode.metadata() else {
+        return;
+    };
+    // A directory entry can reuse an inode number after deletion; never let
+    // the previous object win the identity lookup for the new file.
+    dcache::icache_remove(mount, meta.ino);
+    dcache::icache_insert(mount, meta.ino, inode);
+    dcache::insert_positive(
+        dcache::DentryKey::new(mount, parent_ino, name),
+        inode.clone(),
+        path,
+    );
+}
+
 /// Open a file by absolute path and `O_*` flags.
 pub fn open_abs(abs_path: &str, flags: u32, mode: u32) -> Result<Arc<OpenFile>, VfsError> {
     let norm = normalize_path("/", abs_path);
@@ -358,7 +411,10 @@ pub fn open_abs(abs_path: &str, flags: u32, mode: u32) -> Result<Arc<OpenFile>, 
             let (parent_path, filename) =
                 split_parent_name(&norm).ok_or(VfsError::InvalidArgument)?;
             let (parent_inode, _) = lookup_abs(&parent_path, true)?;
+            let parent_meta = parent_inode.metadata()?;
+            let mount_id = find_mount(&parent_path)?.0.id;
             let created = parent_inode.create(&filename, InodeKind::Regular, mode & 0o7777)?;
+            publish_created(mount_id, parent_meta.ino, &filename, &created, &norm);
             (created, norm, true)
         }
         Err(e) => return Err(e),
@@ -396,7 +452,11 @@ pub fn mkdir_abs(abs_path: &str, mode: u32) -> Result<Arc<dyn Inode>, VfsError> 
     }
     let (parent_path, name) = split_parent_name(&norm).ok_or(VfsError::AlreadyExists)?;
     let (parent_inode, _) = lookup_abs(&parent_path, true)?;
-    parent_inode.mkdir(&name, mode & 0o7777)
+    let parent_meta = parent_inode.metadata()?;
+    let mount_id = find_mount(&parent_path)?.0.id;
+    let created = parent_inode.mkdir(&name, mode & 0o7777)?;
+    publish_created(mount_id, parent_meta.ino, &name, &created, &norm);
+    Ok(created)
 }
 
 /// Remove a file or directory at normalized absolute path `abs_path`.
@@ -407,11 +467,25 @@ pub fn unlink_abs(abs_path: &str, remove_dir: bool) -> Result<(), VfsError> {
     }
     let (parent_path, name) = split_parent_name(&norm).ok_or(VfsError::InvalidArgument)?;
     let (parent_inode, _) = lookup_abs(&parent_path, true)?;
+    let parent_meta = parent_inode.metadata()?;
+    let mount_id = find_mount(&parent_path)?.0.id;
+    let target_ino = lookup_abs(&norm, false)
+        .ok()
+        .and_then(|(inode, _)| inode.metadata().ok())
+        .map(|meta| meta.ino);
     if remove_dir {
-        parent_inode.rmdir(&name)
+        parent_inode.rmdir(&name)?;
     } else {
-        parent_inode.unlink(&name)
+        parent_inode.unlink(&name)?;
     }
+    dcache::invalidate(&dcache::DentryKey::new(mount_id, parent_meta.ino, &name));
+    if remove_dir {
+        dcache::invalidate_path_prefix(mount_id, &norm);
+    }
+    if let Some(ino) = target_ino {
+        dcache::icache_remove(mount_id, ino);
+    }
+    Ok(())
 }
 
 /// Create a symbolic link at `link_abs` pointing to `target`.
@@ -422,7 +496,11 @@ pub fn symlink_abs(target: &str, link_abs: &str) -> Result<Arc<dyn Inode>, VfsEr
     }
     let (parent_path, name) = split_parent_name(&norm).ok_or(VfsError::InvalidArgument)?;
     let (parent_inode, _) = lookup_abs(&parent_path, true)?;
-    parent_inode.symlink(&name, target)
+    let parent_meta = parent_inode.metadata()?;
+    let mount_id = find_mount(&parent_path)?.0.id;
+    let created = parent_inode.symlink(&name, target)?;
+    publish_created(mount_id, parent_meta.ino, &name, &created, &norm);
+    Ok(created)
 }
 
 /// Read symbolic link target at `abs_path`.
@@ -449,7 +527,7 @@ pub fn write_file(abs_path: &str, data: &[u8]) -> Result<(), VfsError> {
 pub fn read_file(abs_path: &str) -> Result<Vec<u8>, VfsError> {
     let f = open_abs(abs_path, abi::O_RDONLY, 0)?;
     let mut out = Vec::new();
-    let mut chunk = [0u8; 512];
+    let mut chunk = alloc::vec![0u8; 64 * 1024];
     loop {
         let n = f.read(&mut chunk)?;
         if n == 0 {
@@ -461,7 +539,36 @@ pub fn read_file(abs_path: &str) -> Result<Vec<u8>, VfsError> {
 }
 
 /// Initialize the VFS subsystem, mount `/`, `/dev`, `/proc`, and `/mnt` (FAT32).
+fn init_module_root() {
+    let disk = rootfs::module_disk().expect("rootfs module disappeared");
+    block::register_device(disk);
+    let (dev_id, device) = block::find_device("rootfs").expect("rootfs device not registered");
+    let filesystem = fat32::Fat32Fs::mount(dev_id, device).expect("FAT32 rootfs mount failed");
+    mount_fs("rootfs", "/", filesystem).expect("failed to mount FAT32 rootfs");
+
+    crate::device::init();
+    for directory in ["/dev", "/proc", "/sys", "/tmp", "/run"] {
+        let _ = mkdir_abs(directory, 0o755);
+    }
+    let _ = mount_fs("devtmpfs", "/dev", Arc::new(devtmpfs::DevTmpFs));
+    let _ = mount_fs("sysfs", "/sys", Arc::new(sysfs::SysFs));
+    let _ = mount_fs("proc", "/proc", Arc::new(procfs::ProcFs::new()));
+    let _ = mount_fs("tmpfs", "/tmp", Arc::new(ramfs::RamFs::new()));
+    let _ = mount_fs("tmpfs", "/run", Arc::new(ramfs::RamFs::new()));
+    kinfo!(
+        "VFS: FAT32 rootfs module mounted on / ({} filesystems mounted)",
+        list_mounts().len()
+    );
+}
+
 pub fn init() {
+    // When a FAT32 root module is attached, it becomes `/`; the kernel's
+    // RamFS remains only for /tmp and /run.
+    if rootfs::module_disk().is_some() {
+        init_module_root();
+        return;
+    }
+
     // 1. Mount RamFS on `/`
     let root_fs = Arc::new(ramfs::RamFs::new());
     mount_fs("ramfs", "/", root_fs).expect("VFS: failed to mount rootfs");
@@ -473,10 +580,20 @@ pub fn init() {
     }
 
     // Populate standard /etc configuration files
-    let _ = write_file("/etc/hostname", b"spacekernel\n");
+    let _ = write_file(
+        "/etc/hostname",
+        format!("{}\n", crate::spk::hostname()).as_bytes(),
+    );
     let _ = write_file(
         "/etc/os-release",
-        b"NAME=\"SpaceKernel\"\nVERSION=\"0.2.0\"\nID=spacekernel\nPRETTY_NAME=\"SpaceKernel 0.2.0 (ViudiraTech)\"\n",
+        format!(
+            "NAME=\"{}\"\nVERSION=\"{}\"\nID=spaceos9\nPRETTY_NAME=\"{} {}\"\n",
+            crate::spk::NAME,
+            crate::spk::VERSION,
+            crate::spk::NAME,
+            crate::spk::VERSION
+        )
+        .as_bytes(),
     );
     let _ = write_file(
         "/etc/motd",
@@ -561,7 +678,13 @@ pub fn run_self_test() {
 
     // 3. Test ProcFS (/proc/version, /proc/mounts, /proc/partitions)
     let ver = read_file("/proc/version").expect("read /proc/version failed");
-    assert!(ver.starts_with(b"SpaceOS-9 version"));
+    assert!(ver.starts_with(b"SpaceKernel version "));
+    let release = crate::spk::release();
+    assert!(
+        ver.windows(release.len())
+            .any(|window| window == release.as_bytes()),
+        "/proc/version lacks UTS release"
+    );
     let mounts = read_file("/proc/mounts").expect("read /proc/mounts failed");
     assert!(!mounts.is_empty());
 
@@ -578,7 +701,7 @@ pub fn run_self_test() {
     unlink_abs("/mnt/testdir", true).expect("FAT32 rmdir failed");
     sync_all();
 
-    crate::self_test::verbose_log(format_args!(
+    crate::verbose::log(format_args!(
         "VFS (RamFS/DevFS/ProcFS/FAT32) self-test passed"
     ));
 }

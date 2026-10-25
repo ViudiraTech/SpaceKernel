@@ -37,7 +37,12 @@ use task::Task;
 pub use task::alloc_pid;
 pub use task::find as find_task;
 pub use task::last_tid;
-pub use task::{CpuMask, TaskRef, TaskState, TaskStats, TaskWeak};
+pub use task::{CpuMask, Credentials, TaskRef, TaskState, TaskStats, TaskWeak, comm_from_path};
+
+/// Linux-visible `cpumask_size()`: one bit per possible CPU, rounded to words.
+pub const fn cpu_mask_bytes() -> usize {
+    smp::MAX_CPUS / 8
+}
 pub(crate) use task::{UserTaskSpec, has_children, take_zombie, zombies};
 pub use wait::WaitQueue;
 
@@ -626,8 +631,10 @@ pub(crate) fn finish_switch() {
                         arch::halt();
                     }
                 }
-                // Orphans are adopted by PID 1 once no thread remains.
-                task::reparent_children(stats.tgid, 1);
+                // Orphans are adopted by the nearest child subreaper, or PID 1.
+                task::deliver_pdeathsig(stats.tgid);
+                let reaper = task::nearest_reaper(stats.tgid);
+                task::reparent_children(stats.tgid, reaper);
                 let (code, status) = if stats.exit_code & 0x7f == 0 {
                     (crate::signal::CLD_EXITED, (stats.exit_code >> 8) & 0xff)
                 } else if stats.exit_code & 0x80 != 0 {

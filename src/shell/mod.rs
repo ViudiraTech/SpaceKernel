@@ -535,17 +535,13 @@ fn cmd_dmesg() {
 }
 
 fn cmd_uname() {
-    let arch_name = if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else if cfg!(target_arch = "riscv64") {
-        "riscv64"
-    } else {
-        "unknown"
-    };
     print_tty(&format!(
-        "SpaceKernel 0.2.0 ({arch_name}) SMP EEVDF VFS Linux-ABI #1 2026\n"
+        "{} {} {} {} {}\n",
+        crate::spk::UTS_SYSNAME,
+        crate::spk::hostname(),
+        crate::spk::release(),
+        crate::spk::uts_version(),
+        crate::spk::UTS_MACHINE
     ));
 }
 

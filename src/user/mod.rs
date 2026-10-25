@@ -21,14 +21,14 @@ pub mod test_binaries;
 pub mod uaccess;
 
 pub use address_space::UserAddressSpace;
-pub use process::spawn_user_elf;
+pub use process::{spawn_init, spawn_user_elf};
 
 /// Execute the architecture-specific built-in user ELF test binary and verify
 /// that it exits with code 42 via the Linux ABI.
 pub fn run_self_test() -> Result<(), &'static str> {
-    crate::self_test::verbose_log(format_args!("Starting user mode Linux ABI self-test..."));
+    crate::verbose::log(format_args!("Starting user mode Linux ABI self-test..."));
     let tid = spawn_user_elf(test_binaries::TEST_USER_ELF, "user_test")?;
-    crate::self_test::verbose_log(format_args!("Spawned user test task (tid={})", tid));
+    crate::verbose::log(format_args!("Spawned user test task (tid={})", tid));
 
     // Wait for the user task to finish and check its exit code
     let mut loops = 0;
@@ -40,7 +40,7 @@ pub fn run_self_test() -> Result<(), &'static str> {
         }
     }
     let _ = crate::sched::take_zombie(tid);
-    crate::self_test::verbose_log(format_args!("user self-test passed: exit code 42 verified"));
+    crate::verbose::log(format_args!("user self-test passed: exit code 42 verified"));
     // A minimal executable whose PT_INTERP is a position-independent copy of
     // the real architecture test. The main entry must never be entered.
     let mut interpreter = test_binaries::TEST_USER_ELF.to_vec();
@@ -71,7 +71,7 @@ pub fn run_self_test() -> Result<(), &'static str> {
     for _ in 0..1000 {
         if crate::syscall::last_user_exit_code() == 42 {
             let _ = crate::sched::take_zombie(interpreter_tid);
-            crate::self_test::verbose_log(format_args!(
+            crate::verbose::log(format_args!(
                 "ELF PT_INTERP/PIE user handoff self-test passed"
             ));
             return Ok(());
@@ -96,7 +96,7 @@ pub fn process_signal_self_test() -> Result<(), &'static str> {
     for _ in 0..8000 {
         if crate::syscall::last_user_exit_code() == 43 {
             let _ = crate::sched::take_zombie(pid);
-            crate::self_test::verbose_log(format_args!(
+            crate::verbose::log(format_args!(
                 "thread/signal/process-group user self-test passed"
             ));
             return Ok(());
@@ -113,7 +113,7 @@ pub fn fork_wait_self_test() -> Result<(), &'static str> {
     spawn_user_elf(test_binaries::FORK_TEST_ELF, "fork_wait")?;
     for _ in 0..3000 {
         if crate::syscall::last_user_exit_code() == 42 {
-            crate::self_test::verbose_log(format_args!("fork/wait4/CoW user self-test passed"));
+            crate::verbose::log(format_args!("fork/wait4/CoW user self-test passed"));
             return Ok(());
         }
         crate::sched::sleep_micros(1000);

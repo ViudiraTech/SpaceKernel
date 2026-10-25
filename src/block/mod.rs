@@ -347,5 +347,5 @@ pub fn run_self_test() {
         dev.flush().expect("block self-test restore flush failed");
     }
 
-    crate::self_test::verbose_log(format_args!("block & storage drivers self-test passed"));
+    crate::verbose::log(format_args!("block & storage drivers self-test passed"));
 }

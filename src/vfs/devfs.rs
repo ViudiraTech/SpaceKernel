@@ -141,11 +141,14 @@ impl Inode for DevRootInode {
                 rdev: (1 << 8) | 8,
             })),
             "urandom" => Ok(Arc::new(SpecialCharInode {
-                ino: 13,
+                ino: 14,
                 kind: SpecialCharKind::Urandom,
                 rdev: (1 << 8) | 9,
             })),
-            "console" | "tty" | "tty0" | "ttyS0" => Ok(Arc::new(ConsoleInode)),
+            "console" => Ok(Arc::new(ConsoleInode::with_ino(15))),
+            "tty" => Ok(Arc::new(ConsoleInode::with_ino(16))),
+            "tty0" => Ok(Arc::new(ConsoleInode::with_ino(17))),
+            "ttyS0" => Ok(Arc::new(ConsoleInode::with_ino(18))),
             _ => {
                 if let Some((dev_id, dev)) = block::find_device(name) {
                     Ok(Arc::new(BlockDevInode { dev_id, dev }))
@@ -212,6 +215,10 @@ impl DevFs {
 impl FileSystem for DevFs {
     fn fs_type(&self) -> &'static str {
         "devfs"
+    }
+
+    fn cache_mode(&self) -> super::CacheMode {
+        super::CacheMode::Revalidate
     }
 
     fn root_inode(&self) -> Arc<dyn Inode> {

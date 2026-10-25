@@ -10,13 +10,16 @@
 
 //! Linux ABI system call dispatcher integrated with the VFS and scheduler subsystems.
 
+mod identity;
 mod memory;
 mod metadata;
 pub mod numbers;
+mod prctl;
 mod process;
+mod system;
 
 use crate::{
-    kinfo, kwarn, sched,
+    kwarn, sched,
     user::uaccess,
     vfs::{
         self, FdEntry, VfsError,
@@ -204,6 +207,30 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
         SYS_GETPID => process::getpid(),
         SYS_GETTID => process::gettid(),
         SYS_GETPPID => process::getppid(),
+        SYS_GETUID => identity::getuid(),
+        SYS_GETEUID => identity::geteuid(),
+        SYS_GETGID => identity::getgid(),
+        SYS_GETEGID => identity::getegid(),
+        SYS_SETUID => identity::setuid(arg0 as u32),
+        SYS_SETGID => identity::setgid(arg0 as u32),
+        SYS_SETREUID => identity::setreuid(arg0 as u32, arg1 as u32),
+        SYS_SETREGID => identity::setregid(arg0 as u32, arg1 as u32),
+        SYS_SETRESUID => identity::setresuid(arg0 as u32, arg1 as u32, arg2 as u32),
+        SYS_GETRESUID => identity::getresuid(arg0, arg1, arg2),
+        SYS_SETRESGID => identity::setresgid(arg0 as u32, arg1 as u32, arg2 as u32),
+        SYS_GETRESGID => identity::getresgid(arg0, arg1, arg2),
+        SYS_SETFSUID => identity::setfsuid(arg0 as u32),
+        SYS_SETFSGID => identity::setfsgid(arg0 as u32),
+        SYS_GETGROUPS => identity::getgroups(arg0 as u32, arg1),
+        SYS_SETGROUPS => identity::setgroups(arg0 as u32, arg1),
+        SYS_UMASK => identity::umask(arg0 as u32),
+        SYS_SCHED_GETAFFINITY => identity::sched_getaffinity(arg0, arg1 as u32, arg2),
+        SYS_SCHED_SETAFFINITY => identity::sched_setaffinity(arg0, arg1 as u32, arg2),
+        SYS_UNAME => system::uname(arg0),
+        SYS_SETHOSTNAME => system::sethostname(arg0, arg1),
+        SYS_SETDOMAINNAME => system::setdomainname(arg0, arg1),
+        SYS_PRCTL => prctl::prctl(arg0, arg1, arg2, arg3, arg4),
+        SYS_SENDFILE => sys_sendfile(arg0 as i32, arg1 as i32, arg2, arg3 as usize),
         SYS_RT_SIGACTION => crate::signal::rt_sigaction(arg0, arg1, arg2, arg3),
         SYS_RT_SIGPROCMASK => crate::signal::rt_sigprocmask(arg0, arg1, arg2, arg3),
         SYS_RT_SIGPENDING => crate::signal::rt_sigpending(arg0, arg1),
@@ -619,6 +646,93 @@ fn sys_pipe2(pipefd_ptr: *mut i32, flags: u32) -> i64 {
     0
 }
 
+/// Linux sendfile(2): copy between file descriptors without bouncing through
+/// a user buffer.  With a non-NULL offset, `in_fd`'s open-file position is
+/// left unchanged and `*offset` is advanced instead.
+fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: u64, count: usize) -> i64 {
+    if count == 0 {
+        return 0;
+    }
+    let output = match get_open_file(out_fd) {
+        Ok(entry) => entry,
+        Err(error) => return error.to_errno(),
+    };
+    let input = match get_open_file(in_fd) {
+        Ok(entry) => entry,
+        Err(error) => return error.to_errno(),
+    };
+    let mut position = if offset_ptr == 0 {
+        None
+    } else {
+        match uaccess::read_value::<u64>(offset_ptr) {
+            Ok(position) => Some(position),
+            Err(error) => return error.to_errno(),
+        }
+    };
+    let mut buffer = alloc::vec![0u8; 64 * 1024];
+    let mut total = 0usize;
+    let store_offset = |position: Option<u64>| -> i64 {
+        if let (Some(position), true) = (position, offset_ptr != 0) {
+            match uaccess::write_value(offset_ptr, &position) {
+                Ok(()) => 0,
+                Err(error) => error.to_errno(),
+            }
+        } else {
+            0
+        }
+    };
+    while total < count {
+        let want = (count - total).min(buffer.len());
+        let read = match position {
+            Some(offset) => match input.file.pread(offset, &mut buffer[..want]) {
+                Ok(0) => break,
+                Ok(read) => {
+                    position = Some(offset.saturating_add(read as u64));
+                    read
+                }
+                Err(error) => {
+                    let stored = store_offset(position);
+                    return if stored != 0 {
+                        stored
+                    } else {
+                        error.to_errno()
+                    };
+                }
+            },
+            None => match input.file.read(&mut buffer[..want]) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) => return error.to_errno(),
+            },
+        };
+        let mut written = 0usize;
+        while written < read {
+            match output.file.write(&buffer[written..read]) {
+                Ok(0) => break,
+                Ok(bytes) => written += bytes,
+                Err(VfsError::Interrupted) => continue,
+                Err(error) => {
+                    if total == 0 && written == 0 {
+                        let stored = store_offset(position);
+                        return if stored != 0 {
+                            stored
+                        } else {
+                            error.to_errno()
+                        };
+                    }
+                    break;
+                }
+            }
+        }
+        total = total.saturating_add(written);
+        if written < read {
+            break;
+        }
+    }
+    let stored = store_offset(position);
+    if stored != 0 { stored } else { total as i64 }
+}
+
 fn sys_fcntl(fd: i32, cmd: u32, arg: u64) -> i64 {
     let entry = match get_open_file(fd) {
         Ok(e) => e,
@@ -762,13 +876,18 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
             Err(e) => return e.to_errno(),
         };
         let settings = decode_termios(&bytes);
-        return match crate::tty::set_termios(crate::tty::TtyDevice::Foreground, settings) {
-            Ok(()) => 0,
-            Err(_) => -abi::ENOTTY,
+        // The console merges the serial and framebuffer input paths, so the
+        // controlling terminal's termios applies to both queues.
+        let foreground = crate::tty::set_termios(crate::tty::TtyDevice::Foreground, settings);
+        let serial = crate::tty::set_termios(crate::tty::TtyDevice::Serial0, settings);
+        return if foreground.is_ok() || serial.is_ok() {
+            0
+        } else {
+            -abi::ENOTTY
         };
     }
     if matches!(cmd, abi::TIOCGPGRP | abi::TIOCSPGRP | abi::TIOCGSID) {
-        if entry.file.abs_path != "/dev/console" {
+        if !console {
             return -abi::ENOTTY;
         }
         let Some(task) = sched::current() else {
@@ -803,17 +922,6 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
                 if crate::tty::controlling_session() != stats.sid {
                     return -abi::ENOTTY;
                 }
-                // Linux runs tty_check_change(SIGTTOU) before setting the
-                // foreground group.
-                if stats.pgid != crate::tty::foreground_pgrp() {
-                    if crate::signal::signal_ignored(&task, crate::signal::SIGTTOU)
-                        || crate::signal::pgrp_orphaned(stats.pgid, stats.sid)
-                    {
-                        return -abi::ENOTTY;
-                    }
-                    let _ = crate::signal::send_to_pgrp(stats.pgid, crate::signal::SIGTTOU);
-                    return -abi::EINTR;
-                }
                 let pgrp = match uaccess::read_value::<i32>(arg) {
                     Ok(pgrp) if pgrp >= 0 => pgrp as u64,
                     Ok(_) => return -abi::EINVAL,
@@ -821,13 +929,25 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
                 };
                 let target = match sched::tasks().into_iter().find(|candidate| {
                     let other = candidate.stats();
-                    other.user && other.pgid == pgrp
+                    other.user && (other.pgid == pgrp || other.tgid == pgrp || other.ltid == pgrp)
                 }) {
                     Some(target) => target,
                     None => return -abi::ESRCH,
                 };
                 if target.stats().sid != stats.sid {
                     return -abi::EPERM;
+                }
+                // Linux tty_check_change(): an orphaned background group gets
+                // EIO; otherwise SIGTTOU is queued (if not ignored) and the
+                // request still proceeds.  Interactive shells ignore SIGTTOU
+                // so they can hand the foreground group back and forth.
+                if stats.pgid != crate::tty::foreground_pgrp() {
+                    if crate::signal::pgrp_orphaned(stats.pgid, stats.sid) {
+                        return -abi::EIO;
+                    }
+                    if !crate::signal::signal_ignored(&task, crate::signal::SIGTTOU) {
+                        let _ = crate::signal::send_to_pgrp(stats.pgid, crate::signal::SIGTTOU);
+                    }
                 }
                 if !crate::tty::set_foreground_pgrp(stats.sid, pgrp) {
                     return -abi::EPERM;
@@ -1278,7 +1398,10 @@ fn sys_exit(code: i32, group: bool) -> i64 {
         })
         .unwrap_or(true);
     if leader {
-        kinfo!("Linux ABI: user process exited with code {}", code);
+        crate::verbose::log(format_args!(
+            "Linux ABI: user process exited with code {}",
+            code
+        ));
         set_last_user_exit_code(code);
     }
     // wait(2) encodes a normal exit in bits 8..15.
@@ -1484,5 +1607,5 @@ pub fn run_vfs_syscall_self_test() {
         0
     );
 
-    crate::self_test::verbose_log(format_args!("Linux ABI VFS syscall self-test passed"));
+    crate::verbose::log(format_args!("Linux ABI VFS syscall self-test passed"));
 }

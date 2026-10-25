@@ -24,7 +24,29 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub const MAX_FDS: usize = 256;
 
 /// Console character device inode backing `/dev/console` and default FDs 0, 1, 2.
-pub struct ConsoleInode;
+pub struct ConsoleInode {
+    nonblock: AtomicBool,
+    ino: u64,
+}
+
+impl ConsoleInode {
+    pub fn new() -> Self {
+        Self::with_ino(15)
+    }
+
+    pub fn with_ino(ino: u64) -> Self {
+        Self {
+            nonblock: AtomicBool::new(false),
+            ino,
+        }
+    }
+}
+
+impl Default for ConsoleInode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Inode for ConsoleInode {
     fn open(&self, _flags: u32) -> Result<Option<Arc<dyn Inode>>, VfsError> {
@@ -45,7 +67,7 @@ impl Inode for ConsoleInode {
     }
 
     fn metadata(&self) -> Result<Stat, VfsError> {
-        let mut s = Stat::simple(2, InodeKind::CharDevice, 0o666, 0);
+        let mut s = Stat::simple(self.ino, InodeKind::CharDevice, 0o666, 0);
         s.rdev = (5 << 8) | 1;
         Ok(s)
     }
@@ -73,14 +95,24 @@ impl Inode for ConsoleInode {
                 return Err(VfsError::Interrupted);
             }
         }
-        tty::poll_serial();
-        match tty::read(TtyDevice::Serial0, buf) {
-            Ok(n) if n > 0 => Ok(n),
-            _ => match tty::read(TtyDevice::Foreground, buf) {
-                Ok(n) => Ok(n),
-                Err(ReadError::WouldBlock) => Ok(0),
-                Err(_) => Err(VfsError::IoError),
-            },
+        loop {
+            tty::poll_serial();
+            match tty::read(TtyDevice::Serial0, buf) {
+                Ok(n) if n > 0 => return Ok(n),
+                _ => match tty::read(TtyDevice::Foreground, buf) {
+                    Ok(n) if n > 0 => return Ok(n),
+                    Ok(_) | Err(ReadError::WouldBlock) => {
+                        if self.nonblock.load(Ordering::Acquire) {
+                            return Err(VfsError::WouldBlock);
+                        }
+                        if crate::signal::pending_for_current() {
+                            return Err(VfsError::Interrupted);
+                        }
+                        crate::sched::sleep_micros(1000);
+                    }
+                    Err(_) => return Err(VfsError::IoError),
+                },
+            }
         }
     }
 
@@ -97,7 +129,17 @@ impl Inode for ConsoleInode {
     }
 
     fn poll(&self) -> u32 {
-        0x04
+        tty::poll_serial();
+        let mut events = 0x04; // POLLOUT
+        if tty::readable(TtyDevice::Serial0) || tty::readable(TtyDevice::Foreground) {
+            events |= 0x01; // POLLIN
+        }
+        events
+    }
+
+    fn set_nonblock(&self, nonblock: bool) -> Result<(), VfsError> {
+        self.nonblock.store(nonblock, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -467,7 +509,7 @@ impl Default for FileDescriptorTable {
 
 impl FileDescriptorTable {
     pub fn new_with_stdio() -> Self {
-        let console: Arc<dyn Inode> = Arc::new(ConsoleInode);
+        let console: Arc<dyn Inode> = Arc::new(ConsoleInode::new());
         let stdin = Arc::new(OpenFile::new(
             console.clone(),
             String::from("/dev/console"),

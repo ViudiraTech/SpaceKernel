@@ -97,6 +97,44 @@ pub(crate) fn has_children(ppid: u64) -> bool {
         .iter()
         .any(|task| task.stats().user && task.stats().ppid == ppid)
 }
+/// Deliver PR_SET_PDEATHSIG to direct children when their parent dies.
+pub(crate) fn deliver_pdeathsig(parent: u64) {
+    for child in all() {
+        let signal = {
+            let task = child.lock();
+            if task.user && task.ppid == parent {
+                task.pdeathsig
+            } else {
+                0
+            }
+        };
+        if signal != 0 {
+            crate::signal::send_to_thread(&child, crate::signal::Signal::kernel(signal));
+        }
+    }
+}
+
+/// Linux subreaper adoption: the nearest living ancestor marked as a child
+/// subreaper inherits orphaned descendants, otherwise PID 1 does.
+pub(crate) fn nearest_reaper(exiting: u64) -> u64 {
+    let mut parent = find(exiting).map(|task| task.stats().ppid).unwrap_or(0);
+    for _ in 0..64 {
+        if parent == 0 {
+            break;
+        }
+        match find(parent) {
+            Some(task) => {
+                if task.child_subreaper() {
+                    return parent;
+                }
+                parent = task.stats().ppid;
+            }
+            None => break,
+        }
+    }
+    1
+}
+
 /// Re-parent live children and already-exited zombies after their parent dies.
 pub(crate) fn reparent_children(old: u64, new: u64) {
     for task in all() {
@@ -115,6 +153,27 @@ pub(crate) fn reparent_children(old: u64, new: u64) {
 pub fn last_tid() -> u64 {
     NEXT_TID.load(Ordering::Relaxed).saturating_sub(1)
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Credentials {
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+    pub suid: u32,
+    pub sgid: u32,
+    pub fsuid: u32,
+    pub fsgid: u32,
+}
+
+/// Build a Linux `task_struct.comm` value from an executable path.
+pub fn comm_from_path(path: &str) -> [u8; 16] {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let mut comm = [0u8; 16];
+    let length = name.len().min(15);
+    comm[..length].copy_from_slice(&name.as_bytes()[..length]);
+    comm
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TaskStats {
     pub tid: u64,
@@ -138,6 +197,11 @@ pub struct TaskStats {
     pub involuntary_switches: u64,
     pub migrations: u64,
     pub exit_code: i32,
+    pub creds: Credentials,
+    /// NUL-padded Linux task command name.
+    pub comm: [u8; 16],
+    pub pdeathsig: u32,
+    pub child_subreaper: bool,
 }
 impl TaskRef {
     pub(crate) fn lock(&self) -> crate::sync::Guard<'_, Task> {
@@ -155,6 +219,61 @@ impl TaskRef {
     pub fn files(&self) -> Arc<SpinLock<crate::vfs::FileDescriptorTable>> {
         self.lock().fd_table.clone()
     }
+    pub fn credentials(&self) -> Credentials {
+        self.lock().creds
+    }
+    pub fn set_credentials(&self, creds: Credentials) {
+        self.lock().creds = creds;
+    }
+    pub fn groups(&self) -> Vec<u32> {
+        self.lock().groups.clone()
+    }
+    pub fn set_groups(&self, groups: Vec<u32>) {
+        self.lock().groups = groups;
+    }
+    pub fn set_affinity(&self, affinity: CpuMask) {
+        self.lock().affinity = affinity;
+    }
+    pub fn comm(&self) -> [u8; 16] {
+        self.lock().comm
+    }
+    pub fn set_comm(&self, name: &[u8]) {
+        let mut comm = [0u8; 16];
+        let length = name.len().min(15);
+        comm[..length].copy_from_slice(&name[..length]);
+        self.lock().comm = comm;
+    }
+    pub fn set_comm_from_path(&self, path: &str) {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        self.set_comm(name.as_bytes());
+    }
+    pub fn pdeathsig(&self) -> u32 {
+        self.lock().pdeathsig
+    }
+    pub fn set_pdeathsig(&self, signal: u32) {
+        self.lock().pdeathsig = signal;
+    }
+    pub fn dumpable(&self) -> bool {
+        self.lock().dumpable
+    }
+    pub fn set_dumpable(&self, dumpable: bool) {
+        self.lock().dumpable = dumpable;
+    }
+    pub fn no_new_privs(&self) -> bool {
+        self.lock().no_new_privs
+    }
+    pub fn set_no_new_privs(&self, enabled: bool) {
+        self.lock().no_new_privs = enabled;
+    }
+    pub fn child_subreaper(&self) -> bool {
+        self.lock().child_subreaper
+    }
+    pub fn set_child_subreaper(&self, enabled: bool) {
+        self.lock().child_subreaper = enabled;
+    }
+    pub fn clear_child_tid(&self) -> u64 {
+        self.lock().clear_child_tid
+    }
     pub fn fs(&self) -> Arc<SpinLock<FsContext>> {
         self.lock().fs.clone()
     }
@@ -163,9 +282,6 @@ impl TaskRef {
     }
     pub fn thread_signals(&self) -> Arc<SpinLock<ThreadSignals>> {
         self.lock().thread_signals.clone()
-    }
-    pub fn clear_child_tid(&self) -> u64 {
-        self.lock().clear_child_tid
     }
     pub fn exit_signal(&self) -> u32 {
         self.lock().exit_signal
@@ -246,6 +362,10 @@ impl TaskRef {
             involuntary_switches: task.involuntary_switches,
             migrations: task.migrations,
             exit_code: task.exit_code,
+            creds: task.creds,
+            comm: task.comm,
+            pdeathsig: task.pdeathsig,
+            child_subreaper: task.child_subreaper,
         }
     }
 }
@@ -279,6 +399,15 @@ impl CpuMask {
     }
     pub const fn empty() -> Self {
         Self([0; 4])
+    }
+    pub const fn from_words(words: [u64; 4]) -> Self {
+        Self(words)
+    }
+    pub const fn words(self) -> [u64; 4] {
+        self.0
+    }
+    pub fn is_empty(self) -> bool {
+        self.0.iter().all(|word| *word == 0)
     }
     pub fn with_cpu(mut self, cpu: usize) -> Self {
         assert!(cpu < crate::smp::MAX_CPUS);
@@ -332,6 +461,14 @@ pub(crate) struct Task {
     pub involuntary_switches: u64,
     pub migrations: u64,
     pub exit_code: i32,
+    pub creds: Credentials,
+    pub groups: Vec<u32>,
+    /// Linux `task_struct.comm`, including the trailing NUL slot.
+    pub comm: [u8; 16],
+    pub pdeathsig: u32,
+    pub dumpable: bool,
+    pub no_new_privs: bool,
+    pub child_subreaper: bool,
     pub(crate) context: UnsafeCell<arch::Context>,
     pub(crate) fpu_state: UnsafeCell<Option<fpu::State>>,
     pub(crate) entry: Option<Box<dyn FnOnce() + Send>>,
@@ -462,6 +599,13 @@ impl Task {
             involuntary_switches: 0,
             migrations: 0,
             exit_code: 0,
+            creds: Credentials::default(),
+            groups: Vec::new(),
+            comm: [0; 16],
+            pdeathsig: 0,
+            dumpable: true,
+            no_new_privs: false,
+            child_subreaper: false,
             context: UnsafeCell::new(context),
             fpu_state: UnsafeCell::new(fpu_state),
             entry,
@@ -534,6 +678,13 @@ impl Task {
             involuntary_switches: 0,
             migrations: 0,
             exit_code: 0,
+            creds: spec.creds,
+            groups: spec.groups,
+            comm: spec.comm,
+            pdeathsig: 0,
+            dumpable: true,
+            no_new_privs: spec.no_new_privs,
+            child_subreaper: false,
             context: UnsafeCell::new(context),
             fpu_state: UnsafeCell::new(fpu_state),
             entry: Some(entry),
@@ -560,6 +711,10 @@ pub(crate) struct UserTaskSpec {
     pub sid: u64,
     pub exit_signal: u32,
     pub clear_child_tid: u64,
+    pub creds: Credentials,
+    pub groups: Vec<u32>,
+    pub comm: [u8; 16],
+    pub no_new_privs: bool,
     pub fd_table: Arc<SpinLock<crate::vfs::FileDescriptorTable>>,
     pub files_shared: bool,
     pub fs: Arc<SpinLock<FsContext>>,
