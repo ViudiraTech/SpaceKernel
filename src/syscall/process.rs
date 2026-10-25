@@ -203,13 +203,13 @@ pub fn getppid() -> i64 {
 }
 
 const WNOHANG: u32 = 1;
-const WUNTRACED: u32 = 2;
-const WCONTINUED: u32 = 8;
 
 /// Linux wait4 subset used by the first init/shell milestone.  `rusage` and
 /// stopped/continued states are rejected with ENOSYS rather than faked.
 pub fn wait4(pid: i64, status: u64, options: u32, rusage: u64) -> i64 {
-    if rusage != 0 || options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
+    // WUNTRACED/WCONTINUED require stopped/continued state, which is not
+    // implemented yet.  Reject them instead of silently treating them as 0.
+    if rusage != 0 || options & !WNOHANG != 0 {
         return -abi::ENOSYS;
     }
     let Some(current) = crate::sched::current() else {
