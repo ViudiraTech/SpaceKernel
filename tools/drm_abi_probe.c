@@ -1,7 +1,7 @@
-/* ABI facts from the frozen Linux UAPI headers. */
+/* ABI facts from the host Linux UAPI headers (libdrm-dev / kernel headers). */
 #include <stdio.h>
-#include "../vendor/linux-uapi/drm/drm.h"
-#include "../vendor/linux-uapi/drm/virtgpu_drm.h"
+#include <drm/drm.h>
+#include <drm/virtgpu_drm.h>
 #define P(x) printf("0x%02lx => Some((%lu, %lu)), // %s\n",(unsigned long)_IOC_NR(x),(unsigned long)_IOC_SIZE(x),(unsigned long)_IOC_DIR(x),#x)
 int main(void) {
 P(DRM_IOCTL_VERSION);P(DRM_IOCTL_GET_UNIQUE);P(DRM_IOCTL_GET_MAGIC);P(DRM_IOCTL_SET_VERSION);P(DRM_IOCTL_GEM_CLOSE);P(DRM_IOCTL_GET_CAP);P(DRM_IOCTL_SET_CLIENT_CAP);P(DRM_IOCTL_SET_MASTER);P(DRM_IOCTL_DROP_MASTER);P(DRM_IOCTL_PRIME_HANDLE_TO_FD);P(DRM_IOCTL_PRIME_FD_TO_HANDLE);

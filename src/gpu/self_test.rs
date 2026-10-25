@@ -260,8 +260,8 @@ fn virgl(gpu: &Arc<Gpu>, file: &Arc<dyn Inode>, space: &Arc<SpinLock<UserAddress
     call(file, 0x44, &mut create, space).unwrap();
     let handle = u32_at(&create, 40).unwrap();
     let resource = u32_at(&create, 44).unwrap();
-    // Protocol definitions are frozen in vendor/virgl; no shader compilation or
-    // floating point instructions are executed by the kernel test.
+    // The VirGL command words are fixed constants for this clear-only probe;
+    // no shader compilation or floating point instructions run in the kernel.
     let words = [
         1 | (8 << 8) | (5 << 16),
         1,

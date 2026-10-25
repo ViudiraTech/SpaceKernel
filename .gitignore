@@ -6,9 +6,6 @@
 /target/
 /build/
 
-# Optional local bootloader checkout. The build downloads Limine into build/.
-/vendor/limine/
-
 # Python helper bytecode and OS metadata.
 __pycache__/
 *.py[cod]
