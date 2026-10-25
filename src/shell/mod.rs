@@ -471,6 +471,7 @@ fn cmd_ps() {
             sched::TaskState::Ready => "Ready   ",
             sched::TaskState::Running => "Running ",
             sched::TaskState::Blocked => "Blocked ",
+            sched::TaskState::Zombie => "Zombie  ",
             sched::TaskState::Dead => "Dead    ",
         };
         let runtime_ms = t.runtime_ns / 1_000_000;

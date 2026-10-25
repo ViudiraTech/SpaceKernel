@@ -29,6 +29,7 @@ use core::{
 #[derive(Clone)]
 pub struct TaskRef(Arc<SpinLock<Task>>);
 static TASKS: SpinLock<Vec<(u64, Weak<SpinLock<Task>>)>> = SpinLock::new(Vec::new());
+static ZOMBIES: SpinLock<Vec<TaskRef>> = SpinLock::new(Vec::new());
 #[derive(Clone)]
 pub struct TaskWeak {
     tid: u64,
@@ -66,6 +67,38 @@ pub fn all() -> Vec<TaskRef> {
         .filter_map(|w| w.upgrade().map(TaskRef))
         .filter(|t| t.stats().state != TaskState::Dead)
         .collect()
+}
+pub(crate) fn push_zombie(task: TaskRef) {
+    ZOMBIES.lock().push(task);
+}
+pub(crate) fn zombies() -> Vec<TaskRef> {
+    ZOMBIES.lock().clone()
+}
+pub(crate) fn take_zombie(tid: u64) -> Option<TaskRef> {
+    let mut list = ZOMBIES.lock();
+    let index = list.iter().position(|task| task.stats().tid == tid)?;
+    Some(list.remove(index))
+}
+pub(crate) fn has_children(ppid: u64) -> bool {
+    if ZOMBIES.lock().iter().any(|task| task.stats().ppid == ppid) {
+        return true;
+    }
+    all().iter().any(|task| task.stats().ppid == ppid)
+}
+/// Re-parent live children and already-exited zombies after their parent dies.
+pub(crate) fn reparent_children(old: u64, new: u64) {
+    for task in all() {
+        let mut task = task.lock();
+        if task.ppid == old {
+            task.ppid = new;
+        }
+    }
+    for task in zombies() {
+        let mut task = task.lock();
+        if task.ppid == old {
+            task.ppid = new;
+        }
+    }
 }
 pub fn last_tid() -> u64 {
     NEXT_TID.load(Ordering::Relaxed).saturating_sub(1)
@@ -136,6 +169,7 @@ pub enum TaskState {
     Ready,
     Running,
     Blocked,
+    Zombie,
     Dead,
 }
 
@@ -261,10 +295,22 @@ impl Task {
     pub fn address_space(&self) -> Option<Arc<SpinLock<crate::user::UserAddressSpace>>> {
         self.address_space.clone()
     }
+    pub(crate) fn become_zombie(&mut self, code: i32) {
+        self.state = TaskState::Zombie;
+        self.exit_code = code;
+    }
     pub(crate) fn create(
         entry: Option<Box<dyn FnOnce() + Send>>,
         cpu: usize,
         affinity: CpuMask,
+    ) -> Result<TaskRef, &'static str> {
+        Self::create_with_fds(entry, cpu, affinity, None)
+    }
+    pub(crate) fn create_with_fds(
+        entry: Option<Box<dyn FnOnce() + Send>>,
+        cpu: usize,
+        affinity: CpuMask,
+        fd_table: Option<Arc<SpinLock<crate::vfs::FileDescriptorTable>>>,
     ) -> Result<TaskRef, &'static str> {
         let idle = entry.is_none();
         let stack = if idle {
@@ -310,9 +356,11 @@ impl Task {
             entry,
             stack,
             address_space: None,
-            fd_table: Arc::new(SpinLock::new(
-                crate::vfs::FileDescriptorTable::new_with_stdio(),
-            )),
+            fd_table: fd_table.unwrap_or_else(|| {
+                Arc::new(SpinLock::new(
+                    crate::vfs::FileDescriptorTable::new_with_stdio(),
+                ))
+            }),
         })));
         let tid = result.stats().tid;
         let mut tasks = TASKS.lock();

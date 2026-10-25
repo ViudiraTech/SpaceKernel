@@ -155,6 +155,14 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
 
         // Process, Memory & Scheduling
         SYS_GETPID | SYS_GETTID => sys_getpid(),
+        SYS_GETPPID => process::getppid(),
+        SYS_WAIT4 => process::wait4(arg0 as i64, arg1, arg2 as u32, arg3),
+        #[cfg(target_arch = "x86_64")]
+        SYS_CLONE => process::clone(arg0, arg1, arg2, arg3, arg4),
+        #[cfg(target_arch = "x86_64")]
+        SYS_FORK => process::fork(),
+        #[cfg(not(target_arch = "x86_64"))]
+        SYS_CLONE => -abi::ENOSYS,
         SYS_SCHED_YIELD => sys_sched_yield(),
         SYS_NANOSLEEP => sys_nanosleep(arg0),
         SYS_EXIT | SYS_EXIT_GROUP => sys_exit(arg0 as i32),

@@ -45,7 +45,7 @@
 
 后续：
 
-- 在 x86_64 `#PF`、AArch64 `ESR/FAR`、RISC-V `scause/stval` 中识别用户写故障，调用 `cow_break`，失败或非 COW 时投递 SIGSEGV。
+- x86_64 `#PF` 已接入 `cow_break`；AArch64 `ESR/FAR`、RISC-V `scause/stval` 的用户写故障入口仍需改造。非 COW 故障目前终止进程，完整 SIGSEGV 投递随信号子系统实现。
 - 建立 VMA 抽象：当前 `mapped_frames` 按页记录，后续需要合并为 VMA（权限、文件偏移、共享/私有、增长方向），以支持 mmap/mprotect/munmap 的 Linux 语义和 `/proc/pid/maps`。
 - 文件私有映射当前由 `mmap` 复制到匿名页；接入 VMA 后改为按页 COW，避免一次性复制。
 - 页面错误与 OOM 路径不能持有 VMM/PMM 锁进入调度；需要可睡眠的缺页路径和失败回滚。
@@ -112,8 +112,9 @@
 | 里程碑 | 内容 | 验收 |
 | --- | --- | --- |
 | P1 | PMM 引用计数、CoW 地址空间复制、内核代写 COW | 已通过内核自测（数据隔离、引用归零、PMM 基线） |
-| P2 | 用户页故障、clone/fork/execve、wait4、僵尸/收养、PID 1 | x86_64 用户程序 fork+exec+wait；父退出后 PID 1 回收；CoW 压力测试 |
-| P3 | 完整信号、线程 clone、futex、进程组/会话、TTY 作业控制 | 多线程共享/隔离、信号掩码/处理器/altstack、Ctrl-C/Ctrl-Z、wait 状态 |
+| P2 | 用户页故障、clone/fork、wait4、僵尸/收养、PID 1 | x86_64 fork+wait+CoW 用户程序已通过；execve/PID1/孤儿回收未完成 |
+| P3 | 完整信号、线程 clone、futex、kill、进程组/会话、TTY 作业控制 | 多线程共享/隔离、信号掩码/处理器/altstack、Ctrl-C/Ctrl-Z、wait 状态 |
+| P3b | 核心 IPC：AF_UNIX、SCM_RIGHTS、eventfd/signalfd/timerfd/epoll、memfd、futex | socketpair/abstract/pathname、fd 传递、LT/ET、fd 继承、poll/epoll 就绪一致性 |
 | P4 | 静态 splibc、systemg、sh、FAT32 根盘 | QEMU 从 FAT32 启动 systemg，启动 sh，执行管道/重定向/作业控制 |
 | P5 | 动态 splibc/ld.so、三架构、故障注入 | 三架构编译/启动；OOM、exec 失败、信号竞争、fork 失败回滚 |
 
@@ -122,5 +123,22 @@
 ## 10. 当前进度
 
 - 已完成：PMM `u16` 帧引用计数、`retain/release/refcount`、CoW `fork_copy`/`cow_break`、写路径 COW 处理、`unmap`/`Drop` 引用释放、内核自测。
-- 未完成：用户页故障接线、`clone/fork/wait4/kill` 系统调用、PID/TID 分离、僵尸/收养、信号投递、futex、TTY pgrp、splibc/systemg/sh、FAT32 根盘。
-- 下一项：把 `clone(2)` 的进程路径接到 `fork_copy`，补 `wait4`/僵尸/父进程退出收养，并在 x86_64 上跑第一个真实 `fork+exec+wait` 用户程序。
+- 已完成（x86_64）：用户写页故障的 COW 解析；`SYS_CLONE`/`SYS_FORK`/`SYS_WAIT4`/`SYS_GETPPID`；僵尸保留、wait4 回收、父进程退出后孤儿 ppid 改挂 1；内核自测回收自身子进程。
+- 已通过的真实验证：`user/test/fork_wait_x86_64.S` 在 QEMU x86_64 2D 启动中输出 `child ok`、`parent ok`，父进程 wait 到子进程退出码 7 后以 42 退出，`SELFTEST_OK`/`BOOT_OK` 通过。该测试覆盖了 fork 返回、COW 数据页写入、wait4 和僵尸回收。
+- 未完成：CLONE_VM/THREAD、execve 后 PID 保持、PID 1 与真正孤儿回收、kill/信号、进程组/会话/TTY 作业控制、futex、IPC、splibc/systemg/sh、FAT32 根盘。AArch64/RISC-V 的 clone/fork 目前返回 ENOSYS，只保证编译。
+- 下一项：补 execve/PID 1 与 kill/信号基础，同时落 IPC 的 `eventfd` + `socketpair(AF_UNIX, SOCK_STREAM)` 最小闭环。
+
+## 11. IPC 子系统（已选型，尚未实现）
+
+选型：核心 IPC 全量，单 IPC namespace，首轮不做 netlink。范围包括：
+
+- 管道/FIFO（现有 `pipe2` 作为起点，补齐阻塞/非阻塞、poll/epoll 就绪与 fork/exec 继承）。
+- AF_UNIX：pathname/abstract/unnamed；SOCK_STREAM/SOCK_DGRAM/SOCK_SEQPACKET；`socketpair`、bind/listen/connect/accept、send/recv/sendmsg/recvmsg、shutdown、backlog、close/unlink/GC。
+- SCM_RIGHTS、SCM_CREDENTIALS、SO_PEERCRED、`SCM_MAX_FD=253`、`RLIMIT_NOFILE`/in-flight fd 限制、cmsg 截断 `MSG_CTRUNC` 与多余 fd 关闭。
+- eventfd（含 `EFD_SEMAPHORE`/`EFD_CLOEXEC`/`EFD_NONBLOCK`）、signalfd（依赖完整信号）、timerfd（依赖内核定时器）、epoll（LT/ET、ONESHOT、epoll fd 可 poll、fork 继承）。
+- memfd（`MFD_CLOEXEC`/`MFD_ALLOW_SEALING`、`F_ADD_SEALS`/`F_GET_SEALS`、ftruncate、`MAP_SHARED`）、共享 mmap、futex。
+- 统一 `Socket`/`Inode` 文件对象、等待队列驱动的 readiness、fd 传递使用 `Arc<OpenFile>`、权限与单 namespace 内的地址注册表。
+
+调研依据：[unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html)、[epoll(7)](https://man7.org/linux/man-pages/man7/epoll.7.html)、[eventfd(2)](https://man7.org/linux/man-pages/man2/eventfd.2.html)、[memfd_create(2)](https://man7.org/linux/man-pages/man2/memfd_create.2.html)；SysV IPC/`mq_overview` 已调研但不在首轮范围：[sysvipc(7)](https://man7.org/linux/man-pages/man7/sysvipc.7.html)、[mq_overview(7)](https://man7.org/linux/man-pages/man7/mq_overview.7.html)。
+
+当前状态：仅完成调研和选型，尚未开始 IPC 内核代码；不以 `ENOSYS` 或空对象冒充实现。

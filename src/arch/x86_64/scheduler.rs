@@ -20,6 +20,7 @@ pub struct CpuLocal {
     pub index: usize,
     pub kernel_rsp: u64,
     pub user_rsp: u64,
+    pub syscall_frame: u64,
 }
 struct SyncUnsafeCell<T>(core::cell::UnsafeCell<T>);
 unsafe impl<T> Sync for SyncUnsafeCell<T> {}
@@ -32,6 +33,7 @@ const fn make_locals() -> [CpuLocal; 256] {
             index: 0,
             kernel_rsp: 0,
             user_rsp: 0,
+            syscall_frame: 0,
         }
     }; 256];
     let mut i = 0;

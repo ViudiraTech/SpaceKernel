@@ -39,6 +39,7 @@ pub fn run_self_test() -> Result<(), &'static str> {
             return Err("user mode self-test timed out waiting for exit code 42");
         }
     }
+    let _ = crate::sched::take_zombie(tid);
     crate::self_test::verbose_log(format_args!("user self-test passed: exit code 42 verified"));
     // A minimal executable whose PT_INTERP is a position-independent copy of
     // the real architecture test. The main entry must never be entered.
@@ -66,9 +67,10 @@ pub fn run_self_test() -> Result<(), &'static str> {
     main[128..136].copy_from_slice(&512u64.to_le_bytes());
     main[152..160].copy_from_slice(&(path.len() as u64).to_le_bytes());
     crate::syscall::set_last_user_exit_code(-1);
-    spawn_user_elf(&main, "interpreter_test")?;
+    let interpreter_tid = spawn_user_elf(&main, "interpreter_test")?;
     for _ in 0..1000 {
         if crate::syscall::last_user_exit_code() == 42 {
+            let _ = crate::sched::take_zombie(interpreter_tid);
             crate::self_test::verbose_log(format_args!(
                 "ELF PT_INTERP/PIE user handoff self-test passed"
             ));
@@ -77,4 +79,19 @@ pub fn run_self_test() -> Result<(), &'static str> {
         crate::sched::sleep_micros(1000);
     }
     Err("ELF interpreter handoff timed out")
+}
+
+/// x86_64 vertical-slice test: fork, COW stack/data write, wait4, zombie reap.
+#[cfg(target_arch = "x86_64")]
+pub fn fork_wait_self_test() -> Result<(), &'static str> {
+    crate::syscall::set_last_user_exit_code(-1);
+    spawn_user_elf(test_binaries::FORK_TEST_ELF, "fork_wait")?;
+    for _ in 0..3000 {
+        if crate::syscall::last_user_exit_code() == 42 {
+            crate::self_test::verbose_log(format_args!("fork/wait4/CoW user self-test passed"));
+            return Ok(());
+        }
+        crate::sched::sleep_micros(1000);
+    }
+    Err("fork/wait4 user self-test failed or timed out")
 }

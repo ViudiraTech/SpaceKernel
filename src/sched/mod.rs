@@ -29,7 +29,7 @@ use crate::{
     sync::{Guard, SpinLock},
     time,
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 pub use eevdf::{NICE_0_WEIGHT, nice_to_weight};
 use rbtree::{Node, RBTree};
@@ -37,6 +37,7 @@ use task::Task;
 pub use task::find as find_task;
 pub use task::last_tid;
 pub use task::{CpuMask, TaskRef, TaskState, TaskStats, TaskWeak};
+pub(crate) use task::{has_children, take_zombie, zombies};
 pub use wait::WaitQueue;
 
 type Entity = Box<Node<TaskRef>>;
@@ -253,10 +254,20 @@ pub fn spawn_with_affinity(
     nice: i32,
     affinity: CpuMask,
 ) -> Result<u64, &'static str> {
+    spawn_with_fds(entry, nice, affinity, None)
+}
+/// Spawn a task with an already-prepared descriptor table.  Used by fork so the
+/// child table is installed before the task can run on another CPU.
+pub fn spawn_with_fds(
+    entry: impl FnOnce() + Send + 'static,
+    nice: i32,
+    affinity: CpuMask,
+    fd_table: Option<Arc<SpinLock<crate::vfs::FileDescriptorTable>>>,
+) -> Result<u64, &'static str> {
     let sched = try_scheduler().ok_or("scheduler not initialized")?;
     let cpu = loadbalance::select_cpu(sched, affinity, smp::current_cpu())
         .ok_or("no online CPU in affinity")?;
-    let task = Task::create(Some(Box::new(entry)), cpu, affinity)?;
+    let task = Task::create_with_fds(Some(Box::new(entry)), cpu, affinity, fd_table)?;
     let tid = {
         let mut guard = task.lock();
         guard.nice = nice.clamp(-20, 19);
@@ -401,8 +412,12 @@ fn dispatch(mut rq: Guard<'static, CpuQueue>, disposition: Disposition<'_>, volu
         Disposition::Exit(code) => {
             assert_ne!(previous.weight, 0, "idle cannot exit");
             let mut task = previous.value.lock();
-            task.state = TaskState::Dead;
-            task.exit_code = code;
+            if task.address_space.is_some() {
+                task.become_zombie(code);
+            } else {
+                task.state = TaskState::Dead;
+                task.exit_code = code;
+            }
             drop(task);
             assert!(rq.retired.is_none());
             rq.retired = Some(previous);
@@ -475,10 +490,18 @@ pub(crate) fn finish_switch() {
     }
     let retired = queue.lock().retired.take();
     if let Some(retired) = retired {
+        let exiting_tid = retired.value.stats().tid;
+        let user = retired.value.stats().state == TaskState::Zombie;
         {
             let mut task = retired.value.lock();
             task.address_space = None;
             task.fd_table.lock().close_all();
+        }
+        if user {
+            // The exiting task is now off-CPU.  Orphans are adopted by PID 1
+            // and the task is retained as a zombie until wait4 reaps it.
+            task::reparent_children(exiting_tid, 1);
+            task::push_zombie(retired.value.clone());
         }
         drop(retired); // Never free the stack while it is still executing.
         COMPLETED.fetch_add(1, Ordering::Release);

@@ -66,6 +66,7 @@ impl Node {
                 let state = match stats.state {
                     TaskState::Running | TaskState::Ready => "R",
                     TaskState::Blocked => "S",
+                    TaskState::Zombie => "Z",
                     TaskState::Dead => "Z",
                 };
                 let pages = space.as_ref().map(|s| s.resident_pages()).unwrap_or(0);

@@ -132,7 +132,27 @@ pub(super) extern "x86-interrupt" fn page_fault(
     code: PageFaultErrorCode,
 ) {
     if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        fatal("#PF", frame, Some(code.bits()));
+        // Interrupt entry from user mode does not perform SWAPGS.
+        unsafe { core::arch::asm!("swapgs", "lfence", options(nostack)) };
+        let address = Cr2::read().map(|address| address.as_u64()).unwrap_or(0);
+        if code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
+            let handled = crate::sched::current()
+                .and_then(|task| task.address_space())
+                .is_some_and(|space| space.lock().cow_break(address).unwrap_or(false));
+            if handled {
+                unsafe { core::arch::asm!("swapgs", options(nostack)) };
+                return;
+            }
+        }
+        crate::fpu::disable_current();
+        crate::kwarn!(
+            "user fault: #PF address={:#x} code={:?} ip={:?}",
+            address,
+            code,
+            frame.instruction_pointer
+        );
+        crate::syscall::set_last_user_exit_code(128 + 11);
+        crate::sched::exit(128 + 11);
     }
     arch::disable_interrupts();
     printk::emergency(format_args!(

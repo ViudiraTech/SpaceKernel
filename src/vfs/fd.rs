@@ -379,6 +379,13 @@ impl FileDescriptorTable {
         }
     }
 
+    pub fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            cwd: String::from("/"),
+        }
+    }
+
     pub fn snapshot(&self) -> Vec<(usize, FdEntry)> {
         self.entries
             .iter()

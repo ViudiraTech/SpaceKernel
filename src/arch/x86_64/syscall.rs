@@ -32,6 +32,7 @@ spacekernel_x86_64_syscall_entry:
     push rcx
 
     push r9
+    mov qword ptr gs:[24], rsp
     mov r9, r8
     mov r8, r10
     mov rcx, rdx
@@ -41,6 +42,7 @@ spacekernel_x86_64_syscall_entry:
 
     call spacekernel_syscall_c
 
+    mov qword ptr gs:[24], 0
     add rsp, 8
 
     pop rcx
@@ -156,6 +158,119 @@ pub unsafe fn enter_user_mode(entry: u64, user_sp: u64) -> ! {
             rflags = in(reg) RFLAGS_USER,
             cs = in(reg) USER_CS,
             rip = in(reg) entry,
+            options(noreturn)
+        );
+    }
+}
+
+/// User register state captured at a `syscall` boundary.  Only the state that
+/// the x86-64 syscall ABI does not permit the kernel to clobber is needed for
+/// a fork child to resume after the syscall with RAX = 0.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UserContext {
+    pub rip: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub rbx: u64,
+    pub rbp: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub fs_base: u64,
+    pub gs_base: u64,
+}
+
+fn read_msr(msr: u32) -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: reading a model-specific register is side-effect free here.
+    unsafe {
+        core::arch::asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high, options(nostack, preserves_flags));
+    }
+    ((high as u64) << 32) | low as u64
+}
+
+fn write_msr(msr: u32, value: u64) {
+    // SAFETY: callers write the architectural FS/GS base MSRs before returning
+    // to user mode.
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+fn syscall_frame() -> *mut u64 {
+    let pointer: u64;
+    // SAFETY: the syscall entry publishes the saved-frame pointer at GS:24.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[24]",
+            out(reg) pointer,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    pointer as *mut u64
+}
+
+/// Capture the current user context while a syscall is executing.
+pub fn capture_user_context() -> Option<UserContext> {
+    let frame = syscall_frame();
+    if frame.is_null() {
+        return None;
+    }
+    // SAFETY: the syscall entry pushed these exact slots before dispatching.
+    unsafe {
+        Some(UserContext {
+            rip: frame.add(1).read(),
+            rflags: frame.add(2).read(),
+            rsp: frame.add(9).read(),
+            rbx: frame.add(3).read(),
+            rbp: frame.add(4).read(),
+            r12: frame.add(5).read(),
+            r13: frame.add(6).read(),
+            r14: frame.add(7).read(),
+            r15: frame.add(8).read(),
+            fs_base: read_msr(0xc000_0100),
+            gs_base: read_msr(0xc000_0102),
+        })
+    }
+}
+
+/// Enter user mode with the captured context and return value 0.
+///
+/// # Safety
+/// The current address space must be the target process's address space and the
+/// user stack/register state must be owned by the new task.
+pub unsafe fn enter_user_context(context: &UserContext) -> ! {
+    write_msr(0xc000_0100, context.fs_base);
+    write_msr(0xc000_0102, context.gs_base);
+    // SAFETY: this code runs on the child task immediately before sysretq.
+    unsafe {
+        let _ = crate::fpu::enable_user();
+    }
+    // SAFETY: address space and context are prepared by the caller.  RAX is
+    // zeroed for the child's clone return value.
+    unsafe {
+        core::arch::asm!(
+            "mov rbx, [rdi + 24]",
+            "mov rbp, [rdi + 32]",
+            "mov r12, [rdi + 40]",
+            "mov r13, [rdi + 48]",
+            "mov r14, [rdi + 56]",
+            "mov r15, [rdi + 64]",
+            "mov rcx, [rdi + 0]",
+            "mov r11, [rdi + 8]",
+            "mov rsp, [rdi + 16]",
+            "xor eax, eax",
+            "swapgs",
+            "sysretq",
+            in("rdi") context as *const UserContext,
             options(noreturn)
         );
     }

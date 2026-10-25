@@ -13,6 +13,9 @@
 #[cfg(target_arch = "x86_64")]
 pub const TEST_USER_ELF: &[u8] = include_bytes!("../../user/test/test_x86_64.elf");
 
+#[cfg(target_arch = "x86_64")]
+pub const FORK_TEST_ELF: &[u8] = include_bytes!("../../user/test/fork_wait_x86_64.elf");
+
 #[cfg(target_arch = "aarch64")]
 pub const TEST_USER_ELF: &[u8] = include_bytes!("../../user/test/test_aarch64.elf");
 

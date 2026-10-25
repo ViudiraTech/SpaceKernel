@@ -194,3 +194,120 @@ pub fn getrandom(pointer: u64, count: usize, flags: u32) -> i64 {
     }
     VfsError::WouldBlock.to_errno()
 }
+
+/// Return the parent task id of the current process.
+pub fn getppid() -> i64 {
+    crate::sched::current()
+        .map(|task| task.stats().ppid as i64)
+        .unwrap_or(0)
+}
+
+const WNOHANG: u32 = 1;
+const WUNTRACED: u32 = 2;
+const WCONTINUED: u32 = 8;
+
+/// Linux wait4 subset used by the first init/shell milestone.  `rusage` and
+/// stopped/continued states are rejected with ENOSYS rather than faked.
+pub fn wait4(pid: i64, status: u64, options: u32, rusage: u64) -> i64 {
+    if rusage != 0 || options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
+        return -abi::ENOSYS;
+    }
+    let Some(current) = crate::sched::current() else {
+        return -abi::ESRCH;
+    };
+    let parent = current.stats().tid;
+    let pgid = current.stats().tgid;
+    loop {
+        for zombie in crate::sched::zombies() {
+            let stats = zombie.stats();
+            if stats.ppid != parent {
+                continue;
+            }
+            let matches = if pid == -1 {
+                true
+            } else if pid == 0 {
+                stats.tgid == pgid
+            } else if pid > 0 {
+                stats.tid == pid as u64
+            } else {
+                stats.tgid == pid.unsigned_abs()
+            };
+            if !matches {
+                continue;
+            }
+            let Some(zombie) = crate::sched::take_zombie(stats.tid) else {
+                continue;
+            };
+            let code = zombie.stats().exit_code;
+            if status != 0 {
+                let encoded = (code & 0xff) << 8;
+                if let Err(error) = uaccess::write_value(status, &encoded) {
+                    return error.to_errno();
+                }
+            }
+            return stats.tid as i64;
+        }
+        if !crate::sched::has_children(parent) {
+            return -abi::ECHILD;
+        }
+        if options & WNOHANG != 0 {
+            return 0;
+        }
+        crate::sched::sleep_micros(1000);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn fork() -> i64 {
+    clone(17, 0, 0, 0, 0)
+}
+
+/// Process-only clone path.  Threads (CLONE_VM/THREAD/SIGHAND/FILES/FS) are
+/// rejected until the shared-resource model is implemented; returning ENOSYS
+/// is deliberate and visible to user space.
+#[cfg(target_arch = "x86_64")]
+pub fn clone(flags: u64, stack: u64, _parent_tid: u64, _child_tid: u64, _tls: u64) -> i64 {
+    if flags & !0xff != 0 {
+        return -abi::ENOSYS;
+    }
+    let Some(parent) = crate::sched::current() else {
+        return -abi::ESRCH;
+    };
+    let Some(parent_space) = parent.address_space() else {
+        return -abi::EINVAL;
+    };
+    let Some(context) = crate::arch::syscall::capture_user_context() else {
+        return -abi::EINVAL;
+    };
+    let files = Arc::new(SpinLock::new(parent.files().lock().clone()));
+    let mut space = parent_space.lock();
+    let child_space = match space.fork_copy() {
+        Ok(space) => space,
+        Err(_) => return -abi::ENOMEM,
+    };
+    drop(space);
+    let mut child_context = context;
+    if stack != 0 {
+        child_context.rsp = stack;
+    }
+    let child_space = Arc::new(SpinLock::new(child_space));
+    let child_context = alloc::boxed::Box::new(child_context);
+    let result = crate::sched::spawn_with_fds(
+        move || {
+            if let Some(current) = crate::sched::current() {
+                current.lock().set_address_space(child_space.clone());
+            }
+            child_space.lock().activate();
+            // SAFETY: the child owns this COW address space and the captured
+            // user context; the child task never returns to kernel mode here.
+            unsafe { crate::arch::syscall::enter_user_context(&child_context) }
+        },
+        0,
+        crate::sched::CpuMask::all(),
+        Some(files),
+    );
+    match result {
+        Ok(tid) => tid as i64,
+        Err(_) => -abi::ENOMEM,
+    }
+}
