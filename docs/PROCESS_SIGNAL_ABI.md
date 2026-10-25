@@ -114,7 +114,7 @@
 | P1 | PMM 引用计数、CoW 地址空间复制、内核代写 COW | 已通过内核自测（数据隔离、引用归零、PMM 基线） |
 | P2 | 用户页故障、clone/fork、wait4、僵尸/收养、PID 1 | x86_64 fork+wait+CoW 用户程序已通过；execve/PID1/孤儿回收未完成 |
 | P3 | 完整信号、线程 clone、futex、kill、进程组/会话、TTY 作业控制 | 多线程共享/隔离、信号掩码/处理器/altstack、Ctrl-C/Ctrl-Z、wait 状态 |
-| P3b | 核心 IPC：AF_UNIX、SCM_RIGHTS、eventfd/signalfd/timerfd/epoll、memfd、futex | socketpair/abstract/pathname、fd 传递、LT/ET、fd 继承、poll/epoll 就绪一致性 |
+| P3b | 核心 IPC：AF_UNIX、SCM_RIGHTS、eventfd/signalfd/timerfd/epoll、memfd、futex | eventfd2 已通过；socketpair/abstract/pathname、fd 传递、LT/ET、fd 继承、poll/epoll 未完成 |
 | P4 | 静态 splibc、systemg、sh、FAT32 根盘 | QEMU 从 FAT32 启动 systemg，启动 sh，执行管道/重定向/作业控制 |
 | P5 | 动态 splibc/ld.so、三架构、故障注入 | 三架构编译/启动；OOM、exec 失败、信号竞争、fork 失败回滚 |
 
@@ -125,7 +125,8 @@
 - 已完成：PMM `u16` 帧引用计数、`retain/release/refcount`、CoW `fork_copy`/`cow_break`、写路径 COW 处理、`unmap`/`Drop` 引用释放、内核自测。
 - 已完成（x86_64）：用户写页故障的 COW 解析；`SYS_CLONE`/`SYS_FORK`/`SYS_WAIT4`/`SYS_GETPPID`；僵尸保留、wait4 回收、父进程退出后孤儿 ppid 改挂 1；内核自测回收自身子进程。
 - 已通过的真实验证：`user/test/fork_wait_x86_64.S` 在 QEMU x86_64 2D 启动中输出 `child ok`、`parent ok`，父进程 wait 到子进程退出码 7 后以 42 退出，`SELFTEST_OK`/`BOOT_OK` 通过。该测试覆盖了 fork 返回、COW 数据页写入、wait4 和僵尸回收。
-- 未完成：CLONE_VM/THREAD、execve 后 PID 保持、PID 1 与真正孤儿回收、kill/信号、进程组/会话/TTY 作业控制、futex、IPC、splibc/systemg/sh、FAT32 根盘。AArch64/RISC-V 的 clone/fork 目前返回 ENOSYS，只保证编译。
+- 已开始 IPC：`src/ipc/mod.rs` 实现 `eventfd2`（counter、EFD_SEMAPHORE、EFD_NONBLOCK、EFD_CLOEXEC、poll 可读可写），内核 syscall 自测覆盖 counter/read/write/poll/EAGAIN/信号量模式。
+- 未完成：CLONE_VM/THREAD、execve 后 PID 保持、PID 1 与真正孤儿回收、kill/信号、进程组/会话/TTY 作业控制、futex、AF_UNIX/SCM_RIGHTS/epoll/signalfd/timerfd/memfd、splibc/systemg/sh、FAT32 根盘。AArch64/RISC-V 的 clone/fork 目前返回 ENOSYS，只保证编译。
 - 下一项：补 execve/PID 1 与 kill/信号基础，同时落 IPC 的 `eventfd` + `socketpair(AF_UNIX, SOCK_STREAM)` 最小闭环。
 
 ## 11. IPC 子系统（已选型，尚未实现）
@@ -141,4 +142,4 @@
 
 调研依据：[unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html)、[epoll(7)](https://man7.org/linux/man-pages/man7/epoll.7.html)、[eventfd(2)](https://man7.org/linux/man-pages/man2/eventfd.2.html)、[memfd_create(2)](https://man7.org/linux/man-pages/man2/memfd_create.2.html)；SysV IPC/`mq_overview` 已调研但不在首轮范围：[sysvipc(7)](https://man7.org/linux/man-pages/man7/sysvipc.7.html)、[mq_overview(7)](https://man7.org/linux/man-pages/man7/mq_overview.7.html)。
 
-当前状态：仅完成调研和选型，尚未开始 IPC 内核代码；不以 `ENOSYS` 或空对象冒充实现。
+当前状态：`eventfd2` 已实现并通过内核 syscall 自测；AF_UNIX、SCM_RIGHTS、epoll、signalfd、timerfd、memfd 尚未开始。未实现项继续返回真实错误，不以空对象冒充。

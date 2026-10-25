@@ -222,6 +222,62 @@ pub fn syscalls() {
     assert_eq!(dispatch(SYS_CLOSE, fds[0] as u64, 0, 0, 0, 0, 0), 0);
     assert_eq!(dispatch(SYS_CLOSE, fds[1] as u64, 0, 0, 0, 0, 0), 0);
 
+    // eventfd2: counter, semaphore mode, nonblocking EAGAIN and poll readiness
+    assert_eq!(
+        dispatch(SYS_EVENTFD2, 0, 0xffff_ffff, 0, 0, 0, 0),
+        -abi::EINVAL
+    );
+    let efd = dispatch(SYS_EVENTFD2, 0, 0, 0, 0, 0, 0);
+    assert!(efd >= 0);
+    scratch
+        .lock()
+        .write_bytes(0x10200, &5u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(dispatch(SYS_WRITE, efd as u64, 0x10200, 8, 0, 0, 0), 8);
+    assert_eq!(dispatch(SYS_READ, efd as u64, 0x10208, 8, 0, 0, 0), 8);
+    let mut event_value = [0u8; 8];
+    scratch
+        .lock()
+        .read_bytes(0x10208, &mut event_value)
+        .unwrap();
+    assert_eq!(u64::from_le_bytes(event_value), 5);
+    #[cfg(target_arch = "x86_64")]
+    {
+        scratch
+            .lock()
+            .write_bytes(0x10200, &3u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(dispatch(SYS_WRITE, efd as u64, 0x10200, 8, 0, 0, 0), 8);
+        scratch
+            .lock()
+            .write_bytes(0x10210, &(efd as i32).to_le_bytes())
+            .unwrap();
+        scratch
+            .lock()
+            .write_bytes(0x10214, &1u16.to_le_bytes())
+            .unwrap();
+        assert_eq!(dispatch(SYS_POLL, 0x10210, 1, 1000, 0, 0, 0), 1);
+    }
+    assert_eq!(dispatch(SYS_CLOSE, efd as u64, 0, 0, 0, 0, 0), 0);
+
+    let empty = dispatch(SYS_EVENTFD2, 0, abi::O_NONBLOCK as u64, 0, 0, 0, 0);
+    assert!(empty >= 0);
+    assert_eq!(
+        dispatch(SYS_READ, empty as u64, 0x10220, 8, 0, 0, 0),
+        -abi::EAGAIN
+    );
+    assert_eq!(dispatch(SYS_CLOSE, empty as u64, 0, 0, 0, 0, 0), 0);
+
+    let sem = dispatch(SYS_EVENTFD2, 3, 1, 0, 0, 0, 0);
+    assert!(sem >= 0);
+    assert_eq!(dispatch(SYS_READ, sem as u64, 0x10228, 8, 0, 0, 0), 8);
+    scratch
+        .lock()
+        .read_bytes(0x10228, &mut event_value)
+        .unwrap();
+    assert_eq!(u64::from_le_bytes(event_value), 1);
+    assert_eq!(dispatch(SYS_CLOSE, sem as u64, 0, 0, 0, 0, 0), 0);
+
     // Verify getrandom matches hardware RNG support without hanging
     let gr = dispatch(SYS_GETRANDOM, 0x10200, 16, 0, 0, 0, 0);
     if crate::random::supported() {

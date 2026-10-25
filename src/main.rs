@@ -24,6 +24,7 @@ pub mod device;
 pub mod fpu;
 pub mod gpu;
 mod hardware;
+pub mod ipc;
 pub mod irq;
 mod mm;
 pub mod pci;

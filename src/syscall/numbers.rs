@@ -126,6 +126,8 @@ pub const SYS_FACCESSAT: u64 = 269;
 pub const SYS_DUP3: u64 = 292;
 #[cfg(target_arch = "x86_64")]
 pub const SYS_PIPE2: u64 = 293;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_EVENTFD2: u64 = 290;
 
 // asm-generic/unistd.h numbers for AArch64 and RISC-V 64
 #[cfg(not(target_arch = "x86_64"))]
@@ -164,6 +166,8 @@ pub const SYS_OPENAT: u64 = 56;
 pub const SYS_CLOSE: u64 = 57;
 #[cfg(not(target_arch = "x86_64"))]
 pub const SYS_PIPE2: u64 = 59;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_EVENTFD2: u64 = 19;
 #[cfg(not(target_arch = "x86_64"))]
 pub const SYS_GETDENTS64: u64 = 61;
 #[cfg(not(target_arch = "x86_64"))]

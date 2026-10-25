@@ -75,6 +75,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
         SYS_DUP => sys_dup(arg0 as i32),
         SYS_DUP3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as u32),
         SYS_PIPE2 => sys_pipe2(arg0 as *mut i32, arg1 as u32),
+        SYS_EVENTFD2 => crate::ipc::eventfd2(arg0 as u32, arg1 as u32),
         SYS_FCNTL => sys_fcntl(arg0 as i32, arg1 as u32, arg2),
         SYS_IOCTL => sys_ioctl(arg0 as i32, arg1, arg2),
 
