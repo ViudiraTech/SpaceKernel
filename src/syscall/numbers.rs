@@ -192,6 +192,8 @@ pub const SYS_TKILL: u64 = 200;
 pub const SYS_TGKILL: u64 = 234;
 #[cfg(target_arch = "x86_64")]
 pub const SYS_WAITID: u64 = 247;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_FUTEX: u64 = 202;
 
 // asm-generic/unistd.h numbers for AArch64 and RISC-V 64
 #[cfg(not(target_arch = "x86_64"))]
@@ -294,6 +296,8 @@ pub const SYS_GETSID: u64 = 156;
 pub const SYS_SETSID: u64 = 157;
 #[cfg(not(target_arch = "x86_64"))]
 pub const SYS_WAITID: u64 = 95;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_FUTEX: u64 = 98;
 #[cfg(not(target_arch = "x86_64"))]
 pub const SYS_GETDENTS64: u64 = 61;
 #[cfg(not(target_arch = "x86_64"))]

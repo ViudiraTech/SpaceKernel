@@ -13,6 +13,10 @@ void thread_entry(void);
 
 static volatile i64 handler_sig;
 static volatile i64 handler_count;
+volatile i32 futex_gate;
+volatile i32 thread_waiting;
+volatile i32 thread_done;
+static volatile i32 futex_never;
 static char thread_stack[65536] __attribute__((aligned(16)));
 
 static u64 string_length(const char *text) {
@@ -126,8 +130,47 @@ int main(void) {
     if (child_tid != (i32)tid) {
         fail("E:settid\n");
     }
-    for (long i = 0; i < 200000 && child_tid != 0; i++) {
+    /* FUTEX_WAIT timeout with no waker. */
+    {
+        struct {
+            i64 seconds;
+            i64 nanos;
+        } timeout = {0, 1000000};
+        i64 rc = sys_futex((u64)&futex_never, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0,
+                           (u64)&timeout, 0, 0);
+        if (rc != -ETIMEDOUT) {
+            fail("E:futex_timeout\n");
+        }
+    }
+    /* Wait until the child publishes its futex gate, then wake it. */
+    for (long i = 0; i < 200000 && thread_waiting == 0; i++) {
         sys_sched_yield();
+    }
+    if (thread_waiting == 0) {
+        fail("E:futex_gate\n");
+    }
+    futex_gate = 1;
+    if (sys_futex((u64)&futex_gate, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0) != 1) {
+        fail("E:futex_wake\n");
+    }
+    for (long i = 0; i < 200000 && thread_done == 0; i++) {
+        sys_sched_yield();
+    }
+    if (thread_done == 0) {
+        fail("E:futex_done\n");
+    }
+    /* pthread_join style: CLONE_CHILD_CLEARTID publishes zero and wakes. */
+    for (int tries = 0; tries < 100 && child_tid != 0; tries++) {
+        struct {
+            i64 seconds;
+            i64 nanos;
+        } timeout = {0, 100000000};
+        i64 rc = sys_futex((u64)&child_tid, FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+                           (u32)child_tid, (u64)&timeout, 0, 0);
+        if (rc == 0 || rc == -11 || rc == -4 || rc == -ETIMEDOUT) {
+            continue;
+        }
+        fail("E:futex_join\n");
     }
     if (child_tid != 0) {
         fail("E:cleartid\n");

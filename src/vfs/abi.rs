@@ -62,6 +62,7 @@ pub const EISCONN: i64 = 106;
 pub const ENOTCONN: i64 = 107;
 pub const ETOOMANYREFS: i64 = 109;
 pub const ECONNREFUSED: i64 = 111;
+pub const ETIMEDOUT: i64 = 110;
 
 // Open Flags (O_*)
 pub const O_RDONLY: u32 = 0;

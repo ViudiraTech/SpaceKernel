@@ -218,6 +218,9 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
         SYS_GETPGID => process::getpgid(arg0 as i64),
         SYS_SETSID => process::setsid(),
         SYS_GETSID => process::getsid(arg0 as i64),
+        SYS_FUTEX => {
+            crate::ipc::futex::futex(arg0, arg1 as u32, arg2 as u32, arg3, arg4, arg5 as u32)
+        }
         #[cfg(not(target_arch = "x86_64"))]
         SYS_RT_SIGRETURN => -abi::ENOSYS,
         SYS_WAIT4 => process::wait4(arg0 as i64, arg1, arg2 as u32, arg3),

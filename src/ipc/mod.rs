@@ -8,6 +8,7 @@
 //! Core IPC objects.  This module owns the Linux syscall surface for `eventfd2`
 //! and AF_UNIX sockets; the socket state machine lives in `unix`.
 
+pub mod futex;
 pub mod unix;
 
 use crate::{

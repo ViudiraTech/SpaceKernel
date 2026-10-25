@@ -673,6 +673,14 @@ impl UserAddressSpace {
         result
     }
 
+    /// Futex identity: address-space root plus virtual address.  Threads that
+    /// share this space share the key.
+    pub fn futex_key(&self, address: u64) -> Option<(u64, u64)> {
+        self.mapped_frames
+            .contains_key(&(address & !4095))
+            .then_some((self.root_phys, address))
+    }
+
     pub fn resident_pages(&self) -> usize {
         self.mapped_frames.len()
     }

@@ -581,10 +581,16 @@ pub(crate) fn finish_switch() {
             if let (Some(space), address) = (space, address)
                 && address != 0
             {
-                let _ = space.lock().write_bytes(address, &0u32.to_le_bytes());
+                let root = {
+                    let mut space = space.lock();
+                    let root = space.root_physical();
+                    let _ = space.write_bytes(address, &0u32.to_le_bytes());
+                    root
+                };
                 // Publish the cleared word before the exit becomes observable
                 // to another CPU waiting on it.
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                crate::ipc::futex::wake_cleared(root, address, 1);
             }
         } else {
             let mut task = retired.value.lock();

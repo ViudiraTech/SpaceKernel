@@ -32,6 +32,7 @@ typedef unsigned short u16;
 #define SYS_GETTID 186
 #define SYS_RT_SIGPENDING 127
 #define SYS_EXIT_GROUP 231
+#define SYS_FUTEX 202
 
 #define SIGUSR1 10
 #define SIGUSR2 12
@@ -40,6 +41,14 @@ typedef unsigned short u16;
 #define SIG_BLOCK 0
 #define SIG_UNBLOCK 1
 #define SIG_SETMASK 2
+
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+#define FUTEX_WAIT_BITSET 9
+#define FUTEX_WAKE_BITSET 10
+#define FUTEX_PRIVATE_FLAG 128
+
+#define ETIMEDOUT 110
 
 #define SA_SIGINFO 4
 #define SA_RESTORER 0x04000000
@@ -104,6 +113,9 @@ static inline i64 sys_rt_sigprocmask(i64 how, const u64 *set, u64 *old, u64 size
 }
 static inline i64 sys_rt_sigpending(u64 *set, u64 size) {
     return syscall3(SYS_RT_SIGPENDING, (i64)set, size, 0);
+}
+static inline i64 sys_futex(u64 address, i64 op, u32 value, u64 timeout, u64 address2, u32 value3) {
+    return syscall6(SYS_FUTEX, (i64)address, op, value, (i64)timeout, (i64)address2, value3);
 }
 
 extern i64 clone_thread(u64 flags, void *stack, volatile i32 *child_tid);
