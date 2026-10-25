@@ -53,20 +53,15 @@ make debug                 # QEMU 暂停在启动处，GDB 端口 1234
 
 `make test` 的 x86_64 项使用 VirtIO GPU/Venus 设备；如果宿主机没有 `/dev/dri/renderD128`，可用 `tools/qemu_test.py --gpu 2d` 运行无 3D 的显示链路测试。
 
-## 保密与使用限制
+## 使用与授权
 
-**Confidential — Internal Use Only. Copyright (C) 2026 ViudiraTech. All rights reserved.**
+**Copyright (C) 2026 ViudiraTech. All rights reserved.**
 
-本仓库及其中的源代码、设计文档、测试数据、构建产物、Logo、名称和商标均属于 ViudiraTech 的保密信息。本仓库未附带开源许可证，不构成任何形式的开源授权、分发许可或商业使用许可。
+本仓库为公开源码仓库，用于开发、构建、验证与安全审计。仓库未附带开源许可证；公开可见不代表授予复制、修改、分发、再许可或商业使用的权利。
 
-未经 ViudiraTech 书面授权，禁止：
+SpaceOS、SpaceOS-9、SpaceKernel、SPK 名称与 Logo 归 ViudiraTech 所有。第三方组件（包括构建时获取的 Limine、musl、BusyBox 等）遵循各自许可证；本仓库不包含这些第三方源码或二进制。
 
-- 向任何第三方披露、分发、转售或公开展示本仓库的任何部分；
-- 将本仓库内容上传到公共代码托管、网盘、论坛、公共 AI 模型或其他不受控环境；
-- 基于本仓库创建衍生作品并对外发布；
-- 移除、修改或隐藏版权、保密、归属和商标标识。
-
-内部使用应遵循最小权限和按需知悉原则。如发现泄露、未授权访问或安全问题，请立即通过私有渠道联系项目维护者。
+如需合作、商用授权或安全报告，请通过项目维护者的私有渠道联系。
 
 ## 文档
 

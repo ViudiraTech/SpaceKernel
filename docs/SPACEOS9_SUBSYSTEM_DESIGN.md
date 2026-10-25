@@ -6,7 +6,7 @@
 
 ## 已完成的仓库操作
 
-远端仓库已从 `ViudiraTech/SpaceKernel` 改为 [ViudiraTech/SpaceOS-9](https://github.com/ViudiraTech/SpaceOS-9)，GitHub API 复查结果为 `private: true`、`visibility: private`。本地 `origin` 的 fetch/push 地址均已更新。
+远端仓库已从 `ViudiraTech/SpaceKernel` 改为 [ViudiraTech/SpaceOS-9](https://github.com/ViudiraTech/SpaceOS-9)，并已于 2026-10-25 切换为公开仓库（`visibility: public`）。本地 `origin` 的 fetch/push 地址均已更新。
 
 本轮没有修改 Cargo 包名、镜像名或工作区目录名；内核功能源码的改动从 2026-10-25 的实现轮次开始。
 
