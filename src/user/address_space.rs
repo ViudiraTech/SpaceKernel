@@ -343,7 +343,7 @@ impl UserAddressSpace {
             kernel: pmm::phys_to_virt(physical) as u64,
             uncached: false,
             prot,
-            max_prot: if owner.is_some() { 3 } else { 7 },
+            max_prot: 7,
             owned,
             cow: false,
             owner,

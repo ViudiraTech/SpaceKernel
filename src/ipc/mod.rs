@@ -10,6 +10,7 @@
 
 pub mod epoll;
 pub mod futex;
+pub mod memfd;
 pub mod signalfd;
 pub mod timerfd;
 pub mod unix;
@@ -1004,6 +1005,26 @@ fn anon_fd(
 ) -> i64 {
     let flags = abi::O_RDWR | if nonblock { O_NONBLOCK } else { 0 };
     let file = Arc::new(OpenFile::new(inode, name, flags));
+    match alloc_file(file, cloexec) {
+        Ok(fd) => fd as i64,
+        Err(error) => error.to_errno(),
+    }
+}
+
+pub fn memfd_create(name: u64, flags: u32) -> i64 {
+    if flags & !(memfd::MFD_CLOEXEC | memfd::MFD_ALLOW_SEALING) != 0 {
+        return -abi::EINVAL;
+    }
+    let name = match uaccess::string(name, 250) {
+        Ok(name) => name,
+        Err(error) => return error.to_errno(),
+    };
+    let (memfd, cloexec) = match memfd::MemFd::create(name, flags) {
+        Ok(memfd) => memfd,
+        Err(error) => return error.to_errno(),
+    };
+    let path = memfd.file_name();
+    let file = Arc::new(OpenFile::new(memfd, path, abi::O_RDWR));
     match alloc_file(file, cloexec) {
         Ok(fd) => fd as i64,
         Err(error) => error.to_errno(),

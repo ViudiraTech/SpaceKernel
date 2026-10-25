@@ -798,7 +798,7 @@ pub fn ipc_advanced() {
         signal::{self, SIGUSR1},
         sync::SpinLock,
         syscall::{dispatch, numbers::*},
-        vfs::abi,
+        vfs::{self, abi},
     };
     use alloc::sync::Arc;
 
@@ -1032,6 +1032,296 @@ pub fn ipc_advanced() {
     assert_eq!(
         u64::from_le_bytes(current[8..16].try_into().unwrap()),
         10_000_000
+    );
+
+    // Nonblocking pipe: capacity, PIPE_BUF atomicity failure, poll, EOF.
+    assert_eq!(
+        dispatch(SYS_PIPE2, 0x10600, abi::O_NONBLOCK as u64, 0, 0, 0, 0),
+        0
+    );
+    let mut pipefds = [0i32; 2];
+    scratch
+        .lock()
+        .read_bytes(0x10600, unsafe {
+            core::slice::from_raw_parts_mut(pipefds.as_mut_ptr() as *mut u8, 8)
+        })
+        .unwrap();
+    scratch
+        .lock()
+        .write_bytes(0x10700, &[0x5au8; 4096])
+        .unwrap();
+    for _ in 0..16 {
+        assert_eq!(
+            dispatch(SYS_WRITE, pipefds[1] as u64, 0x10700, 4096, 0, 0, 0),
+            4096
+        );
+    }
+    assert_eq!(
+        dispatch(SYS_WRITE, pipefds[1] as u64, 0x10700, 1, 0, 0, 0),
+        -abi::EAGAIN,
+        "PIPE_BUF write must not split when the pipe is full"
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut pollfd = [0u8; 8];
+        pollfd[0..4].copy_from_slice(&pipefds[1].to_le_bytes());
+        pollfd[4..6].copy_from_slice(&4u16.to_le_bytes());
+        scratch.lock().write_bytes(0x10680, &pollfd).unwrap();
+        assert_eq!(dispatch(SYS_POLL, 0x10680, 1, 0, 0, 0, 0), 0);
+        assert_eq!(
+            dispatch(SYS_READ, pipefds[0] as u64, 0x10800, 4096, 0, 0, 0),
+            4096
+        );
+        scratch.lock().write_bytes(0x10680, &pollfd).unwrap();
+        assert_eq!(dispatch(SYS_POLL, 0x10680, 1, 0, 0, 0, 0), 1);
+    }
+    assert_eq!(dispatch(SYS_CLOSE, pipefds[1] as u64, 0, 0, 0, 0, 0), 0);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut pollfd = [0u8; 8];
+        pollfd[0..4].copy_from_slice(&pipefds[0].to_le_bytes());
+        pollfd[4..6].copy_from_slice(&1u16.to_le_bytes());
+        scratch.lock().write_bytes(0x10680, &pollfd).unwrap();
+        assert_eq!(dispatch(SYS_POLL, 0x10680, 1, 0, 0, 0, 0), 1);
+        scratch.lock().read_bytes(0x10680, &mut pollfd).unwrap();
+        assert_ne!(
+            u16::from_le_bytes(pollfd[6..8].try_into().unwrap()) & 0x10,
+            0
+        );
+    }
+    let mut total = 0;
+    for _ in 0..32 {
+        let count = dispatch(SYS_READ, pipefds[0] as u64, 0x10800, 4096, 0, 0, 0);
+        if count == 0 {
+            break;
+        }
+        total += count;
+    }
+    assert_eq!(total, 65536 - 4096);
+    assert_eq!(
+        dispatch(SYS_READ, pipefds[0] as u64, 0x10800, 4096, 0, 0, 0),
+        0
+    );
+    assert_eq!(dispatch(SYS_CLOSE, pipefds[0] as u64, 0, 0, 0, 0, 0), 0);
+
+    // A blocking read wakes when another task writes to the same open file.
+    assert_eq!(dispatch(SYS_PIPE2, 0x10610, 0, 0, 0, 0, 0), 0);
+    let mut blocking = [0i32; 2];
+    scratch
+        .lock()
+        .read_bytes(0x10610, unsafe {
+            core::slice::from_raw_parts_mut(blocking.as_mut_ptr() as *mut u8, 8)
+        })
+        .unwrap();
+    let writer = vfs::current_fd_table()
+        .lock()
+        .get(blocking[1] as usize)
+        .unwrap()
+        .file;
+    crate::sched::spawn(
+        move || {
+            crate::sched::sleep_micros(10_000);
+            let _ = writer.write(b"z");
+        },
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(SYS_READ, blocking[0] as u64, 0x10620, 1, 0, 0, 0),
+        1
+    );
+    let mut byte = [0u8; 1];
+    scratch.lock().read_bytes(0x10620, &mut byte).unwrap();
+    assert_eq!(byte[0], b'z');
+    assert_eq!(dispatch(SYS_CLOSE, blocking[0] as u64, 0, 0, 0, 0, 0), 0);
+    assert_eq!(dispatch(SYS_CLOSE, blocking[1] as u64, 0, 0, 0, 0, 0), 0);
+
+    // memfd: read/write, ftruncate, MAP_SHARED coherence and seals.
+    scratch
+        .lock()
+        .write_bytes(0x10900, b"/memfd-test\0")
+        .unwrap();
+    let mfd = dispatch(SYS_MEMFD_CREATE, 0x10900, 2, 0, 0, 0, 0);
+    assert!(mfd >= 0, "memfd_create={}", mfd);
+    scratch.lock().write_bytes(0x10920, b"hello").unwrap();
+    assert_eq!(dispatch(SYS_WRITE, mfd as u64, 0x10920, 5, 0, 0, 0), 5);
+    assert_eq!(dispatch(SYS_LSEEK, mfd as u64, 0, 0, 0, 0, 0), 0);
+    assert_eq!(dispatch(SYS_READ, mfd as u64, 0x10930, 5, 0, 0, 0), 5);
+    let mut mem = [0u8; 16];
+    scratch.lock().read_bytes(0x10930, &mut mem[..5]).unwrap();
+    assert_eq!(&mem[..5], b"hello");
+    assert_eq!(dispatch(SYS_FTRUNCATE, mfd as u64, 8192, 0, 0, 0, 0), 0);
+    let mapped = dispatch(SYS_MMAP, 0, 8192, 3, 1, mfd as u64, 0);
+    assert!(mapped > 0, "memfd mmap={}", mapped);
+    scratch
+        .lock()
+        .write_bytes(mapped as u64, b"SHARED")
+        .unwrap();
+    assert_eq!(dispatch(SYS_LSEEK, mfd as u64, 0, 0, 0, 0, 0), 0);
+    assert_eq!(dispatch(SYS_READ, mfd as u64, 0x10940, 6, 0, 0, 0), 6);
+    scratch.lock().read_bytes(0x10940, &mut mem[..6]).unwrap();
+    assert_eq!(&mem[..6], b"SHARED");
+    scratch
+        .lock()
+        .read_bytes(mapped as u64, &mut mem[..6])
+        .unwrap();
+    assert_eq!(&mem[..6], b"SHARED");
+    // SHRINK|GROW seals block truncate in both directions.
+    let seal_result = dispatch(SYS_FCNTL, mfd as u64, 1033, 6, 0, 0, 0);
+    assert!(seal_result == 0, "F_ADD_SEALS returned {}", seal_result);
+    let grow_result = dispatch(SYS_FTRUNCATE, mfd as u64, 16384, 0, 0, 0, 0);
+    assert!(
+        grow_result == -abi::EPERM,
+        "grow truncate returned {}",
+        grow_result
+    );
+    assert_eq!(
+        dispatch(SYS_FTRUNCATE, mfd as u64, 4096, 0, 0, 0, 0),
+        -abi::EPERM
+    );
+    // A writable shared mapping is still live, so F_SEAL_WRITE is EBUSY.
+    let busy_result = dispatch(SYS_FCNTL, mfd as u64, 1033, 8, 0, 0, 0);
+    assert!(
+        busy_result == -abi::EBUSY,
+        "F_ADD_SEALS WRITE returned {}",
+        busy_result
+    );
+    assert_eq!(dispatch(SYS_FCNTL, mfd as u64, 1034, 0, 0, 0, 0), 6);
+    assert_eq!(dispatch(SYS_MUNMAP, mapped as u64, 8192, 0, 0, 0, 0), 0);
+    assert_eq!(dispatch(SYS_CLOSE, mfd as u64, 0, 0, 0, 0, 0), 0);
+
+    // Without MFD_ALLOW_SEALING the file starts F_SEAL_SEAL.
+    scratch
+        .lock()
+        .write_bytes(0x10900, b"/memfd-plain\0")
+        .unwrap();
+    let plain = dispatch(SYS_MEMFD_CREATE, 0x10900, 0, 0, 0, 0, 0);
+    assert!(plain >= 0);
+    assert_eq!(
+        dispatch(SYS_FCNTL, plain as u64, 1033, 1, 0, 0, 0),
+        -abi::EPERM
+    );
+    assert_eq!(dispatch(SYS_FCNTL, plain as u64, 1034, 0, 0, 0, 0), 1);
+    assert_eq!(dispatch(SYS_CLOSE, plain as u64, 0, 0, 0, 0, 0), 0);
+
+    // F_SEAL_FUTURE_WRITE blocks later write() and writable shared mmap.
+    scratch
+        .lock()
+        .write_bytes(0x10900, b"/memfd-future\0")
+        .unwrap();
+    let future = dispatch(SYS_MEMFD_CREATE, 0x10900, 2, 0, 0, 0, 0);
+    assert!(future >= 0);
+    assert_eq!(dispatch(SYS_FTRUNCATE, future as u64, 4096, 0, 0, 0, 0), 0);
+    assert_eq!(dispatch(SYS_FCNTL, future as u64, 1033, 16, 0, 0, 0), 0);
+    assert_eq!(
+        dispatch(SYS_WRITE, future as u64, 0x10920, 1, 0, 0, 0),
+        -abi::EPERM
+    );
+    assert_eq!(
+        dispatch(SYS_MMAP, 0, 4096, 3, 1, future as u64, 0),
+        -abi::EPERM
+    );
+    assert_eq!(dispatch(SYS_CLOSE, future as u64, 0, 0, 0, 0, 0), 0);
+
+    // FIFO: mknod, nonblocking ENXIO without a reader, data and EPIPE.
+    scratch
+        .lock()
+        .write_bytes(0x10900, b"/tmp/fifo-test\0")
+        .unwrap();
+    assert_eq!(
+        dispatch(
+            SYS_MKNODAT,
+            abi::AT_FDCWD as i64 as u64,
+            0x10900,
+            (0o010000 | 0o666) as u64,
+            0,
+            0,
+            0
+        ),
+        0
+    );
+    assert_eq!(
+        vfs::lookup_abs("/tmp/fifo-test", true)
+            .unwrap()
+            .0
+            .metadata()
+            .unwrap()
+            .kind,
+        vfs::InodeKind::Fifo
+    );
+    assert_eq!(
+        dispatch(
+            SYS_OPENAT,
+            abi::AT_FDCWD as i64 as u64,
+            0x10900,
+            (abi::O_WRONLY | abi::O_NONBLOCK) as u64,
+            0,
+            0,
+            0
+        ),
+        -6,
+        "O_WRONLY|O_NONBLOCK without a reader must return ENXIO"
+    );
+    let fifo_reader = dispatch(
+        SYS_OPENAT,
+        abi::AT_FDCWD as i64 as u64,
+        0x10900,
+        (abi::O_RDONLY | abi::O_NONBLOCK) as u64,
+        0,
+        0,
+        0,
+    );
+    assert!(fifo_reader >= 0);
+    let fifo_writer = dispatch(
+        SYS_OPENAT,
+        abi::AT_FDCWD as i64 as u64,
+        0x10900,
+        (abi::O_WRONLY | abi::O_NONBLOCK) as u64,
+        0,
+        0,
+        0,
+    );
+    assert!(fifo_writer >= 0);
+    scratch.lock().write_bytes(0x10920, b"abc").unwrap();
+    assert_eq!(
+        dispatch(SYS_WRITE, fifo_writer as u64, 0x10920, 3, 0, 0, 0),
+        3
+    );
+    assert_eq!(
+        dispatch(SYS_READ, fifo_reader as u64, 0x10930, 3, 0, 0, 0),
+        3
+    );
+    scratch.lock().read_bytes(0x10930, &mut mem[..3]).unwrap();
+    assert_eq!(&mem[..3], b"abc");
+    assert_eq!(dispatch(SYS_CLOSE, fifo_reader as u64, 0, 0, 0, 0, 0), 0);
+    assert_eq!(
+        dispatch(SYS_WRITE, fifo_writer as u64, 0x10920, 1, 0, 0, 0),
+        -abi::EPIPE
+    );
+    assert_eq!(dispatch(SYS_CLOSE, fifo_writer as u64, 0, 0, 0, 0, 0), 0);
+    assert_eq!(
+        dispatch(
+            SYS_UNLINKAT,
+            abi::AT_FDCWD as i64 as u64,
+            0x10900,
+            0,
+            0,
+            0,
+            0
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            SYS_OPENAT,
+            abi::AT_FDCWD as i64 as u64,
+            0x10900,
+            abi::O_RDONLY as u64,
+            0,
+            0,
+            0
+        ),
+        -abi::ENOENT
     );
 
     for fd in [epfd, ep2, ep3, efd, tfd] {

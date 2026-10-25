@@ -353,6 +353,16 @@ pub fn send_to_process(pid: u64, signal: Signal) -> bool {
     true
 }
 
+/// Raise SIGPIPE for a failed write on a pipe/socket in the current process.
+pub fn raise_sigpipe() {
+    if let Some(task) = sched::current() {
+        let stats = task.stats();
+        if stats.user {
+            let _ = send_to_process(stats.tgid, Signal::kernel(SIGPIPE));
+        }
+    }
+}
+
 /// Deliver a kernel-generated signal to a process group (TTY control).
 pub fn send_to_pgrp(pgid: u64, number: u32) -> bool {
     if number == 0 || number > SIGRTMAX {

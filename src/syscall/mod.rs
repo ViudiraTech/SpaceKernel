@@ -218,6 +218,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
         SYS_GETPGID => process::getpgid(arg0 as i64),
         SYS_SETSID => process::setsid(),
         SYS_GETSID => process::getsid(arg0 as i64),
+        SYS_MEMFD_CREATE => crate::ipc::memfd_create(arg0, arg1 as u32),
         SYS_EPOLL_CREATE1 => crate::ipc::epoll_create1(arg0 as u32),
         #[cfg(target_arch = "x86_64")]
         SYS_EPOLL_CREATE => crate::ipc::epoll_create(arg0 as i32),
@@ -653,6 +654,17 @@ fn sys_fcntl(fd: i32, cmd: u32, arg: u64) -> i64 {
                 Err(e) => e.to_errno(),
             }
         }
+        abi::F_ADD_SEALS => match crate::ipc::memfd::instance(fd as u64) {
+            Ok(memfd) => match memfd.add_seals(arg as u32) {
+                Ok(()) => 0,
+                Err(error) => error.to_errno(),
+            },
+            Err(error) => error.to_errno(),
+        },
+        abi::F_GET_SEALS => match crate::ipc::memfd::instance(fd as u64) {
+            Ok(memfd) => memfd.seals() as i64,
+            Err(error) => error.to_errno(),
+        },
         abi::F_GETFL => entry.file.flags() as i64,
         abi::F_SETFL => match entry.file.set_flags(arg as u32) {
             Ok(()) => 0,

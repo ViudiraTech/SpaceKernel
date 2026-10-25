@@ -36,6 +36,9 @@ pub fn mknodat(dirfd: i32, pointer: u64, mode: u32, rdev: u64) -> i64 {
             0 | vfs::abi::S_IFREG => {
                 parent.create(&name, InodeKind::Regular, mode & 0o7777)?;
             }
+            vfs::abi::S_IFIFO => {
+                parent.create(&name, InodeKind::Fifo, mode & 0o7777)?;
+            }
             _ => return Err(VfsError::NotSupported),
         }
         Ok(())

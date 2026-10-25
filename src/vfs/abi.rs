@@ -98,6 +98,8 @@ pub const F_SETFD: u32 = 2;
 pub const F_GETFL: u32 = 3;
 pub const F_SETFL: u32 = 4;
 pub const F_DUPFD_CLOEXEC: u32 = 1030;
+pub const F_ADD_SEALS: u32 = 1033;
+pub const F_GET_SEALS: u32 = 1034;
 pub const FD_CLOEXEC: u32 = 1;
 
 // File Mode S_IFMT Bits

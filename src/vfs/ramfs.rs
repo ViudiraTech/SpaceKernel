@@ -189,9 +189,10 @@ impl Inode for RamInode {
                 if children.contains_key(name) {
                     return Err(VfsError::AlreadyExists);
                 }
-                let node = match kind {
+                let node: Arc<dyn Inode> = match kind {
                     InodeKind::Regular => RamInode::new_file(mode),
                     InodeKind::Directory => RamInode::new_dir(mode),
+                    InodeKind::Fifo => super::FifoInode::new(),
                     _ => return Err(VfsError::NotSupported),
                 };
                 children.insert(String::from(name), node.clone());

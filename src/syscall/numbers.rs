@@ -214,6 +214,8 @@ pub const SYS_TIMERFD_CREATE: u64 = 283;
 pub const SYS_TIMERFD_SETTIME: u64 = 286;
 #[cfg(target_arch = "x86_64")]
 pub const SYS_TIMERFD_GETTIME: u64 = 287;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_MEMFD_CREATE: u64 = 319;
 
 // asm-generic/unistd.h numbers for AArch64 and RISC-V 64
 #[cfg(not(target_arch = "x86_64"))]
@@ -332,6 +334,8 @@ pub const SYS_TIMERFD_CREATE: u64 = 85;
 pub const SYS_TIMERFD_SETTIME: u64 = 86;
 #[cfg(not(target_arch = "x86_64"))]
 pub const SYS_TIMERFD_GETTIME: u64 = 87;
+#[cfg(not(target_arch = "x86_64"))]
+pub const SYS_MEMFD_CREATE: u64 = 279;
 #[cfg(not(target_arch = "x86_64"))]
 pub const SYS_GETDENTS64: u64 = 61;
 #[cfg(not(target_arch = "x86_64"))]

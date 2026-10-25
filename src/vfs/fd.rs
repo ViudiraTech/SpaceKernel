@@ -19,6 +19,7 @@ use crate::{
     tty::{self, ReadError, TtyDevice},
 };
 use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 pub const MAX_FDS: usize = 256;
 
@@ -100,15 +101,88 @@ impl Inode for ConsoleInode {
     }
 }
 
-struct PipeBuffer {
-    queue: VecDeque<u8>,
-    write_closed: bool,
-    read_closed: bool,
+pub(crate) struct PipeBuffer {
+    pub(crate) queue: VecDeque<u8>,
+    pub(crate) readers: u32,
+    pub(crate) writers: u32,
+}
+
+pub(crate) const PIPE_CAPACITY: usize = 64 * 1024;
+const PIPE_BUF: usize = 4096;
+
+pub(crate) fn pipe_read(
+    shared: &SpinLock<PipeBuffer>,
+    nonblock: bool,
+    buf: &mut [u8],
+) -> Result<usize, VfsError> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        let mut pipe = shared.lock();
+        if !pipe.queue.is_empty() {
+            let count = buf.len().min(pipe.queue.len());
+            for slot in &mut buf[..count] {
+                *slot = pipe.queue.pop_front().unwrap();
+            }
+            return Ok(count);
+        }
+        if pipe.writers == 0 {
+            return Ok(0);
+        }
+        drop(pipe);
+        if nonblock {
+            return Err(VfsError::WouldBlock);
+        }
+        if crate::signal::pending_for_current() {
+            return Err(VfsError::Interrupted);
+        }
+        crate::sched::sleep_micros(1000);
+    }
+}
+
+pub(crate) fn pipe_write(
+    shared: &SpinLock<PipeBuffer>,
+    nonblock: bool,
+    buf: &[u8],
+) -> Result<usize, VfsError> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        let mut pipe = shared.lock();
+        if pipe.readers == 0 {
+            drop(pipe);
+            crate::signal::raise_sigpipe();
+            return Err(VfsError::BrokenPipe);
+        }
+        let available = PIPE_CAPACITY.saturating_sub(pipe.queue.len());
+        let count = if buf.len() <= PIPE_BUF {
+            if available >= buf.len() { buf.len() } else { 0 }
+        } else {
+            available.min(buf.len())
+        };
+        if count != 0 {
+            for &byte in &buf[..count] {
+                pipe.queue.push_back(byte);
+            }
+            return Ok(count);
+        }
+        drop(pipe);
+        if nonblock {
+            return Err(VfsError::WouldBlock);
+        }
+        if crate::signal::pending_for_current() {
+            return Err(VfsError::Interrupted);
+        }
+        crate::sched::sleep_micros(1000);
+    }
 }
 
 pub struct PipeEndInode {
     shared: Arc<SpinLock<PipeBuffer>>,
     is_writer: bool,
+    nonblock: AtomicBool,
     ino: u64,
 }
 
@@ -122,51 +196,41 @@ impl Inode for PipeEndInode {
         if self.is_writer {
             return Err(VfsError::BadFileDescriptor);
         }
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        let mut pipe = self.shared.lock();
-        if pipe.queue.is_empty() {
-            if pipe.write_closed {
-                return Ok(0);
-            }
-            return Err(VfsError::WouldBlock);
-        }
-        let count = buf.len().min(pipe.queue.len());
-        for slot in &mut buf[..count] {
-            *slot = pipe.queue.pop_front().unwrap();
-        }
-        Ok(count)
+        pipe_read(&self.shared, self.nonblock.load(Ordering::Acquire), buf)
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
         if !self.is_writer {
             return Err(VfsError::BadFileDescriptor);
         }
-        let mut pipe = self.shared.lock();
-        if pipe.read_closed {
-            return Err(VfsError::BrokenPipe);
-        }
-        for &b in buf {
-            pipe.queue.push_back(b);
-        }
-        Ok(buf.len())
+        pipe_write(&self.shared, self.nonblock.load(Ordering::Acquire), buf)
     }
 
     fn poll(&self) -> u32 {
         let pipe = self.shared.lock();
         if self.is_writer {
-            if pipe.read_closed { 0x08 } else { 0x04 }
+            let mut events = 0;
+            if pipe.readers == 0 {
+                events |= 0x08; // POLLERR
+            } else if pipe.queue.len() < PIPE_CAPACITY {
+                events |= 0x04; // POLLOUT
+            }
+            events
         } else {
-            let mut revents = 0;
+            let mut events = 0;
             if !pipe.queue.is_empty() {
-                revents |= 0x01;
+                events |= 0x01; // POLLIN
             }
-            if pipe.write_closed {
-                revents |= 0x10;
+            if pipe.writers == 0 {
+                events |= 0x10; // POLLHUP
             }
-            revents
+            events
         }
+    }
+
+    fn set_nonblock(&self, nonblock: bool) -> Result<(), VfsError> {
+        self.nonblock.store(nonblock, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -174,9 +238,9 @@ impl Drop for PipeEndInode {
     fn drop(&mut self) {
         let mut pipe = self.shared.lock();
         if self.is_writer {
-            pipe.write_closed = true;
+            pipe.writers = pipe.writers.saturating_sub(1);
         } else {
-            pipe.read_closed = true;
+            pipe.readers = pipe.readers.saturating_sub(1);
         }
     }
 }
@@ -189,19 +253,22 @@ pub fn create_pipe_pair_with_flags(extra_flags: u32) -> (Arc<OpenFile>, Arc<Open
     let status_flags = extra_flags & abi::O_NONBLOCK;
     let shared = Arc::new(SpinLock::new(PipeBuffer {
         queue: VecDeque::with_capacity(4096),
-        write_closed: false,
-        read_closed: false,
+        readers: 1,
+        writers: 1,
     }));
     let r_ino = super::tree::ino();
     let w_ino = super::tree::ino();
+    let nonblock = status_flags & abi::O_NONBLOCK != 0;
     let read_inode: Arc<dyn Inode> = Arc::new(PipeEndInode {
         shared: shared.clone(),
         is_writer: false,
+        nonblock: AtomicBool::new(nonblock),
         ino: r_ino,
     });
     let write_inode: Arc<dyn Inode> = Arc::new(PipeEndInode {
         shared,
         is_writer: true,
+        nonblock: AtomicBool::new(nonblock),
         ino: w_ino,
     });
     let reader = Arc::new(OpenFile::new(

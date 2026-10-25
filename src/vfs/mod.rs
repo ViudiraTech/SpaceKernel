@@ -17,6 +17,7 @@ pub mod devfs;
 pub mod devtmpfs;
 pub mod fat32;
 pub mod fd;
+pub mod fifo;
 pub mod inode;
 pub mod path;
 pub mod procfs;
@@ -29,6 +30,7 @@ pub mod tree;
 pub use fd::{
     FdEntry, FileDescriptorTable, OpenFile, create_pipe_pair, create_pipe_pair_with_flags,
 };
+pub use fifo::FifoInode;
 pub use inode::{DirEntry, FileSystem, Inode, InodeKind, Stat, StatFs, VfsError};
 pub use path::{normalize_path, split_parent_name};
 
