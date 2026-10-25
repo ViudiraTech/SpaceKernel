@@ -91,6 +91,16 @@ pub fn loadavg() -> [(u64, u64); 3] {
     out
 }
 static COMPLETED: AtomicU64 = AtomicU64::new(0);
+static INIT_PID: AtomicU64 = AtomicU64::new(0);
+
+/// PID 1 is only considered established once an init image has been started.
+pub fn init_pid() -> u64 {
+    INIT_PID.load(Ordering::Acquire)
+}
+
+pub fn set_init_pid(pid: u64) {
+    INIT_PID.store(pid, Ordering::Release);
+}
 
 struct Scheduler {
     cpus: Vec<Cpu>,
@@ -605,16 +615,27 @@ pub(crate) fn finish_switch() {
                 task::push_zombie(retired.value.clone());
             }
             if !group_has_live_threads(stats.tgid) {
+                let init = init_pid();
+                if init != 0 && stats.tgid == init {
+                    // Linux panics rather than leaving a namespace without init.
+                    crate::printk::emergency(format_args!(
+                        "PID 1 (init) exited with status {:#x}",
+                        stats.exit_code
+                    ));
+                    loop {
+                        arch::halt();
+                    }
+                }
                 // Orphans are adopted by PID 1 once no thread remains.
                 task::reparent_children(stats.tgid, 1);
-                let code = if stats.exit_code & 0x7f == 0 {
-                    crate::signal::CLD_EXITED
+                let (code, status) = if stats.exit_code & 0x7f == 0 {
+                    (crate::signal::CLD_EXITED, (stats.exit_code >> 8) & 0xff)
                 } else if stats.exit_code & 0x80 != 0 {
-                    crate::signal::CLD_DUMPED
+                    (crate::signal::CLD_DUMPED, stats.exit_code & 0x7f)
                 } else {
-                    crate::signal::CLD_KILLED
+                    (crate::signal::CLD_KILLED, stats.exit_code & 0x7f)
                 };
-                crate::signal::notify_child_exit(stats.ppid, stats.tgid, code);
+                crate::signal::notify_child_exit(stats.ppid, stats.tgid, code, status);
             }
         }
         drop(retired); // Never free the stack while it is still executing.

@@ -32,6 +32,7 @@ typedef unsigned short u16;
 #define SYS_EXECVE 59
 #define SYS_EXIT 60
 #define SYS_WAIT4 61
+#define SYS_WAITID 247
 #define SYS_KILL 62
 #define SYS_SETPGID 109
 #define SYS_GETPGID 121
@@ -47,6 +48,7 @@ typedef unsigned short u16;
 #define SIGSTOP 19
 #define SIGCONT 18
 #define SIGTTIN 21
+#define SIGCHLD 17
 #define SIGQUIT 3
 
 #define SIG_BLOCK 0
@@ -72,6 +74,12 @@ typedef unsigned short u16;
 #define TIOCGSID 0x5429
 
 #define WUNTRACED 2
+#define WEXITED 4
+#define WNOWAIT 0x01000000
+#define P_PID 1
+#define CLD_EXITED 1
+#define CLD_KILLED 2
+#define CLD_DUMPED 3
 #define WCONTINUED 8
 
 #define SA_SIGINFO 4
@@ -125,6 +133,9 @@ static inline i64 sys_kill(i64 pid, i64 sig) {
 }
 static inline i64 sys_wait4(i64 pid, i64 *status, i64 options, i64 rusage) {
     return syscall6(SYS_WAIT4, pid, (i64)status, options, rusage, 0, 0);
+}
+static inline i64 sys_waitid(i64 idtype, i64 id, void *info, i64 options, i64 rusage) {
+    return syscall6(SYS_WAITID, idtype, id, (i64)info, options, rusage, 0);
 }
 static inline i64 sys_setpgid(i64 pid, i64 pgid) {
     return syscall3(SYS_SETPGID, pid, pgid, 0);

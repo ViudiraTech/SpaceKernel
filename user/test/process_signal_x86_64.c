@@ -18,6 +18,11 @@ volatile i32 thread_waiting;
 volatile i32 thread_done;
 volatile i32 thread_loop;
 static volatile i32 futex_never;
+static volatile i32 chld_seen;
+static volatile i32 chld_signal;
+static volatile i32 chld_code;
+static volatile i32 chld_pid;
+static volatile i32 chld_status;
 static char thread_stack[65536] __attribute__((aligned(16)));
 
 static u64 string_length(const char *text) {
@@ -33,14 +38,38 @@ static void fail(const char *why) {
     sys_exit_group(1);
 }
 
-static void handler(int sig) {
+static void handler(int sig, void *info, void *context) {
+    (void)info;
+    (void)context;
     handler_sig = sig;
     handler_count++;
 }
 
-static void terminate_handler(int sig) {
+static void terminate_handler(int sig, void *info, void *context) {
     (void)sig;
+    (void)info;
+    (void)context;
     sys_exit(7);
+}
+
+struct kernel_siginfo {
+    i32 signo;
+    i32 error;
+    i32 code;
+    i32 padding;
+    i32 pid;
+    u32 uid;
+    i32 status;
+};
+
+static void child_handler(int sig, void *info, void *context) {
+    (void)context;
+    struct kernel_siginfo *child = (struct kernel_siginfo *)info;
+    chld_signal = sig;
+    chld_code = child->code;
+    chld_pid = child->pid;
+    chld_status = child->status;
+    chld_seen = 1;
 }
 
 struct kernel_sigaction {
@@ -50,7 +79,7 @@ struct kernel_sigaction {
     u64 mask;
 };
 
-static void install_handler(int sig, void (*fn)(int)) {
+static void install_handler(int sig, void (*fn)(int, void *, void *)) {
     struct kernel_sigaction action;
     action.handler = (void *)fn;
     action.flags = SA_SIGINFO | SA_RESTORER;
@@ -379,6 +408,74 @@ int main(void) {
     }
     if ((status & 0x7f) != SIGTERM) {
         fail("E:execsig\n");
+    }
+
+    /* waitid reports exit details without reaping under WNOWAIT. */
+    child = sys_fork();
+    if (child == 0) {
+        sys_exit(9);
+    }
+    if (child < 0) {
+        fail("E:fork6\n");
+    }
+    struct kernel_siginfo wait_info;
+    for (int tries = 0; tries < 200000; tries++) {
+        for (u64 i = 0; i < sizeof(wait_info); i++) {
+            ((volatile unsigned char *)&wait_info)[i] = 0;
+        }
+        i64 rc = sys_waitid(P_PID, child, &wait_info, WEXITED | WNOWAIT, 0);
+        if (rc == 0) {
+            break;
+        }
+        if (rc != -10) {
+            fail("E:waitid1\n");
+        }
+        sys_sched_yield();
+    }
+    if (wait_info.signo != SIGCHLD || wait_info.code != CLD_EXITED
+        || wait_info.pid != (i32)child || wait_info.status != 9) {
+        fail("E:waitidinfo\n");
+    }
+    /* A second WNOWAIT query must still see the zombie. */
+    if (sys_waitid(P_PID, child, &wait_info, WEXITED | WNOWAIT | 1, 0) != 0) {
+        fail("E:waitid2\n");
+    }
+    status = 0;
+    if (sys_wait4(child, &status, 0, 0) != child) {
+        fail("E:waitidreap\n");
+    }
+
+    /* SIGCHLD siginfo carries CLD_EXITED and the child's exit status. */
+    install_handler(SIGCHLD, child_handler);
+    chld_seen = 0;
+    child = sys_fork();
+    if (child == 0) {
+        sys_exit(7);
+    }
+    status = 0;
+    if (sys_wait4(child, &status, 0, 0) != child) {
+        fail("E:chldwait\n");
+    }
+    for (int i = 0; i < 200000 && chld_seen == 0; i++) {
+        sys_sched_yield();
+    }
+    if (chld_seen == 0 || chld_signal != SIGCHLD || chld_code != CLD_EXITED
+        || chld_pid != (i32)child || chld_status != 7) {
+        fail("E:chldinfo\n");
+    }
+
+    /* A non-COW user fault is reported to wait4 as SIGSEGV death. */
+    child = sys_fork();
+    if (child == 0) {
+        *(volatile int *)0 = 1;
+        sys_exit(1);
+    }
+    status = 0;
+    if (sys_wait4(child, &status, 0, 0) != child) {
+        fail("E:faultwait\n");
+    }
+    if ((status & 0x7f) != 11) {
+        fail("E:faultstatus\n");
     }
 
     const char ok[] = "process/signal ok\n";

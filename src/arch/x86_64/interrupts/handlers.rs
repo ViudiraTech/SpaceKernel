@@ -31,17 +31,25 @@ fn user_return(user: bool) {
         }
     }
 }
+fn fatal_user(name: &str, frame: InterruptStackFrame, code: Option<u64>, signal: u32) -> ! {
+    // Interrupt entry from user mode leaves the kernel GS base parked.
+    unsafe {
+        core::arch::asm!("swapgs", "lfence", options(nostack));
+    }
+    crate::fpu::disable_current();
+    crate::kwarn!(
+        "user fault: {} code={:?} ip={:?}",
+        name,
+        code,
+        frame.instruction_pointer
+    );
+    crate::syscall::set_last_user_exit_code(128 + signal as i32);
+    crate::signal::force_fatal(signal, true)
+}
+
 fn fatal(name: &str, frame: InterruptStackFrame, code: Option<u64>) -> ! {
     if user_entry(&frame) {
-        crate::fpu::disable_current();
-        crate::kwarn!(
-            "user fault: {} code={:?} ip={:?}",
-            name,
-            code,
-            frame.instruction_pointer
-        );
-        crate::syscall::set_last_user_exit_code(128 + 11);
-        crate::sched::exit(128 + 11);
+        fatal_user(name, frame, code, crate::signal::SIGSEGV);
     }
     arch::disable_interrupts();
     printk::emergency(format_args!("{name} code={code:?} frame={frame:#?}"));
@@ -51,29 +59,51 @@ fn fatal(name: &str, frame: InterruptStackFrame, code: Option<u64>) -> ! {
 }
 
 macro_rules! fatal_no_code {
-    ($name:ident, $label:literal) => {
+    ($name:ident, $label:literal, $signal:expr) => {
         pub(super) extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
+            if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+                fatal_user($label, frame, None, $signal);
+            }
             fatal($label, frame, None)
         }
     };
 }
 
 macro_rules! fatal_with_code {
-    ($name:ident, $label:literal) => {
+    ($name:ident, $label:literal, $signal:expr) => {
         pub(super) extern "x86-interrupt" fn $name(frame: InterruptStackFrame, code: u64) {
+            if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+                fatal_user($label, frame, Some(code), $signal);
+            }
             fatal($label, frame, Some(code))
         }
     };
 }
 
-fatal_no_code!(divide_error, "#DE divide error");
-fatal_no_code!(bound_range, "#BR bound range");
-fatal_no_code!(invalid_opcode, "#UD invalid opcode");
-fatal_no_code!(device_not_available, "#NM device unavailable");
-fatal_no_code!(x87_floating_point, "#MF floating point");
-fatal_no_code!(simd_floating_point, "#XM SIMD floating point");
-fatal_no_code!(virtualization, "#HV virtualization");
-fatal_no_code!(unhandled_interrupt, "unhandled interrupt");
+fatal_no_code!(divide_error, "#DE divide error", crate::signal::SIGFPE);
+fatal_no_code!(bound_range, "#BR bound range", crate::signal::SIGSEGV);
+fatal_no_code!(invalid_opcode, "#UD invalid opcode", crate::signal::SIGILL);
+fatal_no_code!(
+    device_not_available,
+    "#NM device unavailable",
+    crate::signal::SIGILL
+);
+fatal_no_code!(
+    x87_floating_point,
+    "#MF floating point",
+    crate::signal::SIGFPE
+);
+fatal_no_code!(
+    simd_floating_point,
+    "#XM SIMD floating point",
+    crate::signal::SIGFPE
+);
+fatal_no_code!(virtualization, "#HV virtualization", crate::signal::SIGSEGV);
+fatal_no_code!(
+    unhandled_interrupt,
+    "unhandled interrupt",
+    crate::signal::SIGSEGV
+);
 
 pub(super) extern "x86-interrupt" fn external<const VECTOR: u8>(frame: InterruptStackFrame) {
     let user = user_entry(&frame);
@@ -87,30 +117,46 @@ pub(super) extern "x86-interrupt" fn external<const VECTOR: u8>(frame: Interrupt
     }
     user_return(user);
 }
-fatal_with_code!(invalid_tss, "#TS invalid TSS");
-fatal_with_code!(segment_not_present, "#NP segment absent");
-fatal_with_code!(stack_segment_fault, "#SS stack segment");
-fatal_with_code!(general_protection, "#GP general protection");
-fatal_with_code!(alignment_check, "#AC alignment");
-fatal_with_code!(cp_protection, "#CP control protection");
+fatal_with_code!(invalid_tss, "#TS invalid TSS", crate::signal::SIGSEGV);
+fatal_with_code!(
+    segment_not_present,
+    "#NP segment absent",
+    crate::signal::SIGSEGV
+);
+fatal_with_code!(
+    stack_segment_fault,
+    "#SS stack segment",
+    crate::signal::SIGSEGV
+);
+fatal_with_code!(
+    general_protection,
+    "#GP general protection",
+    crate::signal::SIGSEGV
+);
+fatal_with_code!(alignment_check, "#AC alignment", crate::signal::SIGBUS);
+fatal_with_code!(
+    cp_protection,
+    "#CP control protection",
+    crate::signal::SIGSEGV
+);
 
 pub(super) extern "x86-interrupt" fn debug_trap(frame: InterruptStackFrame) {
     if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        fatal("#DB debug trap", frame, None);
+        fatal_user("#DB debug trap", frame, None, crate::signal::SIGTRAP);
     }
     printk::emergency(format_args!("#DB debug trap frame={frame:#?}"));
 }
 
 pub(super) extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
     if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        fatal("#BP breakpoint", frame, None);
+        fatal_user("#BP breakpoint", frame, None, crate::signal::SIGTRAP);
     }
     printk::emergency(format_args!("#BP breakpoint frame={frame:#?}"));
 }
 
 pub(super) extern "x86-interrupt" fn overflow(frame: InterruptStackFrame) {
     if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        fatal("#OF overflow", frame, None);
+        fatal_user("#OF overflow", frame, None, crate::signal::SIGSEGV);
     }
     printk::emergency(format_args!("#OF overflow frame={frame:#?}"));
 }
@@ -151,8 +197,8 @@ pub(super) extern "x86-interrupt" fn page_fault(
             code,
             frame.instruction_pointer
         );
-        crate::syscall::set_last_user_exit_code(128 + 11);
-        crate::sched::exit(128 + 11);
+        crate::syscall::set_last_user_exit_code(128 + crate::signal::SIGSEGV as i32);
+        crate::signal::force_fatal(crate::signal::SIGSEGV, true);
     }
     arch::disable_interrupts();
     printk::emergency(format_args!(

@@ -282,6 +282,24 @@ pub fn send_to_process(pid: u64, signal: Signal) -> bool {
     if members.is_empty() {
         return false;
     }
+    if pid == sched::init_pid() && pid != 0 {
+        // Linux SIGNAL_UNKILLABLE: init only receives signals it handles.
+        let leader = members
+            .iter()
+            .find(|member| {
+                let stats = member.stats();
+                stats.ltid == stats.tgid
+            })
+            .unwrap_or(&members[0]);
+        let action = leader.signals().action(signal.number);
+        if action.handler == SIG_DFL
+            || signal.number == SIGKILL
+            || signal.number == SIGSTOP
+            || signal.number == SIGCONT
+        {
+            return true;
+        }
+    }
     if signal.number == SIGCONT {
         // SIGCONT is not blockable and resumes every thread even when it is
         // parked in the default stop action.
@@ -309,7 +327,7 @@ pub fn send_to_process(pid: u64, signal: Signal) -> bool {
             task.stop_reported = false;
             task.continue_pending = true;
         }
-        notify_parent_event(stats.ppid, stats.tgid, CLD_CONTINUED);
+        notify_parent_event(stats.ppid, stats.tgid, CLD_CONTINUED, SIGCONT as i32);
         return true;
     }
     if is_stop_signal(signal.number) {
@@ -384,7 +402,7 @@ fn is_stop_signal(number: u32) -> bool {
     matches!(number, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
 }
 
-fn notify_parent_event(ppid: u64, pid: u64, code: i32) {
+fn notify_parent_event(ppid: u64, pid: u64, code: i32, status: i32) {
     if ppid == 0 {
         return;
     }
@@ -393,7 +411,7 @@ fn notify_parent_event(ppid: u64, pid: u64, code: i32) {
         code,
         pid: pid as u32,
         uid: 0,
-        value: 0,
+        value: status as u32 as u64,
     };
     let _ = send_to_process(ppid, signal);
 }
@@ -671,7 +689,13 @@ mod x86_64 {
         put_u32(bytes, 8, signal.code as u32);
         put_u32(bytes, 16, signal.pid);
         put_u32(bytes, 20, signal.uid);
-        put_u64(bytes, 24, signal.value);
+        if signal.number == SIGCHLD {
+            // _sigchld.si_status occupies the first four bytes of the union
+            // after pid/uid.
+            put_u32(bytes, 24, signal.value as u32);
+        } else {
+            put_u64(bytes, 24, signal.value);
+        }
     }
 
     pub fn setup_frame(
@@ -912,7 +936,7 @@ fn stop_current(task: &sched::TaskRef, signal: u32) {
         task.stop_signal = signal;
         task.stop_reported = false;
     }
-    notify_parent_event(stats.ppid, stats.tgid, CLD_STOPPED);
+    notify_parent_event(stats.ppid, stats.tgid, CLD_STOPPED, signal as i32);
     // SIGCONT clears `stopped` from the sender side; a fatal pending signal
     // also ends the park so the delivery loop can terminate the task.
     while thread.lock().stopped && !pending_for_current() {
@@ -1342,7 +1366,7 @@ pub fn force_fatal(signal: u32, core: bool) -> ! {
 
 /// Send SIGCHLD for a terminating child.  `code` is the `siginfo.si_code`
 /// (CLD_EXITED/CLD_KILLED/CLD_DUMPED).
-pub fn notify_child_exit(ppid: u64, pid: u64, code: i32) {
+pub fn notify_child_exit(ppid: u64, pid: u64, code: i32, status: i32) {
     if ppid == 0 {
         return;
     }
@@ -1351,7 +1375,7 @@ pub fn notify_child_exit(ppid: u64, pid: u64, code: i32) {
         code,
         pid: pid as u32,
         uid: 0,
-        value: 0,
+        value: status as u32 as u64,
     };
     let _ = send_to_process(ppid, signal);
 }

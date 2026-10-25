@@ -38,6 +38,61 @@ pub unsafe fn install_tls(tp: u64) {
     }
 }
 
+/// Start the init process as PID 1.  Must be called before any other user
+/// process so the PID allocator yields 1.
+pub fn spawn_init(data: &[u8], name: &str) -> Result<u64, &'static str> {
+    if sched::init_pid() != 0 {
+        return Err("init already started");
+    }
+    if sched::alloc_pid() != 1 {
+        return Err("PID 1 was already allocated");
+    }
+    let mut space = UserAddressSpace::new()?;
+    let loaded = elf::load_elf(&mut space, data)?;
+    let user_sp = stack::setup_user_stack(&mut space, &loaded, name)?;
+    let space_arc = Arc::new(SpinLock::new(space));
+    let entry_va = loaded.initial_pc;
+    let tls_tp = loaded.tls_tp;
+    let spec = sched::UserTaskSpec {
+        tgid: 1,
+        ltid: 1,
+        ppid: 0,
+        pgid: 1,
+        sid: 1,
+        exit_signal: crate::signal::SIGCHLD,
+        clear_child_tid: 0,
+        fd_table: Arc::new(SpinLock::new(
+            crate::vfs::FileDescriptorTable::new_with_stdio(),
+        )),
+        files_shared: false,
+        fs: Arc::new(SpinLock::new(crate::vfs::FsContext::new())),
+        signals: Arc::new(crate::signal::SignalState::new()),
+        thread_signals: Arc::new(SpinLock::new(crate::signal::ThreadSignals::new())),
+        address_space: space_arc,
+    };
+    sched::spawn_user(
+        move || {
+            kinfo!(
+                "Entering user mode: entry={:#x} sp={:#x}",
+                entry_va,
+                user_sp
+            );
+            // SAFETY: the scheduler installed and activated this address space.
+            unsafe {
+                install_tls(tls_tp);
+                let _ = crate::fpu::enable_user();
+                arch::enter_user_mode(entry_va, user_sp);
+            }
+        },
+        0,
+        sched::CpuMask::all(),
+        spec,
+    )
+    .map_err(|_| "failed to spawn init")?;
+    sched::set_init_pid(1);
+    Ok(1)
+}
+
 pub fn spawn_user_elf(data: &[u8], name: &str) -> Result<u64, &'static str> {
     let mut space = UserAddressSpace::new()?;
     let loaded = elf::load_elf(&mut space, data)?;

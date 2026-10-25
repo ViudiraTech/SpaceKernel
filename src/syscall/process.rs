@@ -650,3 +650,163 @@ pub fn getsid(pid: i64) -> i64 {
         None => -abi::ESRCH,
     }
 }
+
+const P_ALL: u32 = 0;
+const P_PID: u32 = 1;
+const P_PGID: u32 = 2;
+const WSTOPPED: u32 = 2;
+const WEXITED: u32 = 4;
+const WNOWAIT: u32 = 0x0100_0000;
+
+fn write_waitid_info(pointer: u64, code: i32, pid: u64, status: i32) -> Result<(), VfsError> {
+    let mut info = [0u8; 128];
+    info[0..4].copy_from_slice(&(crate::signal::SIGCHLD as i32).to_le_bytes());
+    info[8..12].copy_from_slice(&code.to_le_bytes());
+    info[16..20].copy_from_slice(&(pid as u32).to_le_bytes());
+    info[20..24].copy_from_slice(&0u32.to_le_bytes());
+    info[24..28].copy_from_slice(&status.to_le_bytes());
+    uaccess::write(pointer, &info)
+}
+
+/// Linux waitid(2): idtype/id select the child, WEXITED/WSTOPPED/WCONTINUED
+/// select event classes and WNOWAIT reports without consuming the event.
+pub fn waitid(idtype: u32, id: u32, info: u64, options: u32, rusage: u64) -> i64 {
+    if rusage != 0 {
+        return -abi::ENOSYS;
+    }
+    if options & !(WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT) != 0
+        || options & (WSTOPPED | WEXITED | WCONTINUED) == 0
+        || idtype > P_PGID
+    {
+        return -abi::EINVAL;
+    }
+    if info == 0 {
+        return -abi::EFAULT;
+    }
+    let Some(current) = crate::sched::current() else {
+        return -abi::ESRCH;
+    };
+    let parent = current.stats().tgid;
+    let caller_pgid = current.stats().pgid;
+    let selector_pid = if idtype == P_PID { id as u64 } else { 0 };
+    let selector_pgid = if idtype == P_PGID {
+        if id == 0 { caller_pgid } else { id as u64 }
+    } else {
+        0
+    };
+    let matches = |tgid: u64, pgid: u64| -> bool {
+        match idtype {
+            P_ALL => true,
+            P_PID => tgid == selector_pid,
+            _ => pgid == selector_pgid,
+        }
+    };
+    loop {
+        if options & WEXITED != 0 {
+            for zombie in crate::sched::zombies() {
+                let stats = zombie.stats();
+                if stats.ppid != parent
+                    || !matches(stats.tgid, stats.pgid)
+                    || crate::sched::group_has_live_threads(stats.tgid)
+                {
+                    continue;
+                }
+                let encoded = stats.exit_code;
+                let (code, status) = if encoded & 0x7f == 0 {
+                    (crate::signal::CLD_EXITED, (encoded >> 8) & 0xff)
+                } else if encoded & 0x80 != 0 {
+                    (crate::signal::CLD_DUMPED, encoded & 0x7f)
+                } else {
+                    (crate::signal::CLD_KILLED, encoded & 0x7f)
+                };
+                if options & WNOWAIT == 0 && crate::sched::take_zombie(stats.tgid).is_none() {
+                    continue;
+                }
+                if let Err(error) = write_waitid_info(info, code, stats.tgid, status) {
+                    return error.to_errno();
+                }
+                return 0;
+            }
+        }
+        if options & WSTOPPED != 0 {
+            for task in crate::sched::tasks() {
+                let stats = task.stats();
+                if !stats.user
+                    || stats.ppid != parent
+                    || stats.ltid != stats.tgid
+                    || stats.state == crate::sched::TaskState::Zombie
+                    || !matches(stats.tgid, stats.pgid)
+                {
+                    continue;
+                }
+                let stopped = {
+                    let mut task = task.lock();
+                    if task.stop_signal != 0 && (!task.stop_reported || options & WNOWAIT != 0) {
+                        if options & WNOWAIT == 0 {
+                            task.stop_reported = true;
+                        }
+                        Some(task.stop_signal)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(signal) = stopped {
+                    if let Err(error) = write_waitid_info(
+                        info,
+                        crate::signal::CLD_STOPPED,
+                        stats.tgid,
+                        signal as i32,
+                    ) {
+                        return error.to_errno();
+                    }
+                    return 0;
+                }
+            }
+        }
+        if options & WCONTINUED != 0 {
+            for task in crate::sched::tasks() {
+                let stats = task.stats();
+                if !stats.user
+                    || stats.ppid != parent
+                    || stats.ltid != stats.tgid
+                    || stats.state == crate::sched::TaskState::Zombie
+                    || !matches(stats.tgid, stats.pgid)
+                {
+                    continue;
+                }
+                let continued = {
+                    let mut task = task.lock();
+                    if task.continue_pending {
+                        if options & WNOWAIT == 0 {
+                            task.continue_pending = false;
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if continued {
+                    if let Err(error) = write_waitid_info(
+                        info,
+                        crate::signal::CLD_CONTINUED,
+                        stats.tgid,
+                        crate::signal::SIGCONT as i32,
+                    ) {
+                        return error.to_errno();
+                    }
+                    return 0;
+                }
+            }
+        }
+        if !crate::sched::has_children(parent) {
+            return -abi::ECHILD;
+        }
+        if options & WNOHANG != 0 {
+            return 0;
+        }
+        if crate::signal::pending_for_current() {
+            return -abi::EINTR;
+        }
+        crate::sched::sleep_micros(1000);
+    }
+}
