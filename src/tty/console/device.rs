@@ -26,6 +26,7 @@ pub enum TtyDevice {
 
 /// Raw write to a named TTY. This path deliberately bypasses printk metadata.
 pub fn write(device: TtyDevice, bytes: &[u8]) -> bool {
+    super::DIRTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mut state = CONSOLE.lock();
     match device {
         TtyDevice::Serial0 => {

@@ -30,6 +30,7 @@ pub struct Context {
     pub s9: u64,
     pub s10: u64,
     pub s11: u64,
+    pub tp: u64,
 }
 
 impl Context {
@@ -50,6 +51,7 @@ impl Context {
             s9: 0,
             s10: 0,
             s11: 0,
+            tp: 0,
         }
     }
 }
@@ -86,6 +88,7 @@ pub unsafe extern "C" fn switch(_prev: *mut Context, _next: *const Context) {
         "sd s9, 88(a0)",
         "sd s10, 96(a0)",
         "sd s11, 104(a0)",
+        "sd tp, 112(a0)",
         // Load callee-saved registers from next
         "ld ra, 0(a1)",
         "ld sp, 8(a1)",
@@ -101,6 +104,7 @@ pub unsafe extern "C" fn switch(_prev: *mut Context, _next: *const Context) {
         "ld s9, 88(a1)",
         "ld s10, 96(a1)",
         "ld s11, 104(a1)",
+        "ld tp, 112(a1)",
         "ret",
     )
 }

@@ -200,7 +200,7 @@ menu "Testing & QEMU Validation"
 
 config BOOT_SELF_TEST
     bool "Run automated self-tests at boot"
-    default y
+    default n
     help
       Execute comprehensive smoke tests at boot: CPU/FPU, PMM/VMM/SLAB,
       SMP, EEVDF scheduler preemption/fairness, and user-mode Linux ABI self-tests.

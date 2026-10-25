@@ -15,7 +15,34 @@ use x86_64::{
     structures::idt::{InterruptStackFrame, PageFaultErrorCode},
 };
 
+fn user_entry(frame: &InterruptStackFrame) -> bool {
+    let user = frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
+    if user {
+        unsafe {
+            core::arch::asm!("swapgs", "lfence", options(nostack));
+        }
+    }
+    user
+}
+fn user_return(user: bool) {
+    if user {
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack));
+        }
+    }
+}
 fn fatal(name: &str, frame: InterruptStackFrame, code: Option<u64>) -> ! {
+    if user_entry(&frame) {
+        crate::fpu::disable_current();
+        crate::kwarn!(
+            "user fault: {} code={:?} ip={:?}",
+            name,
+            code,
+            frame.instruction_pointer
+        );
+        crate::syscall::set_last_user_exit_code(128 + 11);
+        crate::sched::exit(128 + 11);
+    }
     arch::disable_interrupts();
     printk::emergency(format_args!("{name} code={code:?} frame={frame:#?}"));
     loop {
@@ -48,9 +75,17 @@ fatal_no_code!(simd_floating_point, "#XM SIMD floating point");
 fatal_no_code!(virtualization, "#HV virtualization");
 fatal_no_code!(unhandled_interrupt, "unhandled interrupt");
 
-pub(super) extern "x86-interrupt" fn external<const VECTOR: u8>(_frame: InterruptStackFrame) {
+pub(super) extern "x86-interrupt" fn external<const VECTOR: u8>(frame: InterruptStackFrame) {
+    let user = user_entry(&frame);
+    crate::fpu::disable_current();
     crate::arch::apic::dispatch(VECTOR);
     crate::sched::irq_exit();
+    if user {
+        unsafe {
+            let _ = crate::fpu::enable_user();
+        }
+    }
+    user_return(user);
 }
 fatal_with_code!(invalid_tss, "#TS invalid TSS");
 fatal_with_code!(segment_not_present, "#NP segment absent");
@@ -60,14 +95,23 @@ fatal_with_code!(alignment_check, "#AC alignment");
 fatal_with_code!(cp_protection, "#CP control protection");
 
 pub(super) extern "x86-interrupt" fn debug_trap(frame: InterruptStackFrame) {
+    if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        fatal("#DB debug trap", frame, None);
+    }
     printk::emergency(format_args!("#DB debug trap frame={frame:#?}"));
 }
 
 pub(super) extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
+    if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        fatal("#BP breakpoint", frame, None);
+    }
     printk::emergency(format_args!("#BP breakpoint frame={frame:#?}"));
 }
 
 pub(super) extern "x86-interrupt" fn overflow(frame: InterruptStackFrame) {
+    if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        fatal("#OF overflow", frame, None);
+    }
     printk::emergency(format_args!("#OF overflow frame={frame:#?}"));
 }
 
@@ -87,6 +131,9 @@ pub(super) extern "x86-interrupt" fn page_fault(
     frame: InterruptStackFrame,
     code: PageFaultErrorCode,
 ) {
+    if frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        fatal("#PF", frame, Some(code.bits()));
+    }
     arch::disable_interrupts();
     printk::emergency(format_args!(
         "#PF address={:?} code={code:?} frame={frame:#?}",

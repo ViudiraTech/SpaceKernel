@@ -9,9 +9,15 @@
  */
 
 use super::{CpuMask, WaitQueue, current, sleep_micros, spawn, spawn_on, yield_now};
-use crate::{arch, boot, fpu, kinfo, smp, time};
+use crate::{arch, boot, fpu, smp, time};
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+macro_rules! sched_log {
+    ($($arg:tt)*) => {
+        $crate::self_test::verbose_log(format_args!($($arg)*))
+    };
+}
 
 fn until(condition: impl Fn() -> bool) {
     let end = time::uptime_micros() + 10_000_000;
@@ -22,7 +28,7 @@ fn until(condition: impl Fn() -> bool) {
 }
 pub fn run() {
     super::model_tests::run();
-    kinfo!("sched test: augmented RB tree / EEVDF fairness / lag passed");
+    sched_log!("sched test: augmented RB tree / EEVDF fairness / lag passed");
     cpu_startup();
     preemption();
     weighted_runtime();
@@ -32,7 +38,7 @@ pub fn run() {
     migration();
     migration_with_live_state();
     stress();
-    kinfo!("scheduler self-test passed");
+    sched_log!("scheduler self-test passed");
 }
 fn cpu_startup() {
     let done = Arc::new(AtomicUsize::new(0));
@@ -60,7 +66,7 @@ fn cpu_startup() {
     }
     until(|| done.load(Ordering::Acquire) == super::cpu_count());
     assert_eq!(smp::online_count(), boot::cpu_count());
-    kinfo!(
+    sched_log!(
         "sched test: {} CPU startup / affinity / hardware ticks passed",
         super::cpu_count()
     );
@@ -96,7 +102,7 @@ fn preemption() {
     )
     .unwrap();
     until(|| done.load(Ordering::Acquire));
-    kinfo!("sched test: hardware timer preemption passed");
+    sched_log!("sched test: hardware timer preemption passed");
 }
 fn weighted_runtime() {
     let started = Arc::new(AtomicUsize::new(0));
@@ -145,7 +151,7 @@ fn weighted_runtime() {
             "hardware weighted fairness: {runtimes:?}"
         );
     }
-    kinfo!(
+    sched_log!(
         "sched test: real weighted CPU service passed {:?}",
         runtimes
     );
@@ -205,7 +211,7 @@ fn waits() {
         .unwrap();
         until(|| done.load(Ordering::Acquire));
     }
-    kinfo!("sched test: FIFO / cross-CPU wake / wake-before-block races passed");
+    sched_log!("sched test: FIFO / cross-CPU wake / wake-before-block races passed");
 }
 fn sleep() {
     let start = time::uptime_micros();
@@ -214,7 +220,7 @@ fn sleep() {
         time::uptime_micros() - start >= 10_000,
         "sleep woke before deadline"
     );
-    kinfo!("sched test: blocking timer sleep passed");
+    sched_log!("sched test: blocking timer sleep passed");
 }
 fn fpu_isolation() {
     let Some(config) = fpu::config() else {
@@ -262,7 +268,7 @@ fn fpu_isolation() {
         .unwrap();
     }
     until(|| done.load(Ordering::Acquire) == 12);
-    kinfo!("sched test: FPU isolation across voluntary / involuntary switches passed");
+    sched_log!("sched test: FPU isolation across voluntary / involuntary switches passed");
 }
 fn migration() {
     if super::cpu_count() == 1 {
@@ -294,7 +300,7 @@ fn migration() {
         moved.load(Ordering::Acquire) > 0,
         "idle CPUs did not migrate queued work"
     );
-    kinfo!(
+    sched_log!(
         "sched test: lag-preserving idle pull migrated {} tasks",
         moved.load(Ordering::Acquire)
     );
@@ -372,7 +378,7 @@ fn migration_with_live_state() {
     until(|| done.load(Ordering::Acquire));
     stop.store(true, Ordering::Release);
     until(|| blockers_done.load(Ordering::Acquire) == 2);
-    kinfo!("sched test: live context / FPU state migration on wake passed");
+    sched_log!("sched test: live context / FPU state migration on wake passed");
 }
 
 fn stress() {
@@ -402,5 +408,5 @@ fn stress() {
     until(|| done.load(Ordering::Acquire) == 64);
     until(|| super::completed_count() >= baseline + 64);
     assert_eq!(count.load(Ordering::Acquire), 64 * 128);
-    kinfo!("sched test: 64 tasks / 8192 yields / off-stack retirement passed");
+    sched_log!("sched test: 64 tasks / 8192 yields / off-stack retirement passed");
 }

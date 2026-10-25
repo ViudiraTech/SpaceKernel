@@ -10,8 +10,68 @@
 
 use alloc::{boxed::Box, vec::Vec};
 
+pub fn verbose() -> bool {
+    crate::boot::cmdline()
+        .split_whitespace()
+        .any(|arg| arg == "verbose" || arg == "selftest=verbose")
+}
+
+pub fn verbose_log(args: core::fmt::Arguments) {
+    if verbose() {
+        crate::printk::record(crate::printk::Level::Info, args);
+    }
+}
+
+pub fn run_early() {
+    run();
+    crate::user::self_test::run();
+    crate::block::run_self_test();
+    crate::vfs::run_self_test();
+    crate::vfs::pseudo_test::devices();
+    // SAFETY: trusted static/stack test buffers, before scheduler/AP release.
+    unsafe {
+        crate::user::uaccess::kernel_test_scope(crate::syscall::run_vfs_syscall_self_test);
+    }
+}
+
+pub fn spawn_late() {
+    crate::sched::spawn_on(
+        crate::boot::bsp_cpu_index(),
+        || {
+            crate::sched::sched_test::run();
+            crate::user::run_self_test().expect("user self-test failed");
+            crate::vfs::pseudo_test::processes();
+            crate::user::self_test::syscalls();
+            let gpu_status = crate::gpu::self_test::run();
+            let rng_status = if crate::random::supported() {
+                "hw"
+            } else {
+                "unsupported(unverified)"
+            };
+            let arch_name = if cfg!(target_arch = "x86_64") {
+                "x86_64"
+            } else if cfg!(target_arch = "aarch64") {
+                "aarch64"
+            } else if cfg!(target_arch = "riscv64") {
+                "riscv64"
+            } else {
+                "unknown"
+            };
+            crate::kinfo!(
+                "SELFTEST_OK arch={} cpu_fpu=ok mm_irq_fdt=ok block=ok vfs_abi=ok dev_sys_proc=ok user_elf=ok sched=ok rng={} gpu={}",
+                arch_name,
+                rng_status,
+                gpu_status,
+            );
+            crate::kinfo!("BOOT_OK");
+        },
+        0,
+    )
+    .expect("scheduler test task allocation failed");
+}
+
 pub fn run() {
-    use crate::{kinfo, mm, printk, tty};
+    use crate::{mm, printk, tty};
 
     let before = mm::pmm::stats().free;
     let frame = mm::pmm::alloc(2).expect("PMM allocation failed");
@@ -149,9 +209,13 @@ pub fn run() {
     }
 
     let sequence = printk::next_sequence();
-    kinfo!("PMM/VMM/SLAB/TTY/IRQ/FDT self-test passed");
+    printk::record(
+        printk::Level::Info,
+        format_args!("printk sequence validation"),
+    );
     let record = printk::read(sequence).expect("printk record missing");
     assert_eq!(record.sequence, sequence);
+    verbose_log(format_args!("PMM/VMM/SLAB/TTY/IRQ/FDT self-test passed"));
 }
 
 /// Verify an actual interrupt entry/return while the FP gate is closed. This
@@ -218,7 +282,7 @@ fn test_timer_interrupt() {
         "timer did not reach the architecture interrupt handler"
     );
     assert!(!arch::fpu::is_enabled());
-    crate::kinfo!("hardware timer IRQ self-test passed");
+    verbose_log(format_args!("hardware timer IRQ self-test passed"));
 }
 
 struct DtbBuilder {

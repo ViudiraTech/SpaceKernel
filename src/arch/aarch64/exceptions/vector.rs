@@ -16,8 +16,21 @@ global_asm!(include_str!("vector.S"));
 
 #[unsafe(no_mangle)]
 extern "C" fn spacekernel_aarch64_irq() {
+    let spsr: u64;
+    // SAFETY: reads the saved processor state of the interrupted context.
+    unsafe {
+        asm!("mrs {spsr}, spsr_el1", spsr = out(reg) spsr, options(nomem, nostack));
+    }
+    let user = (spsr & 15) == 0;
+    crate::fpu::disable_current();
     crate::arch::gic::handle_irq();
     crate::sched::irq_exit();
+    if user {
+        // SAFETY: returning to EL0; the task's FPU state is already restored on switch.
+        unsafe {
+            let _ = crate::fpu::enable_user();
+        }
+    }
 }
 
 unsafe extern "C" {
@@ -38,6 +51,11 @@ extern "C" fn spacekernel_aarch64_exception(vector: u64, original_sp: u64) -> ! 
             far = out(reg) far, spsr = out(reg) spsr, options(nomem, nostack));
     }
     arch::disable_interrupts();
+    if spsr & 15 == 0 {
+        crate::fpu::disable_current();
+        crate::syscall::set_last_user_exit_code(139);
+        crate::sched::exit(139);
+    }
     printk::emergency(format_args!(
         "aarch64 exception vector={vector} ESR={esr:#x} ELR={elr:#x} FAR={far:#x} SPSR={spsr:#x} SP={original_sp:#x}"
     ));

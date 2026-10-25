@@ -10,21 +10,24 @@
 
 //! Linux ABI system call dispatcher integrated with the VFS and scheduler subsystems.
 
+mod memory;
+mod metadata;
 pub mod numbers;
+mod process;
 
 use crate::{
     kinfo, kwarn, sched,
+    user::uaccess,
     vfs::{
         self, FdEntry, VfsError,
         abi::{self, IoVec, LinuxStat, LinuxStatFs, WinSize},
     },
 };
 use alloc::{string::String, vec};
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, Ordering};
 use numbers::*;
 
 static LAST_USER_EXIT_CODE: AtomicI32 = AtomicI32::new(-1);
-static USER_BRK: AtomicU64 = AtomicU64::new(0x0000_0000_2000_0000);
 
 pub fn last_user_exit_code() -> i32 {
     LAST_USER_EXIT_CODE.load(Ordering::Acquire)
@@ -44,18 +47,18 @@ pub extern "C" fn spacekernel_syscall_c(
     arg4: u64,
     arg5: u64,
 ) -> i64 {
-    dispatch(num, arg0, arg1, arg2, arg3, arg4, arg5)
+    crate::fpu::disable_current();
+    crate::arch::enable_interrupts();
+    let result = dispatch(num, arg0, arg1, arg2, arg3, arg4, arg5);
+    crate::arch::disable_interrupts();
+    // SAFETY: the scheduler restored the current task before resuming this syscall.
+    unsafe {
+        let _ = crate::fpu::enable_user();
+    }
+    result
 }
 
-pub fn dispatch(
-    num: u64,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    arg3: u64,
-    _arg4: u64,
-    _arg5: u64,
-) -> i64 {
+pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
     match num {
         // Core File I/O
         SYS_READ => sys_read(arg0 as i32, arg1 as *mut u8, arg2 as usize),
@@ -156,7 +159,23 @@ pub fn dispatch(
         SYS_NANOSLEEP => sys_nanosleep(arg0),
         SYS_EXIT | SYS_EXIT_GROUP => sys_exit(arg0 as i32),
         SYS_SET_TID_ADDRESS => sys_set_tid_address(arg0),
+        SYS_MKNODAT => metadata::mknodat(arg0 as i32, arg1, arg2 as u32, arg3),
+        SYS_FCHMOD => metadata::fchmod(arg0 as i32, arg1 as u32),
+        SYS_FCHMODAT => metadata::fchmodat(arg0 as i32, arg1, arg2 as u32, 0),
+        SYS_FCHOWN => metadata::fchown(arg0 as i32, arg1 as u32, arg2 as u32),
+        SYS_FCHOWNAT => {
+            metadata::fchownat(arg0 as i32, arg1, arg2 as u32, arg3 as u32, arg4 as u32)
+        }
+        SYS_EXECVE => process::execve(arg0, arg1, arg2),
+        SYS_PPOLL => process::ppoll(arg0, arg1, arg2, arg3),
+        #[cfg(target_arch = "x86_64")]
+        SYS_POLL => process::poll(arg0, arg1, arg2 as i32 as i64),
+        SYS_CLOCK_GETTIME => process::clock_gettime(arg0 as u32, arg1),
+        SYS_GETRANDOM => process::getrandom(arg0, arg1 as usize, arg2 as u32),
         SYS_BRK => sys_brk(arg0),
+        SYS_MMAP => memory::mmap(arg0, arg1, arg2 as u32, arg3 as u32, arg4 as i32, arg5),
+        SYS_MUNMAP => memory::munmap(arg0, arg1),
+        SYS_MPROTECT => memory::mprotect(arg0, arg1, arg2 as u32),
         #[cfg(target_arch = "x86_64")]
         SYS_ARCH_PRCTL => sys_arch_prctl(arg0 as u32, arg1),
         _ => {
@@ -167,20 +186,7 @@ pub fn dispatch(
 }
 
 fn read_c_string(ptr: *const u8, max_len: usize) -> Result<String, VfsError> {
-    if ptr.is_null() {
-        return Err(VfsError::Fault);
-    }
-    let mut bytes = alloc::vec::Vec::new();
-    for i in 0..max_len {
-        let b = unsafe { ptr.add(i).read_volatile() };
-        if b == 0 {
-            return core::str::from_utf8(&bytes)
-                .map(String::from)
-                .map_err(|_| VfsError::InvalidArgument);
-        }
-        bytes.push(b);
-    }
-    Err(VfsError::NameTooLong)
+    uaccess::string(ptr as u64, max_len)
 }
 
 fn get_open_file(fd: i32) -> Result<FdEntry, VfsError> {
@@ -230,21 +236,24 @@ fn sys_close(fd: i32) -> i64 {
 }
 
 fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
-    if buf.is_null() {
-        return -abi::EFAULT;
-    }
-    if count == 0 {
-        return 0;
-    }
     let entry = match get_open_file(fd) {
         Ok(e) => e,
         Err(e) => return e.to_errno(),
     };
+    if count == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        return -abi::EFAULT;
+    }
+    if let Err(e) = uaccess::check(buf as u64, count.min(65536), true) {
+        return e.to_errno();
+    }
     let mut kbuf = vec![0u8; count.min(65536)];
     match entry.file.read(&mut kbuf) {
         Ok(n) => {
-            unsafe {
-                core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf, n);
+            if let Err(e) = uaccess::write(buf as u64, &kbuf[..n]) {
+                return e.to_errno();
             }
             n as i64
         }
@@ -253,20 +262,20 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
 }
 
 fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
-    if buf.is_null() {
-        return -abi::EFAULT;
-    }
-    if count == 0 {
-        return 0;
-    }
     let entry = match get_open_file(fd) {
         Ok(e) => e,
         Err(e) => return e.to_errno(),
     };
+    if count == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        return -abi::EFAULT;
+    }
     let limit = count.min(65536);
     let mut kbuf = vec![0u8; limit];
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf, kbuf.as_mut_ptr(), limit);
+    if let Err(e) = uaccess::read(buf as u64, &mut kbuf) {
+        return e.to_errno();
     }
     match entry.file.write(&kbuf) {
         Ok(n) => n as i64,
@@ -286,21 +295,24 @@ fn sys_lseek(fd: i32, offset: i64, whence: u32) -> i64 {
 }
 
 fn sys_pread64(fd: i32, buf: *mut u8, count: usize, pos: u64) -> i64 {
-    if buf.is_null() {
-        return -abi::EFAULT;
-    }
-    if count == 0 {
-        return 0;
-    }
     let entry = match get_open_file(fd) {
         Ok(e) => e,
         Err(e) => return e.to_errno(),
     };
+    if count == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        return -abi::EFAULT;
+    }
+    if let Err(e) = uaccess::check(buf as u64, count.min(65536), true) {
+        return e.to_errno();
+    }
     let mut kbuf = vec![0u8; count.min(65536)];
     match entry.file.pread(pos, &mut kbuf) {
         Ok(n) => {
-            unsafe {
-                core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf, n);
+            if let Err(e) = uaccess::write(buf as u64, &kbuf[..n]) {
+                return e.to_errno();
             }
             n as i64
         }
@@ -309,20 +321,20 @@ fn sys_pread64(fd: i32, buf: *mut u8, count: usize, pos: u64) -> i64 {
 }
 
 fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, pos: u64) -> i64 {
-    if buf.is_null() {
-        return -abi::EFAULT;
-    }
-    if count == 0 {
-        return 0;
-    }
     let entry = match get_open_file(fd) {
         Ok(e) => e,
         Err(e) => return e.to_errno(),
     };
+    if count == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        return -abi::EFAULT;
+    }
     let limit = count.min(65536);
     let mut kbuf = vec![0u8; limit];
-    unsafe {
-        core::ptr::copy_nonoverlapping(buf, kbuf.as_mut_ptr(), limit);
+    if let Err(e) = uaccess::read(buf as u64, &mut kbuf) {
+        return e.to_errno();
     }
     match entry.file.pwrite(pos, &kbuf) {
         Ok(n) => n as i64,
@@ -331,12 +343,32 @@ fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, pos: u64) -> i64 {
 }
 
 fn sys_readv(fd: i32, iov_ptr: *const IoVec, iovcnt: usize) -> i64 {
-    if iov_ptr.is_null() || iovcnt > 1024 {
+    if let Err(e) = get_open_file(fd) {
+        return e.to_errno();
+    }
+    if iovcnt > 1024 {
         return -abi::EINVAL;
+    }
+    if iovcnt == 0 {
+        return 0;
+    }
+    if iov_ptr.is_null() {
+        return -abi::EFAULT;
     }
     let mut total = 0i64;
     for i in 0..iovcnt {
-        let iov = unsafe { iov_ptr.add(i).read_volatile() };
+        let address = match (iov_ptr as u64).checked_add((i * core::mem::size_of::<IoVec>()) as u64)
+        {
+            Some(a) => a,
+            None => return if total > 0 { total } else { -abi::EFAULT },
+        };
+        let iov = match uaccess::read_value::<IoVec>(address) {
+            Ok(v) => v,
+            Err(e) => return if total > 0 { total } else { e.to_errno() },
+        };
+        if iov.iov_len > i64::MAX as u64 {
+            return if total > 0 { total } else { -abi::EINVAL };
+        }
         if iov.iov_len == 0 {
             continue;
         }
@@ -344,7 +376,7 @@ fn sys_readv(fd: i32, iov_ptr: *const IoVec, iovcnt: usize) -> i64 {
         if n < 0 {
             return if total > 0 { total } else { n };
         }
-        total += n;
+        total = total.saturating_add(n);
         if (n as u64) < iov.iov_len {
             break;
         }
@@ -353,12 +385,32 @@ fn sys_readv(fd: i32, iov_ptr: *const IoVec, iovcnt: usize) -> i64 {
 }
 
 fn sys_writev(fd: i32, iov_ptr: *const IoVec, iovcnt: usize) -> i64 {
-    if iov_ptr.is_null() || iovcnt > 1024 {
+    if let Err(e) = get_open_file(fd) {
+        return e.to_errno();
+    }
+    if iovcnt > 1024 {
         return -abi::EINVAL;
+    }
+    if iovcnt == 0 {
+        return 0;
+    }
+    if iov_ptr.is_null() {
+        return -abi::EFAULT;
     }
     let mut total = 0i64;
     for i in 0..iovcnt {
-        let iov = unsafe { iov_ptr.add(i).read_volatile() };
+        let address = match (iov_ptr as u64).checked_add((i * core::mem::size_of::<IoVec>()) as u64)
+        {
+            Some(a) => a,
+            None => return if total > 0 { total } else { -abi::EFAULT },
+        };
+        let iov = match uaccess::read_value::<IoVec>(address) {
+            Ok(v) => v,
+            Err(e) => return if total > 0 { total } else { e.to_errno() },
+        };
+        if iov.iov_len > i64::MAX as u64 {
+            return if total > 0 { total } else { -abi::EINVAL };
+        }
         if iov.iov_len == 0 {
             continue;
         }
@@ -366,7 +418,7 @@ fn sys_writev(fd: i32, iov_ptr: *const IoVec, iovcnt: usize) -> i64 {
         if n < 0 {
             return if total > 0 { total } else { n };
         }
-        total += n;
+        total = total.saturating_add(n);
         if (n as u64) < iov.iov_len {
             break;
         }
@@ -431,11 +483,14 @@ fn sys_dup3(oldfd: i32, newfd: i32, flags: u32) -> i64 {
 }
 
 fn sys_pipe2(pipefd_ptr: *mut i32, flags: u32) -> i64 {
+    if (flags & !(abi::O_CLOEXEC | abi::O_NONBLOCK)) != 0 {
+        return -abi::EINVAL;
+    }
     if pipefd_ptr.is_null() {
         return -abi::EFAULT;
     }
     let cloexec = (flags & abi::O_CLOEXEC) != 0;
-    let (reader, writer) = vfs::create_pipe_pair();
+    let (reader, writer) = vfs::create_pipe_pair_with_flags(flags);
     let tbl = vfs::current_fd_table();
     let mut guard = tbl.lock();
     let rfd = match guard.alloc_fd(
@@ -462,9 +517,11 @@ fn sys_pipe2(pipefd_ptr: *mut i32, flags: u32) -> i64 {
         }
     };
     drop(guard);
-    unsafe {
-        pipefd_ptr.write_volatile(rfd as i32);
-        pipefd_ptr.add(1).write_volatile(wfd as i32);
+    if let Err(e) = uaccess::write_value(pipefd_ptr as u64, &[rfd as i32, wfd as i32]) {
+        let mut fds = tbl.lock();
+        let _ = fds.close(rfd);
+        let _ = fds.close(wfd);
+        return e.to_errno();
     }
     0
 }
@@ -518,7 +575,7 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
         Ok(e) => e,
         Err(e) => return e.to_errno(),
     };
-    if cmd == abi::TIOCGWINSZ && arg != 0 {
+    if cmd == abi::TIOCGWINSZ {
         let status = crate::tty::status();
         let ws = WinSize {
             ws_row: status.rows.max(25) as u16,
@@ -526,24 +583,31 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        unsafe {
-            (arg as *mut WinSize).write_volatile(ws);
-        }
-        return 0;
+        return match uaccess::write_value(arg, &ws) {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
+        };
     }
     match entry.file.inode.ioctl(cmd, arg) {
         Ok(val) => {
-            if (cmd == abi::BLKGETSIZE64 || cmd == abi::BLKGETSIZE) && arg != 0 {
-                unsafe {
-                    (arg as *mut u64).write_volatile(val);
-                }
-                return 0;
+            if cmd == abi::TCGETS && arg != 0 {
+                let termios = [0u8; 36];
+                return match uaccess::write_value(arg, &termios) {
+                    Ok(()) => 0,
+                    Err(e) => e.to_errno(),
+                };
             }
-            if cmd == abi::BLKSSZGET && arg != 0 {
-                unsafe {
-                    (arg as *mut u32).write_volatile(val as u32);
-                }
-                return 0;
+            if cmd == abi::BLKGETSIZE64 || cmd == abi::BLKGETSIZE {
+                return match uaccess::write_value(arg, &val) {
+                    Ok(()) => 0,
+                    Err(e) => e.to_errno(),
+                };
+            }
+            if cmd == abi::BLKSSZGET {
+                return match uaccess::write_value(arg, &(val as u32)) {
+                    Ok(()) => 0,
+                    Err(e) => e.to_errno(),
+                };
             }
             val as i64
         }
@@ -562,10 +626,10 @@ fn sys_fstat(fd: i32, stat_ptr: *mut LinuxStat) -> i64 {
     match entry.file.inode.metadata() {
         Ok(meta) => {
             let lstat = LinuxStat::from(meta);
-            unsafe {
-                stat_ptr.write_volatile(lstat);
+            match uaccess::write_value(stat_ptr as u64, &lstat) {
+                Ok(()) => 0,
+                Err(e) => e.to_errno(),
             }
-            0
         }
         Err(e) => e.to_errno(),
     }
@@ -576,7 +640,10 @@ fn sys_newfstatat(dirfd: i32, path_ptr: *const u8, stat_ptr: *mut LinuxStat, fla
         return -abi::EFAULT;
     }
     if (flags & abi::AT_EMPTY_PATH) != 0 && !path_ptr.is_null() {
-        let b0 = unsafe { path_ptr.read_volatile() };
+        let b0 = match uaccess::read_value::<u8>(path_ptr as u64) {
+            Ok(b) => b,
+            Err(e) => return e.to_errno(),
+        };
         if b0 == 0 {
             return sys_fstat(dirfd, stat_ptr);
         }
@@ -601,10 +668,10 @@ fn sys_newfstatat(dirfd: i32, path_ptr: *const u8, stat_ptr: *mut LinuxStat, fla
     match inode.metadata() {
         Ok(meta) => {
             let lstat = LinuxStat::from(meta);
-            unsafe {
-                stat_ptr.write_volatile(lstat);
+            match uaccess::write_value(stat_ptr as u64, &lstat) {
+                Ok(()) => 0,
+                Err(e) => e.to_errno(),
             }
-            0
         }
         Err(e) => e.to_errno(),
     }
@@ -625,8 +692,8 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> i64 {
     match entry.file.getdents64(&mut kbuf) {
         Ok(written) => {
             if written > 0 {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(kbuf.as_ptr(), dirp, written);
+                if let Err(e) = uaccess::write(dirp as u64, &kbuf[..written]) {
+                    return e.to_errno();
                 }
             }
             written as i64
@@ -720,8 +787,8 @@ fn sys_readlinkat(dirfd: i32, path_ptr: *const u8, buf: *mut u8, bufsiz: usize) 
         Ok(target) => {
             let bytes = target.as_bytes();
             let copy_len = bytes.len().min(bufsiz);
-            unsafe {
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, copy_len);
+            if let Err(e) = uaccess::write(buf as u64, &bytes[..copy_len]) {
+                return e.to_errno();
             }
             copy_len as i64
         }
@@ -729,7 +796,10 @@ fn sys_readlinkat(dirfd: i32, path_ptr: *const u8, buf: *mut u8, bufsiz: usize) 
     }
 }
 
-fn sys_faccessat(dirfd: i32, path_ptr: *const u8, _mode: u32, flags: u32) -> i64 {
+fn sys_faccessat(dirfd: i32, path_ptr: *const u8, mode: u32, flags: u32) -> i64 {
+    if mode & !7 != 0 || flags & !(abi::AT_SYMLINK_NOFOLLOW | abi::AT_EACCESS) != 0 {
+        return -abi::EINVAL;
+    }
     let path_str = match read_c_string(path_ptr, 512) {
         Ok(s) => s,
         Err(e) => return e.to_errno(),
@@ -743,8 +813,16 @@ fn sys_faccessat(dirfd: i32, path_ptr: *const u8, _mode: u32, flags: u32) -> i64
         }
     };
     let follow = (flags & abi::AT_SYMLINK_NOFOLLOW) == 0;
-    match vfs::lookup_abs(&abs_path, follow) {
-        Ok(_) => 0,
+    match vfs::lookup_abs(&abs_path, follow).and_then(|(inode, _)| inode.metadata()) {
+        Ok(meta) => {
+            if (mode & 4 != 0 && meta.mode & 0o444 == 0)
+                || (mode & 2 != 0 && meta.mode & 0o222 == 0)
+                || (mode & 1 != 0 && meta.mode & 0o111 == 0)
+            {
+                return -abi::EACCES;
+            }
+            0
+        }
         Err(e) => e.to_errno(),
     }
 }
@@ -773,9 +851,10 @@ fn sys_getcwd(buf: *mut u8, size: usize) -> i64 {
     if bytes.len() + 1 > size {
         return -abi::ERANGE;
     }
-    unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
-        buf.add(bytes.len()).write_volatile(0);
+    let mut terminated = bytes.to_vec();
+    terminated.push(0);
+    if let Err(e) = uaccess::write(buf as u64, &terminated) {
+        return e.to_errno();
     }
     (bytes.len() + 1) as i64
 }
@@ -839,12 +918,10 @@ fn sys_statfs(path_ptr: *const u8, buf_ptr: *mut LinuxStatFs) -> i64 {
         Err(e) => return e.to_errno(),
     };
     match mount.fs.statfs() {
-        Ok(sfs) => {
-            unsafe {
-                buf_ptr.write_volatile(LinuxStatFs::from(sfs));
-            }
-            0
-        }
+        Ok(sfs) => match uaccess::write_value(buf_ptr as u64, &LinuxStatFs::from(sfs)) {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
+        },
         Err(e) => e.to_errno(),
     }
 }
@@ -862,18 +939,23 @@ fn sys_fstatfs(fd: i32, buf_ptr: *mut LinuxStatFs) -> i64 {
         Err(e) => return e.to_errno(),
     };
     match mount.fs.statfs() {
-        Ok(sfs) => {
-            unsafe {
-                buf_ptr.write_volatile(LinuxStatFs::from(sfs));
-            }
-            0
-        }
+        Ok(sfs) => match uaccess::write_value(buf_ptr as u64, &LinuxStatFs::from(sfs)) {
+            Ok(()) => 0,
+            Err(e) => e.to_errno(),
+        },
         Err(e) => e.to_errno(),
     }
 }
 
 fn sys_mount(source_ptr: *const u8, target_ptr: *const u8, fstype_ptr: *const u8) -> i64 {
-    let source = read_c_string(source_ptr, 256).unwrap_or_else(|_| String::from("none"));
+    let source = if source_ptr.is_null() {
+        String::from("none")
+    } else {
+        match read_c_string(source_ptr, 256) {
+            Ok(s) => s,
+            Err(e) => return e.to_errno(),
+        }
+    };
     let target = match read_c_string(target_ptr, 256) {
         Ok(s) => s,
         Err(e) => return e.to_errno(),
@@ -912,11 +994,14 @@ fn sys_nanosleep(req_ptr: u64) -> i64 {
     if req_ptr == 0 {
         return -abi::EFAULT;
     }
-    let timespec = req_ptr as *const [u64; 2];
-    let (sec, nsec) = unsafe {
-        let ts = *timespec;
-        (ts[0], ts[1])
+    let ts = match uaccess::read_value::<[u64; 2]>(req_ptr) {
+        Ok(ts) => ts,
+        Err(e) => return e.to_errno(),
     };
+    let [sec, nsec] = ts;
+    if sec > i64::MAX as u64 || nsec >= 1_000_000_000 {
+        return -abi::EINVAL;
+    }
     let micros = sec.saturating_mul(1_000_000).saturating_add(nsec / 1_000);
     sched::sleep_micros(micros);
     0
@@ -933,13 +1018,16 @@ fn sys_set_tid_address(_tidptr: u64) -> i64 {
 }
 
 fn sys_brk(addr: u64) -> i64 {
-    let current = USER_BRK.load(Ordering::Acquire);
-    if addr == 0 || addr <= current {
-        return current as i64;
+    let space = match uaccess::current_space() {
+        Ok(s) => s,
+        Err(e) => return e.to_errno(),
+    };
+    let mut guard = space.lock();
+    if addr == 0 {
+        guard.brk as i64
+    } else {
+        guard.resize_brk(addr) as i64
     }
-    let new_brk = (addr + 4095) & !4095;
-    USER_BRK.store(new_brk, Ordering::Release);
-    new_brk as i64
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -950,6 +1038,9 @@ fn sys_arch_prctl(code: u32, addr: u64) -> i64 {
 
     match code {
         ARCH_SET_FS => {
+            if addr >= crate::user::UserAddressSpace::user_limit() {
+                return -abi::EPERM;
+            }
             unsafe {
                 core::arch::asm!(
                     "wrmsr",
@@ -974,8 +1065,8 @@ fn sys_arch_prctl(code: u32, addr: u64) -> i64 {
             }
             let val = ((high as u64) << 32) | (low as u64);
             if addr != 0 {
-                unsafe {
-                    *(addr as *mut u64) = val;
+                if let Err(e) = uaccess::write_value(addr, &val) {
+                    return e.to_errno();
                 }
             }
             0
@@ -1116,5 +1207,5 @@ pub fn run_vfs_syscall_self_test() {
         0
     );
 
-    kinfo!("Linux ABI VFS syscall self-test passed");
+    crate::self_test::verbose_log(format_args!("Linux ABI VFS syscall self-test passed"));
 }

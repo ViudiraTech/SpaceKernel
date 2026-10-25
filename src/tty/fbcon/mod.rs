@@ -59,32 +59,81 @@ pub enum FbError {
     InvalidGeometry,
 }
 
+struct FramebufferSpec {
+    address: usize,
+    width: u64,
+    height: u64,
+    pitch: u64,
+    bpp: u16,
+    memory_model: u8,
+    red_mask_size: u8,
+    red_mask_shift: u8,
+    green_mask_size: u8,
+    green_mask_shift: u8,
+    blue_mask_size: u8,
+    blue_mask_shift: u8,
+}
+
 impl FbConsole {
     pub fn new(framebuffer: &Framebuffer) -> Result<Self, FbError> {
-        let width = usize::try_from(framebuffer.width).map_err(|_| FbError::InvalidGeometry)?;
-        let height = usize::try_from(framebuffer.height).map_err(|_| FbError::InvalidGeometry)?;
-        let pitch = usize::try_from(framebuffer.pitch).map_err(|_| FbError::InvalidGeometry)?;
-        let bytes_per_pixel = match framebuffer.bpp {
+        Self::from_spec(FramebufferSpec {
+            address: framebuffer.address() as usize,
+            width: framebuffer.width,
+            height: framebuffer.height,
+            pitch: framebuffer.pitch,
+            bpp: framebuffer.bpp,
+            memory_model: framebuffer.memory_model,
+            red_mask_size: framebuffer.red_mask_size,
+            red_mask_shift: framebuffer.red_mask_shift,
+            green_mask_size: framebuffer.green_mask_size,
+            green_mask_shift: framebuffer.green_mask_shift,
+            blue_mask_size: framebuffer.blue_mask_size,
+            blue_mask_shift: framebuffer.blue_mask_shift,
+        })
+    }
+    /// # Safety
+    /// The owner must pin at least width * height * 4 writable bytes until this console is replaced.
+    pub unsafe fn linear(address: usize, width: u32, height: u32) -> Result<Self, FbError> {
+        Self::from_spec(FramebufferSpec {
+            address,
+            width: width as u64,
+            height: height as u64,
+            pitch: width as u64 * 4,
+            bpp: 32,
+            memory_model: FRAMEBUFFER_RGB,
+            red_mask_size: 8,
+            red_mask_shift: 16,
+            green_mask_size: 8,
+            green_mask_shift: 8,
+            blue_mask_size: 8,
+            blue_mask_shift: 0,
+        })
+    }
+    fn from_spec(spec: FramebufferSpec) -> Result<Self, FbError> {
+        let width = usize::try_from(spec.width).map_err(|_| FbError::InvalidGeometry)?;
+        let height = usize::try_from(spec.height).map_err(|_| FbError::InvalidGeometry)?;
+        let pitch = usize::try_from(spec.pitch).map_err(|_| FbError::InvalidGeometry)?;
+        let bytes_per_pixel = match spec.bpp {
             24 => 3,
             32 => 4,
             _ => return Err(FbError::UnsupportedFormat),
         };
-        if framebuffer.memory_model != FRAMEBUFFER_RGB
-            || framebuffer.red_mask_size == 0
-            || framebuffer.green_mask_size == 0
-            || framebuffer.blue_mask_size == 0
-            || framebuffer.red_mask_size > 8
-            || framebuffer.green_mask_size > 8
-            || framebuffer.blue_mask_size > 8
+        if spec.memory_model != FRAMEBUFFER_RGB
+            || spec.red_mask_size == 0
+            || spec.green_mask_size == 0
+            || spec.blue_mask_size == 0
+            || spec.red_mask_size > 8
+            || spec.green_mask_size > 8
+            || spec.blue_mask_size > 8
         {
             return Err(FbError::UnsupportedFormat);
         }
         for (size, shift) in [
-            (framebuffer.red_mask_size, framebuffer.red_mask_shift),
-            (framebuffer.green_mask_size, framebuffer.green_mask_shift),
-            (framebuffer.blue_mask_size, framebuffer.blue_mask_shift),
+            (spec.red_mask_size, spec.red_mask_shift),
+            (spec.green_mask_size, spec.green_mask_shift),
+            (spec.blue_mask_size, spec.blue_mask_shift),
         ] {
-            if u16::from(size) + u16::from(shift) > framebuffer.bpp {
+            if u16::from(size) + u16::from(shift) > spec.bpp {
                 return Err(FbError::UnsupportedFormat);
             }
         }
@@ -98,7 +147,7 @@ impl FbConsole {
                 .checked_mul(bytes_per_pixel)
                 .is_none_or(|minimum| pitch < minimum)
             || pitch.checked_mul(height).is_none()
-            || framebuffer.address().is_null()
+            || spec.address == 0
         {
             return Err(FbError::InvalidGeometry);
         }
@@ -108,17 +157,17 @@ impl FbConsole {
         }
         let fpu_scratch = crate::fpu::State::new().ok();
         let mut result = Self {
-            address: framebuffer.address() as usize,
+            address: spec.address,
             pitch,
             width,
             height,
             bytes_per_pixel,
-            red_shift: framebuffer.red_mask_shift,
-            green_shift: framebuffer.green_mask_shift,
-            blue_shift: framebuffer.blue_mask_shift,
-            red_size: framebuffer.red_mask_size,
-            green_size: framebuffer.green_mask_size,
-            blue_size: framebuffer.blue_mask_size,
+            red_shift: spec.red_mask_shift,
+            green_shift: spec.green_mask_shift,
+            blue_shift: spec.blue_mask_shift,
+            red_size: spec.red_mask_size,
+            green_size: spec.green_mask_size,
+            blue_size: spec.blue_mask_size,
             columns,
             rows,
             active: 0,

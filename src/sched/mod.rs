@@ -34,12 +34,60 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering
 pub use eevdf::{NICE_0_WEIGHT, nice_to_weight};
 use rbtree::{Node, RBTree};
 use task::Task;
-pub use task::{CpuMask, TaskRef, TaskState, TaskStats};
+pub use task::find as find_task;
+pub use task::last_tid;
+pub use task::{CpuMask, TaskRef, TaskState, TaskStats, TaskWeak};
 pub use wait::WaitQueue;
 
 type Entity = Box<Node<TaskRef>>;
 static SCHEDULER: AtomicPtr<Scheduler> = AtomicPtr::new(core::ptr::null_mut());
 static TIMERS: SpinLock<RBTree<TaskRef>> = SpinLock::new(RBTree::new());
+static USER_NS: [AtomicU64; smp::MAX_CPUS] = [const { AtomicU64::new(0) }; smp::MAX_CPUS];
+static SYSTEM_NS: [AtomicU64; smp::MAX_CPUS] = [const { AtomicU64::new(0) }; smp::MAX_CPUS];
+static IDLE_NS: [AtomicU64; smp::MAX_CPUS] = [const { AtomicU64::new(0) }; smp::MAX_CPUS];
+static CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
+static LOAD_AVG: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static LAST_LOAD_US: AtomicU64 = AtomicU64::new(0);
+
+pub fn sync_accounting() {
+    let Some(sched) = try_scheduler() else {
+        return;
+    };
+    let flags = arch::irq_save();
+    let cpu = smp::current_cpu();
+    if sched.cpus[cpu].active.load(Ordering::Acquire) {
+        sched.cpus[cpu].queue.lock().account();
+    }
+    arch::irq_restore(flags);
+}
+
+pub fn cpu_time(cpu: usize) -> [u64; 3] {
+    if let Some(sched) = try_scheduler() {
+        if cpu < sched.cpus.len() && sched.cpus[cpu].active.load(Ordering::Acquire) {
+            let flags = arch::irq_save();
+            sched.cpus[cpu].queue.lock().account();
+            arch::irq_restore(flags);
+        }
+    }
+    [
+        USER_NS[cpu].load(Ordering::Relaxed),
+        SYSTEM_NS[cpu].load(Ordering::Relaxed),
+        IDLE_NS[cpu].load(Ordering::Relaxed),
+    ]
+}
+pub fn context_switches() -> u64 {
+    CONTEXT_SWITCHES.load(Ordering::Relaxed)
+}
+pub fn loadavg() -> [(u64, u64); 3] {
+    let mut out = [(0u64, 0u64); 3];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let fixed = LOAD_AVG[i].load(Ordering::Relaxed);
+        let int = fixed >> 11;
+        let frac = ((fixed & 2047) * 100) >> 11;
+        *slot = (int, frac);
+    }
+    out
+}
 static COMPLETED: AtomicU64 = AtomicU64::new(0);
 
 struct Scheduler {
@@ -78,6 +126,16 @@ impl CpuQueue {
                 eevdf::RunQueue::account(node, elapsed);
                 let mut task = node.value.lock();
                 task.runtime_ns = task.runtime_ns.saturating_add(elapsed);
+                if task.address_space.is_some() {
+                    task.user_ns = task.user_ns.saturating_add(elapsed);
+                    USER_NS[self.cpu].fetch_add(elapsed, Ordering::Relaxed);
+                } else {
+                    task.system_ns = task.system_ns.saturating_add(elapsed);
+                    SYSTEM_NS[self.cpu].fetch_add(elapsed, Ordering::Relaxed);
+                }
+            }
+            if node.weight == 0 {
+                IDLE_NS[self.cpu].fetch_add(elapsed, Ordering::Relaxed);
             }
             node.last_run_us = now;
         }
@@ -199,7 +257,11 @@ pub fn spawn_with_affinity(
     let cpu = loadbalance::select_cpu(sched, affinity, smp::current_cpu())
         .ok_or("no online CPU in affinity")?;
     let task = Task::create(Some(Box::new(entry)), cpu, affinity)?;
-    let tid = task.lock().tid;
+    let tid = {
+        let mut guard = task.lock();
+        guard.nice = nice.clamp(-20, 19);
+        guard.tid
+    };
     let entity = Node::new(tid, task, nice_to_weight(nice));
     sched.cpus[cpu].queue.lock().admit(entity, true);
     request_reschedule(cpu);
@@ -360,6 +422,7 @@ fn dispatch(mut rq: Guard<'static, CpuQueue>, disposition: Disposition<'_>, volu
         task.on_cpu = cpu;
         if previous_tid != next_tid {
             task.switches += 1;
+            CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
         }
         next_context = task.context.get().cast_const();
         next_fpu = task.fpu_state.get().cast_const();
@@ -399,12 +462,6 @@ pub(crate) fn finish_switch() {
     unsafe {
         queue.unlock_handoff();
     }
-    let retired = queue.lock().retired.take();
-    if let Some(retired) = retired {
-        drop(retired); // Never free the stack while it is still executing.
-        COMPLETED.fetch_add(1, Ordering::Release);
-    }
-
     if let Some(current_task) = current() {
         let task = current_task.lock();
         if let Some(space) = &task.address_space {
@@ -415,6 +472,16 @@ pub(crate) fn finish_switch() {
         } else {
             crate::user::UserAddressSpace::deactivate();
         }
+    }
+    let retired = queue.lock().retired.take();
+    if let Some(retired) = retired {
+        {
+            let mut task = retired.value.lock();
+            task.address_space = None;
+            task.fd_table.lock().close_all();
+        }
+        drop(retired); // Never free the stack while it is still executing.
+        COMPLETED.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -470,6 +537,32 @@ pub fn tick() {
         }
     }
     let now = time::uptime_micros();
+    if cpu == 0 {
+        let last = LAST_LOAD_US.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 50_000
+            && LAST_LOAD_US
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let runnable: u64 = sched
+                .cpus
+                .iter()
+                .map(|c| c.runnable.load(Ordering::Relaxed) as u64)
+                .sum();
+            let sample = runnable << 11;
+            // Fixed-point EWMA factors for 1m, 5m, 15m sampled periodically
+            let factors = [1884u64, 2014, 2037];
+            for (i, &exp) in factors.iter().enumerate() {
+                let prev = LOAD_AVG[i].load(Ordering::Relaxed);
+                let next = if prev == 0 {
+                    sample
+                } else {
+                    (prev * exp + sample * (2048 - exp)) >> 11
+                };
+                LOAD_AVG[i].store(next, Ordering::Relaxed);
+            }
+        }
+    }
     for _ in 0..64 {
         let entity = {
             let mut timers = TIMERS.lock();
@@ -525,7 +618,11 @@ fn spawn_placed(
     affinity: CpuMask,
 ) -> Result<u64, &'static str> {
     let task = Task::create(Some(Box::new(entry)), cpu, affinity)?;
-    let tid = task.lock().tid;
+    let tid = {
+        let mut guard = task.lock();
+        guard.nice = nice.clamp(-20, 19);
+        guard.tid
+    };
     scheduler().cpus[cpu]
         .queue
         .lock()
@@ -558,7 +655,7 @@ pub fn task_snapshots() -> Vec<TaskStats> {
 }
 
 pub fn task_list() -> Vec<TaskStats> {
-    task_snapshots()
+    task::all().into_iter().map(|task| task.stats()).collect()
 }
 
 pub fn current_fd_table() -> Option<alloc::sync::Arc<SpinLock<crate::vfs::FileDescriptorTable>>> {

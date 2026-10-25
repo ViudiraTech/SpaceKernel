@@ -26,7 +26,7 @@ fn alloc_ino() -> u64 {
 
 enum RamNodeData {
     Regular(Vec<u8>),
-    Directory(BTreeMap<String, Arc<RamInode>>),
+    Directory(BTreeMap<String, Arc<dyn Inode>>),
     Symlink(String),
 }
 
@@ -34,6 +34,7 @@ pub struct RamInode {
     ino: u64,
     kind: InodeKind,
     mode: SpinLock<u32>,
+    owner: SpinLock<(u32, u32)>,
     data: SpinLock<RamNodeData>,
 }
 
@@ -42,6 +43,7 @@ impl RamInode {
         Arc::new(Self {
             ino: alloc_ino(),
             kind: InodeKind::Directory,
+            owner: SpinLock::new((0, 0)),
             mode: SpinLock::new(mode),
             data: SpinLock::new(RamNodeData::Directory(BTreeMap::new())),
         })
@@ -51,6 +53,7 @@ impl RamInode {
         Arc::new(Self {
             ino: alloc_ino(),
             kind: InodeKind::Regular,
+            owner: SpinLock::new((0, 0)),
             mode: SpinLock::new(mode),
             data: SpinLock::new(RamNodeData::Regular(Vec::new())),
         })
@@ -60,6 +63,7 @@ impl RamInode {
         Arc::new(Self {
             ino: alloc_ino(),
             kind: InodeKind::Symlink,
+            owner: SpinLock::new((0, 0)),
             mode: SpinLock::new(0o777),
             data: SpinLock::new(RamNodeData::Symlink(String::from(target))),
         })
@@ -67,6 +71,35 @@ impl RamInode {
 }
 
 impl Inode for RamInode {
+    fn insert_node(&self, name: &str, node: Arc<dyn Inode>) -> Result<(), VfsError> {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.as_bytes().contains(&0)
+            || name.len() > 255
+        {
+            return Err(VfsError::InvalidArgument);
+        }
+        if let RamNodeData::Directory(children) = &mut *self.data.lock() {
+            if children.contains_key(name) {
+                return Err(VfsError::AlreadyExists);
+            }
+            children.insert(String::from(name), node);
+            Ok(())
+        } else {
+            Err(VfsError::NotADirectory)
+        }
+    }
+    fn chmod(&self, mode: u32) -> Result<(), VfsError> {
+        *self.mode.lock() = mode & 0o7777;
+        Ok(())
+    }
+    fn chown(&self, uid: u32, gid: u32) -> Result<(), VfsError> {
+        *self.owner.lock() = (uid, gid);
+        Ok(())
+    }
+
     fn metadata(&self) -> Result<Stat, VfsError> {
         let mode = *self.mode.lock();
         let size = match &*self.data.lock() {
@@ -74,7 +107,11 @@ impl Inode for RamInode {
             RamNodeData::Directory(children) => (children.len() * 64) as u64,
             RamNodeData::Symlink(target) => target.len() as u64,
         };
-        Ok(Stat::simple(self.ino, self.kind, mode, size))
+        let mut stat = Stat::simple(self.ino, self.kind, mode, size);
+        let (uid, gid) = *self.owner.lock();
+        stat.uid = uid;
+        stat.gid = gid;
+        Ok(stat)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
@@ -98,6 +135,9 @@ impl Inode for RamInode {
             RamNodeData::Regular(bytes) => {
                 let start = offset as usize;
                 let end = start.checked_add(buf.len()).ok_or(VfsError::NoSpace)?;
+                if end > 64 * 1024 * 1024 {
+                    return Err(VfsError::NoSpace);
+                }
                 if end > bytes.len() {
                     bytes.resize(end, 0);
                 }
@@ -112,6 +152,9 @@ impl Inode for RamInode {
     fn truncate(&self, size: u64) -> Result<(), VfsError> {
         match &mut *self.data.lock() {
             RamNodeData::Regular(bytes) => {
+                if size > 64 * 1024 * 1024 {
+                    return Err(VfsError::NoSpace);
+                }
                 bytes.resize(size as usize, 0);
                 Ok(())
             }
@@ -132,7 +175,13 @@ impl Inode for RamInode {
     }
 
     fn create(&self, name: &str, kind: InodeKind, mode: u32) -> Result<Arc<dyn Inode>, VfsError> {
-        if name.is_empty() || name.contains('/') {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.len() > 255
+            || name.as_bytes().contains(&0)
+            || name.contains('/')
+        {
             return Err(VfsError::InvalidArgument);
         }
         match &mut *self.data.lock() {
@@ -160,7 +209,7 @@ impl Inode for RamInode {
         match &mut *self.data.lock() {
             RamNodeData::Directory(children) => {
                 let existing = children.get(name).ok_or(VfsError::NotFound)?;
-                if existing.kind == InodeKind::Directory {
+                if existing.metadata()?.kind == InodeKind::Directory {
                     return Err(VfsError::IsADirectory);
                 }
                 children.remove(name);
@@ -174,11 +223,13 @@ impl Inode for RamInode {
         match &mut *self.data.lock() {
             RamNodeData::Directory(children) => {
                 let existing = children.get(name).ok_or(VfsError::NotFound)?;
-                if existing.kind != InodeKind::Directory {
+                if existing.metadata()?.kind != InodeKind::Directory {
                     return Err(VfsError::NotADirectory);
                 }
-                if let RamNodeData::Directory(sub) = &*existing.data.lock()
-                    && !sub.is_empty()
+                if existing
+                    .readdir()?
+                    .iter()
+                    .any(|e| e.name != "." && e.name != "..")
                 {
                     return Err(VfsError::NotEmpty);
                 }
@@ -190,7 +241,13 @@ impl Inode for RamInode {
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn Inode>, VfsError> {
-        if name.is_empty() || name.contains('/') {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.len() > 255
+            || name.as_bytes().contains(&0)
+            || name.contains('/')
+        {
             return Err(VfsError::InvalidArgument);
         }
         match &mut *self.data.lock() {
@@ -229,9 +286,9 @@ impl Inode for RamInode {
                 });
                 for (name, child) in children.iter() {
                     entries.push(DirEntry {
-                        ino: child.ino,
+                        ino: child.metadata()?.ino,
                         name: name.clone(),
-                        kind: child.kind,
+                        kind: child.metadata()?.kind,
                     });
                 }
                 Ok(entries)

@@ -17,10 +17,7 @@ use super::{
     fd::ConsoleInode,
     inode::{DirEntry, FileSystem, Inode, InodeKind, Stat, StatFs, VfsError},
 };
-use crate::{
-    block::{self, BlockDevice},
-    time,
-};
+use crate::block::{self, BlockDevice};
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 enum SpecialCharKind {
@@ -43,7 +40,7 @@ impl Inode for SpecialCharInode {
         Ok(s)
     }
 
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
         match self.kind {
             SpecialCharKind::Null => Ok(0),
             SpecialCharKind::Zero | SpecialCharKind::Full => {
@@ -51,16 +48,7 @@ impl Inode for SpecialCharInode {
                 Ok(buf.len())
             }
             SpecialCharKind::Urandom => {
-                let mut state = time::uptime_micros()
-                    .wrapping_add(offset)
-                    .wrapping_add(0x9E37_79B9_7F4A_7C15);
-                for b in buf.iter_mut() {
-                    state ^= state >> 12;
-                    state ^= state << 25;
-                    state ^= state >> 27;
-                    let val = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
-                    *b = (val & 0xFF) as u8;
-                }
+                crate::random::fill(buf)?;
                 Ok(buf.len())
             }
         }
@@ -147,7 +135,12 @@ impl Inode for DevRootInode {
                 kind: SpecialCharKind::Full,
                 rdev: (1 << 8) | 7,
             })),
-            "random" | "urandom" => Ok(Arc::new(SpecialCharInode {
+            "random" => Ok(Arc::new(SpecialCharInode {
+                ino: 13,
+                kind: SpecialCharKind::Urandom,
+                rdev: (1 << 8) | 8,
+            })),
+            "urandom" => Ok(Arc::new(SpecialCharInode {
                 ino: 13,
                 kind: SpecialCharKind::Urandom,
                 rdev: (1 << 8) | 9,

@@ -14,14 +14,21 @@
 
 pub mod abi;
 pub mod devfs;
+pub mod devtmpfs;
 pub mod fat32;
 pub mod fd;
 pub mod inode;
 pub mod path;
 pub mod procfs;
+#[cfg(feature = "boot-self-test")]
+pub mod pseudo_test;
 pub mod ramfs;
+pub mod sysfs;
+pub mod tree;
 
-pub use fd::{FdEntry, FileDescriptorTable, OpenFile, create_pipe_pair};
+pub use fd::{
+    FdEntry, FileDescriptorTable, OpenFile, create_pipe_pair, create_pipe_pair_with_flags,
+};
 pub use inode::{DirEntry, FileSystem, Inode, InodeKind, Stat, StatFs, VfsError};
 pub use path::{normalize_path, split_parent_name};
 
@@ -89,7 +96,8 @@ pub fn mount_by_type(source: &str, target: &str, fstype: &str) -> Result<(), Vfs
     }
     let fs: Arc<dyn FileSystem> = match fstype {
         "ramfs" | "tmpfs" => Arc::new(ramfs::RamFs::new()),
-        "devfs" | "devtmpfs" => Arc::new(devfs::DevFs::new()),
+        "devfs" | "devtmpfs" => Arc::new(devtmpfs::DevTmpFs),
+        "sysfs" => Arc::new(sysfs::SysFs),
         "proc" | "procfs" => Arc::new(procfs::ProcFs::new()),
         "vfat" | "fat32" | "msdos" => {
             let dev_name = source.strip_prefix("/dev/").unwrap_or(source);
@@ -274,19 +282,19 @@ pub fn open_abs(abs_path: &str, flags: u32, mode: u32) -> Result<Arc<OpenFile>, 
     let trunc = (flags & abi::O_TRUNC) != 0;
     let must_dir = (flags & (abi::O_DIRECTORY_GENERIC | abi::O_DIRECTORY_ARM64)) != 0;
 
-    let (inode, final_path) = match lookup_abs(&norm, !excl) {
+    let (inode, final_path, newly_created) = match lookup_abs(&norm, !excl) {
         Ok((ino, p)) => {
             if create && excl {
                 return Err(VfsError::AlreadyExists);
             }
-            (ino, p)
+            (ino, p, false)
         }
         Err(VfsError::NotFound) if create => {
             let (parent_path, filename) =
                 split_parent_name(&norm).ok_or(VfsError::InvalidArgument)?;
             let (parent_inode, _) = lookup_abs(&parent_path, true)?;
             let created = parent_inode.create(&filename, InodeKind::Regular, mode & 0o7777)?;
-            (created, norm)
+            (created, norm, true)
         }
         Err(e) => return Err(e),
     };
@@ -299,10 +307,19 @@ pub fn open_abs(abs_path: &str, flags: u32, mode: u32) -> Result<Arc<OpenFile>, 
     if meta.kind == InodeKind::Directory && (acc == abi::O_WRONLY || acc == abi::O_RDWR || trunc) {
         return Err(VfsError::IsADirectory);
     }
+    if !newly_created && meta.kind != InodeKind::Directory && meta.kind != InodeKind::Symlink {
+        if (acc == abi::O_RDONLY || acc == abi::O_RDWR) && (meta.mode & 0o444) == 0 {
+            return Err(VfsError::PermissionDenied);
+        }
+        if (acc == abi::O_WRONLY || acc == abi::O_RDWR || trunc) && (meta.mode & 0o222) == 0 {
+            return Err(VfsError::PermissionDenied);
+        }
+    }
     if trunc && meta.kind == InodeKind::Regular && (acc == abi::O_WRONLY || acc == abi::O_RDWR) {
         inode.truncate(0)?;
     }
 
+    let inode = inode.open(flags)?.unwrap_or(inode);
     Ok(Arc::new(OpenFile::new(inode, final_path, flags)))
 }
 
@@ -384,7 +401,9 @@ pub fn init() {
     let root_fs = Arc::new(ramfs::RamFs::new());
     mount_fs("ramfs", "/", root_fs).expect("VFS: failed to mount rootfs");
 
-    for dir in ["/dev", "/proc", "/tmp", "/mnt", "/etc", "/var", "/home"] {
+    for dir in [
+        "/dev", "/proc", "/sys", "/tmp", "/mnt", "/etc", "/var", "/home",
+    ] {
         let _ = mkdir_abs(dir, 0o755);
     }
 
@@ -404,7 +423,9 @@ pub fn init() {
     );
 
     // 2. Mount DevFS on `/dev` and ProcFS on `/proc`
-    let _ = mount_fs("devfs", "/dev", Arc::new(devfs::DevFs::new()));
+    crate::device::init();
+    let _ = mount_fs("devtmpfs", "/dev", Arc::new(devtmpfs::DevTmpFs));
+    let _ = mount_fs("sysfs", "/sys", Arc::new(sysfs::SysFs));
     let _ = mount_fs("proc", "/proc", Arc::new(procfs::ProcFs::new()));
 
     // 3. Mount the preferred FAT32 partition on `/mnt`
@@ -475,7 +496,7 @@ pub fn run_self_test() {
 
     // 3. Test ProcFS (/proc/version, /proc/mounts, /proc/partitions)
     let ver = read_file("/proc/version").expect("read /proc/version failed");
-    assert!(ver.starts_with(b"SpaceKernel version"));
+    assert!(ver.starts_with(b"SpaceOS-9 version"));
     let mounts = read_file("/proc/mounts").expect("read /proc/mounts failed");
     assert!(!mounts.is_empty());
 
@@ -490,5 +511,7 @@ pub fn run_self_test() {
     unlink_abs("/mnt/testdir", true).expect("FAT32 rmdir failed");
     sync_all();
 
-    kinfo!("VFS (RamFS/DevFS/ProcFS/FAT32) self-test passed");
+    crate::self_test::verbose_log(format_args!(
+        "VFS (RamFS/DevFS/ProcFS/FAT32) self-test passed"
+    ));
 }

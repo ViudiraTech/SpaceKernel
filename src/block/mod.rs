@@ -11,7 +11,9 @@
 //! Block device layer unifying IDE (PATA), AHCI (SATA), NVMe, RAMDisk,
 //! MBR/GPT partitions, and an LRU sector cache.
 
+pub mod accounting;
 pub mod ahci;
+pub mod bench;
 pub mod cache;
 pub mod ide;
 pub mod nvme;
@@ -124,6 +126,20 @@ pub fn read_at(
     offset: u64,
     buf: &mut [u8],
 ) -> Result<usize, BlockError> {
+    let mut request = accounting::Request::start(dev_id, false);
+    let result = read_at_inner(dev_id, dev, offset, buf);
+    if let Ok(bytes) = result {
+        request.complete(bytes);
+    }
+    result
+}
+
+fn read_at_inner(
+    dev_id: usize,
+    dev: &Arc<dyn BlockDevice>,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<usize, BlockError> {
     let info = dev.info();
     let capacity = info.capacity_bytes();
     if offset >= capacity || buf.is_empty() {
@@ -149,6 +165,20 @@ pub fn read_at(
 
 /// Byte-granular cached write to a block device.
 pub fn write_at(
+    dev_id: usize,
+    dev: &Arc<dyn BlockDevice>,
+    offset: u64,
+    buf: &[u8],
+) -> Result<usize, BlockError> {
+    let mut request = accounting::Request::start(dev_id, true);
+    let result = write_at_inner(dev_id, dev, offset, buf);
+    if let Ok(bytes) = result {
+        request.complete(bytes);
+    }
+    result
+}
+
+fn write_at_inner(
     dev_id: usize,
     dev: &Arc<dyn BlockDevice>,
     offset: u64,
@@ -317,5 +347,5 @@ pub fn run_self_test() {
         dev.flush().expect("block self-test restore flush failed");
     }
 
-    kinfo!("block & storage drivers self-test passed");
+    crate::self_test::verbose_log(format_args!("block & storage drivers self-test passed"));
 }

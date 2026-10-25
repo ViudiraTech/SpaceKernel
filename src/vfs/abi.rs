@@ -63,6 +63,7 @@ pub const O_CLOEXEC: u32 = 0o2000000;
 // *at() Flags
 pub const AT_FDCWD: i32 = -100;
 pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+pub const AT_EACCESS: u32 = 0x200;
 pub const AT_REMOVEDIR: u32 = 0x200;
 pub const AT_EMPTY_PATH: u32 = 0x1000;
 

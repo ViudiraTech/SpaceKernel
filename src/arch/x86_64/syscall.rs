@@ -20,6 +20,7 @@ spacekernel_x86_64_syscall_entry:
     swapgs
     mov gs:[16], rsp
     mov rsp, gs:[8]
+    push qword ptr gs:[16]
 
     push r15
     push r14
@@ -30,7 +31,6 @@ spacekernel_x86_64_syscall_entry:
     push r11
     push rcx
 
-    sub rsp, 8
     push r9
     mov r9, r8
     mov r8, r10
@@ -41,7 +41,7 @@ spacekernel_x86_64_syscall_entry:
 
     call spacekernel_syscall_c
 
-    add rsp, 16
+    add rsp, 8
 
     pop rcx
     pop r11
@@ -52,7 +52,7 @@ spacekernel_x86_64_syscall_entry:
     pop r14
     pop r15
 
-    mov rsp, gs:[16]
+    pop rsp
     swapgs
     sysretq
 "#
@@ -135,6 +135,21 @@ pub unsafe fn enter_user_mode(entry: u64, user_sp: u64) -> ! {
             "push {rflags}",
             "push {cs}",
             "push {rip}",
+            "xor eax, eax",
+            "xor ebx, ebx",
+            "xor ecx, ecx",
+            "xor edx, edx",
+            "xor esi, esi",
+            "xor edi, edi",
+            "xor ebp, ebp",
+            "xor r8d, r8d",
+            "xor r9d, r9d",
+            "xor r10d, r10d",
+            "xor r11d, r11d",
+            "xor r12d, r12d",
+            "xor r13d, r13d",
+            "xor r14d, r14d",
+            "xor r15d, r15d",
             "iretq",
             ss = in(reg) USER_DS,
             rsp = in(reg) user_sp,

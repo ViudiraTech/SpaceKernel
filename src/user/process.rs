@@ -17,14 +17,36 @@ use crate::{
 };
 use alloc::sync::Arc;
 
+pub unsafe fn install_tls(tp: u64) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xc000_0100u32,
+            in("eax") (tp as u32),
+            in("edx") ((tp >> 32) as u32),
+            options(nostack)
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("msr tpidr_el0, {}", in(reg) tp, options(nostack));
+    }
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("mv tp, {}", in(reg) tp, options(nostack));
+    }
+}
+
 pub fn spawn_user_elf(data: &[u8], name: &str) -> Result<u64, &'static str> {
     let mut space = UserAddressSpace::new()?;
     let loaded = elf::load_elf(&mut space, data)?;
-    let user_sp = stack::setup_user_stack(&mut space, loaded.entry, name)?;
+    let user_sp = stack::setup_user_stack(&mut space, &loaded, name)?;
     let space_arc = Arc::new(SpinLock::new(space));
 
     let space_clone = space_arc.clone();
-    let entry_va = loaded.entry;
+    let entry_va = loaded.initial_pc;
+    let tls_tp = loaded.tls_tp;
 
     // Spawn a new task in the scheduler
     let tid = sched::spawn(
@@ -49,6 +71,8 @@ pub fn spawn_user_elf(data: &[u8], name: &str) -> Result<u64, &'static str> {
 
             // Drop to unprivileged user mode!
             unsafe {
+                install_tls(tls_tp);
+                let _ = crate::fpu::enable_user();
                 arch::enter_user_mode(entry_va, user_sp);
             }
         },

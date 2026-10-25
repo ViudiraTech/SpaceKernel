@@ -67,7 +67,8 @@ pub fn setup_device_memory() {
     // any kernel device mapping uses that index.
     unsafe {
         asm!("mrs {}, mair_el1", out(reg) mair, options(nomem, nostack));
-        mair &= !(0xff << 16);
+        mair &= !((0xff << 16) | (0xff << 24));
+        mair |= 0x44 << 24;
         asm!("msr mair_el1, {}", "isb", in(reg) mair, options(nostack));
     }
 }
