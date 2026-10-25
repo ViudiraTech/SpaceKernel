@@ -20,6 +20,9 @@ pub const FORK_TEST_ELF: &[u8] = include_bytes!("../../user/test/fork_wait_x86_6
 pub const PROCESS_SIGNAL_TEST_ELF: &[u8] =
     include_bytes!("../../user/test/process_signal_x86_64.elf");
 
+#[cfg(target_arch = "x86_64")]
+pub const EXEC_TARGET_ELF: &[u8] = include_bytes!("../../user/test/exec_target_x86_64.elf");
+
 #[cfg(target_arch = "aarch64")]
 pub const TEST_USER_ELF: &[u8] = include_bytes!("../../user/test/test_aarch64.elf");
 

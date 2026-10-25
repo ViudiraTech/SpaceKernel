@@ -60,6 +60,9 @@ impl Inode for EventFd {
             if self.nonblock {
                 return Err(VfsError::WouldBlock);
             }
+            if crate::signal::pending_for_current() {
+                return Err(VfsError::Interrupted);
+            }
             sched::sleep_micros(1000);
         }
     }
@@ -84,6 +87,9 @@ impl Inode for EventFd {
             drop(counter);
             if self.nonblock {
                 return Err(VfsError::WouldBlock);
+            }
+            if crate::signal::pending_for_current() {
+                return Err(VfsError::Interrupted);
             }
             sched::sleep_micros(1000);
         }

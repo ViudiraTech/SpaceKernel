@@ -17,6 +17,6 @@ mod line;
 pub use console::{
     DIRTY as GRAPHICS_DIRTY, TtyDevice, assign_session, controlling_session, foreground_pgrp, init,
     install_gpu_console, poll_serial, read, receive, scrollback, set_foreground_pgrp, set_termios,
-    status, switch_to, write, write_kernel,
+    status, switch_to, termios, write, write_kernel,
 };
 pub use line::{InputEvent, LineDiscipline, ReadError, Termios};

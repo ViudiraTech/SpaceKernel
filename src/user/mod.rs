@@ -84,10 +84,17 @@ pub fn run_self_test() -> Result<(), &'static str> {
 /// x86_64 thread, POSIX signal, process-group and cross-process kill test.
 #[cfg(target_arch = "x86_64")]
 pub fn process_signal_self_test() -> Result<(), &'static str> {
+    crate::vfs::write_file("/tmp/exec_target", test_binaries::EXEC_TARGET_ELF)
+        .map_err(|_| "cannot stage exec target")?;
+    crate::vfs::lookup_abs("/tmp/exec_target", true)
+        .map_err(|_| "cannot find exec target")?
+        .0
+        .chmod(0o755)
+        .map_err(|_| "cannot chmod exec target")?;
     crate::syscall::set_last_user_exit_code(-1);
     let pid = spawn_user_elf(test_binaries::PROCESS_SIGNAL_TEST_ELF, "process_signal")?;
     for _ in 0..8000 {
-        if crate::syscall::last_user_exit_code() == 42 {
+        if crate::syscall::last_user_exit_code() == 43 {
             let _ = crate::sched::take_zombie(pid);
             crate::self_test::verbose_log(format_args!(
                 "thread/signal/process-group user self-test passed"

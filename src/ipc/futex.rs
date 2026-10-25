@@ -250,6 +250,9 @@ pub fn futex(address: u64, op: u32, value: u32, timeout: u64, address2: u64, val
     if flags & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME) != 0 {
         return -abi::EINVAL;
     }
+    if flags & FUTEX_CLOCK_REALTIME != 0 && !matches!(command, FUTEX_WAIT_BITSET) {
+        return -abi::ENOSYS;
+    }
     let realtime = flags & FUTEX_CLOCK_REALTIME != 0;
     match command {
         FUTEX_WAIT => wait(address, value, timeout, !0, false, realtime),

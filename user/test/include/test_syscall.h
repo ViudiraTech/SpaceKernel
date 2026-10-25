@@ -16,6 +16,10 @@ typedef unsigned short u16;
 
 #define SYS_READ 0
 #define SYS_WRITE 1
+#define SYS_CLOSE 3
+#define SYS_OPENAT 257
+#define AT_FDCWD (-100)
+#define O_RDWR 2
 #define SYS_READ 0
 #define SYS_RT_SIGACTION 13
 #define SYS_RT_SIGPROCMASK 14
@@ -25,6 +29,7 @@ typedef unsigned short u16;
 #define SYS_GETPID 39
 #define SYS_CLONE 56
 #define SYS_FORK 57
+#define SYS_EXECVE 59
 #define SYS_EXIT 60
 #define SYS_WAIT4 61
 #define SYS_KILL 62
@@ -55,6 +60,12 @@ typedef unsigned short u16;
 #define FUTEX_PRIVATE_FLAG 128
 
 #define ETIMEDOUT 110
+
+#define TCGETS 0x5401
+#define TCSETS 0x5402
+#define ICANON 0x0002
+#define ECHO 0x0008
+#define ICRNL 0x0100
 
 #define TIOCGPGRP 0x540F
 #define TIOCSPGRP 0x5410
@@ -96,6 +107,9 @@ static inline i64 sys_write(i64 fd, const void *buf, u64 len) {
 static inline i64 sys_getpid(void) { return syscall3(SYS_GETPID, 0, 0, 0); }
 static inline i64 sys_gettid(void) { return syscall3(SYS_GETTID, 0, 0, 0); }
 static inline i64 sys_fork(void) { return syscall3(SYS_FORK, 0, 0, 0); }
+static inline i64 sys_execve(const char *path, char *const argv[], char *const envp[]) {
+    return syscall3(SYS_EXECVE, (i64)path, (i64)argv, (i64)envp);
+}
 __attribute__((noreturn)) static inline void sys_exit(i64 code) {
     syscall3(SYS_EXIT, code, 0, 0);
     for (;;) {
@@ -118,6 +132,10 @@ static inline i64 sys_setpgid(i64 pid, i64 pgid) {
 static inline i64 sys_getpgid(i64 pid) { return syscall3(SYS_GETPGID, pid, 0, 0); }
 static inline i64 sys_getsid(i64 pid) { return syscall3(SYS_GETSID, pid, 0, 0); }
 static inline i64 sys_sched_yield(void) { return syscall3(SYS_SCHED_YIELD, 0, 0, 0); }
+static inline i64 sys_openat(i64 dirfd, const char *path, u64 flags, u64 mode) {
+    return syscall6(SYS_OPENAT, dirfd, (i64)path, (i64)flags, (i64)mode, 0, 0);
+}
+static inline i64 sys_close(i64 fd) { return syscall3(SYS_CLOSE, fd, 0, 0); }
 static inline i64 sys_read(i64 fd, void *buffer, u64 length) {
     return syscall3(SYS_READ, fd, (i64)buffer, (i64)length);
 }

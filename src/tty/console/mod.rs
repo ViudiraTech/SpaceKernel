@@ -12,7 +12,7 @@
 
 mod device;
 
-pub use device::{TtyDevice, poll_serial, read, receive, set_termios, write};
+pub use device::{TtyDevice, poll_serial, read, receive, set_termios, termios, write};
 
 use super::{
     fbcon::{FbConsole, VT_COUNT},

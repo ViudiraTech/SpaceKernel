@@ -393,6 +393,9 @@ impl UnixSocket {
             if nonblock || self.nonblock.load(Ordering::Acquire) {
                 return Err(VfsError::WouldBlock);
             }
+            if crate::signal::pending_for_current() {
+                return Err(VfsError::Interrupted);
+            }
             sched::sleep_micros(1000);
         }
     }
@@ -471,6 +474,9 @@ impl UnixSocket {
             }
             if nonblock {
                 return Err(VfsError::WouldBlock);
+            }
+            if crate::signal::pending_for_current() {
+                return Err(VfsError::Interrupted);
             }
             sched::sleep_micros(1000);
         }
@@ -574,6 +580,9 @@ impl UnixSocket {
             if self.nonblocking(dontwait) {
                 return Err(VfsError::WouldBlock);
             }
+            if crate::signal::pending_for_current() {
+                return Err(VfsError::Interrupted);
+            }
             sched::sleep_micros(1000);
         }
     }
@@ -616,6 +625,9 @@ impl UnixSocket {
             }
             if dontwait {
                 return Err(VfsError::WouldBlock);
+            }
+            if crate::signal::pending_for_current() {
+                return Err(VfsError::Interrupted);
             }
             sched::sleep_micros(1000);
         }
@@ -722,6 +734,9 @@ impl UnixSocket {
             if self.nonblocking(dontwait) {
                 return Err(VfsError::WouldBlock);
             }
+            if crate::signal::pending_for_current() {
+                return Err(VfsError::Interrupted);
+            }
             sched::sleep_micros(1000);
         }
     }
@@ -775,6 +790,9 @@ impl UnixSocket {
             }
             if self.nonblocking(dontwait) {
                 return Err(VfsError::WouldBlock);
+            }
+            if crate::signal::pending_for_current() {
+                return Err(VfsError::Interrupted);
             }
             sched::sleep_micros(1000);
         }

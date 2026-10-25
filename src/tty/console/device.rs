@@ -125,6 +125,21 @@ pub fn read(device: TtyDevice, output: &mut [u8]) -> Result<usize, ReadError> {
     }
 }
 
+pub fn termios(device: TtyDevice) -> Result<Termios, ReadError> {
+    let state = CONSOLE.lock();
+    match device {
+        TtyDevice::Serial0 => Ok(state.serial_line.termios()),
+        TtyDevice::Foreground => {
+            let active = state.active_vt;
+            Ok(state.virtual_lines[active - 1].termios())
+        }
+        TtyDevice::Virtual(number) if (1..=VT_COUNT).contains(&number) => {
+            Ok(state.virtual_lines[number - 1].termios())
+        }
+        _ => Err(ReadError::NoDevice),
+    }
+}
+
 pub fn set_termios(device: TtyDevice, termios: Termios) -> Result<(), ReadError> {
     let mut state = CONSOLE.lock();
     match device {

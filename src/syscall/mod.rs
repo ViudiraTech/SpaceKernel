@@ -646,6 +646,57 @@ fn sys_fcntl(fd: i32, cmd: u32, arg: u64) -> i64 {
     }
 }
 
+const TERMIOS_ICRNL: u32 = 0x100;
+const TERMIOS_ISIG: u32 = 0x1;
+const TERMIOS_ICANON: u32 = 0x2;
+const TERMIOS_ECHO: u32 = 0x8;
+const TERMIOS_CS8: u32 = 0x30;
+const TERMIOS_CREAD: u32 = 0x80;
+
+fn encode_termios(settings: &crate::tty::Termios) -> [u8; 36] {
+    let mut bytes = [0u8; 36];
+    let iflag = if settings.icrnl { TERMIOS_ICRNL } else { 0 };
+    let cflag = TERMIOS_CS8 | TERMIOS_CREAD;
+    let mut lflag = 0;
+    if settings.signals {
+        lflag |= TERMIOS_ISIG;
+    }
+    if settings.canonical {
+        lflag |= TERMIOS_ICANON;
+    }
+    if settings.echo {
+        lflag |= TERMIOS_ECHO;
+    }
+    bytes[0..4].copy_from_slice(&iflag.to_le_bytes());
+    bytes[8..12].copy_from_slice(&cflag.to_le_bytes());
+    bytes[12..16].copy_from_slice(&lflag.to_le_bytes());
+    bytes[17] = settings.interrupt;
+    bytes[18] = settings.quit;
+    bytes[19] = settings.erase;
+    bytes[20] = settings.kill;
+    bytes[21] = settings.eof;
+    bytes[23] = 1; // VMIN
+    bytes[27] = settings.suspend;
+    bytes
+}
+
+fn decode_termios(bytes: &[u8]) -> crate::tty::Termios {
+    let iflag = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let lflag = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    crate::tty::Termios {
+        canonical: lflag & TERMIOS_ICANON != 0,
+        echo: lflag & TERMIOS_ECHO != 0,
+        signals: lflag & TERMIOS_ISIG != 0,
+        icrnl: iflag & TERMIOS_ICRNL != 0,
+        erase: bytes[19],
+        kill: bytes[20],
+        eof: bytes[21],
+        interrupt: bytes[17],
+        quit: bytes[18],
+        suspend: bytes[27],
+    }
+}
+
 fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
     let entry = match get_open_file(fd) {
         Ok(e) => e,
@@ -662,6 +713,30 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
         return match uaccess::write_value(arg, &ws) {
             Ok(()) => 0,
             Err(e) => e.to_errno(),
+        };
+    }
+    let console =
+        entry.file.abs_path == "/dev/console" || entry.file.abs_path.starts_with("/dev/tty");
+    if console && matches!(cmd, abi::TCGETS | abi::TCSETS | abi::TCSETSW | abi::TCSETSF) {
+        if cmd == abi::TCGETS {
+            let settings = match crate::tty::termios(crate::tty::TtyDevice::Foreground) {
+                Ok(settings) => settings,
+                Err(_) => return -abi::ENOTTY,
+            };
+            let bytes = encode_termios(&settings);
+            return match uaccess::write(arg, &bytes) {
+                Ok(()) => 0,
+                Err(e) => e.to_errno(),
+            };
+        }
+        let bytes = match uaccess::read_vec(arg, 36, 36) {
+            Ok(bytes) => bytes,
+            Err(e) => return e.to_errno(),
+        };
+        let settings = decode_termios(&bytes);
+        return match crate::tty::set_termios(crate::tty::TtyDevice::Foreground, settings) {
+            Ok(()) => 0,
+            Err(_) => -abi::ENOTTY,
         };
     }
     if matches!(cmd, abi::TIOCGPGRP | abi::TIOCSPGRP | abi::TIOCGSID) {
@@ -697,19 +772,36 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
                 };
             }
             _ => {
-                let pgrp = match uaccess::read_value::<u32>(arg) {
-                    Ok(pgrp) => pgrp as u64,
+                if crate::tty::controlling_session() != stats.sid {
+                    return -abi::ENOTTY;
+                }
+                // Linux runs tty_check_change(SIGTTOU) before setting the
+                // foreground group.
+                if stats.pgid != crate::tty::foreground_pgrp() {
+                    if crate::signal::signal_ignored(&task, crate::signal::SIGTTOU)
+                        || crate::signal::pgrp_orphaned(stats.pgid, stats.sid)
+                    {
+                        return -abi::ENOTTY;
+                    }
+                    let _ = crate::signal::send_to_pgrp(stats.pgid, crate::signal::SIGTTOU);
+                    return -abi::EINTR;
+                }
+                let pgrp = match uaccess::read_value::<i32>(arg) {
+                    Ok(pgrp) if pgrp >= 0 => pgrp as u64,
+                    Ok(_) => return -abi::EINVAL,
                     Err(e) => return e.to_errno(),
                 };
-                let caller = stats.sid;
-                let same_session = sched::tasks().into_iter().any(|task| {
-                    let other = task.stats();
-                    other.user && other.pgid == pgrp && other.sid == caller
-                });
-                if pgrp == 0 || !same_session {
+                let target = match sched::tasks().into_iter().find(|candidate| {
+                    let other = candidate.stats();
+                    other.user && other.pgid == pgrp
+                }) {
+                    Some(target) => target,
+                    None => return -abi::ESRCH,
+                };
+                if target.stats().sid != stats.sid {
                     return -abi::EPERM;
                 }
-                if !crate::tty::set_foreground_pgrp(caller, pgrp) {
+                if !crate::tty::set_foreground_pgrp(stats.sid, pgrp) {
                     return -abi::EPERM;
                 }
                 return 0;
@@ -718,13 +810,6 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
     }
     match entry.file.inode.ioctl(cmd, arg) {
         Ok(val) => {
-            if cmd == abi::TCGETS && arg != 0 {
-                let termios = [0u8; 36];
-                return match uaccess::write_value(arg, &termios) {
-                    Ok(()) => 0,
-                    Err(e) => e.to_errno(),
-                };
-            }
             if cmd == abi::BLKGETSIZE64 || cmd == abi::BLKGETSIZE {
                 return match uaccess::write_value(arg, &val) {
                     Ok(()) => 0,

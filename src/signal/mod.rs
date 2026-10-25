@@ -62,6 +62,14 @@ pub const SA_RESTART: u64 = 0x1000_0000;
 pub const SA_NODEFER: u64 = 0x4000_0000;
 pub const SA_RESETHAND: u64 = 0x8000_0000;
 pub const SA_RESTORER: u64 = 0x0400_0000;
+pub const SA_KNOWN: u64 = SA_NOCLDSTOP
+    | SA_NOCLDWAIT
+    | SA_SIGINFO
+    | SA_ONSTACK
+    | SA_RESTART
+    | SA_NODEFER
+    | SA_RESETHAND
+    | SA_RESTORER;
 
 pub const SS_ONSTACK: u32 = 1;
 pub const SS_DISABLE: u32 = 2;
@@ -133,6 +141,10 @@ impl SigAction {
 pub struct SignalState {
     actions: SpinLock<[SigAction; 65]>,
     shared: SpinLock<Vec<Signal>>,
+    // Linux's signal->group_exec_task: while an exec is de-threading, a fatal
+    // signal makes the receiving sibling exit itself instead of zapping the
+    // whole group.
+    exec_leader: SpinLock<Option<u64>>,
 }
 
 impl SignalState {
@@ -140,6 +152,7 @@ impl SignalState {
         Self {
             actions: SpinLock::new([SigAction::default(); 65]),
             shared: SpinLock::new(Vec::new()),
+            exec_leader: SpinLock::new(None),
         }
     }
 
@@ -148,7 +161,16 @@ impl SignalState {
         Self {
             actions: SpinLock::new(actions),
             shared: SpinLock::new(Vec::new()),
+            exec_leader: SpinLock::new(None),
         }
+    }
+
+    pub fn exec_leader(&self) -> Option<u64> {
+        *self.exec_leader.lock()
+    }
+
+    pub fn set_exec_leader(&self, leader: Option<u64>) {
+        *self.exec_leader.lock() = leader;
     }
 
     pub fn shared_pending(&self) -> crate::sync::Guard<'_, Vec<Signal>> {
@@ -319,6 +341,43 @@ pub fn send_to_pgrp(pgid: u64, number: u32) -> bool {
         return false;
     }
     send_to_group(pgid, Signal::kernel(number))
+}
+
+/// True when the signal is blocked or its disposition is SIG_IGN for `task`.
+pub fn signal_ignored(task: &sched::TaskRef, number: u32) -> bool {
+    if task.thread_signals().lock().blocked & signal_bit(number) != 0 {
+        return true;
+    }
+    task.signals().action(number).handler == SIG_IGN
+}
+
+/// POSIX orphaned process group: no member has a parent in a different
+/// process group of the same session.
+pub fn pgrp_orphaned(pgid: u64, sid: u64) -> bool {
+    let tasks = sched::tasks();
+    let members: Vec<_> = tasks
+        .iter()
+        .filter(|task| {
+            let stats = task.stats();
+            stats.user && stats.pgid == pgid && stats.sid == sid
+        })
+        .collect();
+    if members.is_empty() {
+        return true;
+    }
+    for member in members {
+        let ppid = member.stats().ppid;
+        if let Some(parent) = tasks.iter().find(|task| {
+            let stats = task.stats();
+            stats.user && stats.tgid == ppid
+        }) {
+            let parent_stats = parent.stats();
+            if parent_stats.sid == sid && parent_stats.pgid != pgid {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn is_stop_signal(number: u32) -> bool {
@@ -818,6 +877,16 @@ fn update_blocked(task: &sched::TaskRef, signal: u32, action: SigAction) {
 
 fn terminate_group(task: &sched::TaskRef, signal: u32, core: bool) -> ! {
     let stats = task.stats();
+    if let Some(exec_leader) = task.signals().exec_leader() {
+        // de_thread is in progress: only this thread exits (Linux
+        // do_group_exit sees group_exec_task and skips zap_other_threads).
+        let status = if stats.ltid == exec_leader {
+            0
+        } else {
+            signal as i32 | if core { 0x80 } else { 0 }
+        };
+        crate::sched::exit(status);
+    }
     if stats.tgid != 0 {
         for member in sched::tasks_in_group(stats.tgid) {
             if member.stats().ltid != stats.ltid {
@@ -870,6 +939,12 @@ fn deliver(task: &sched::TaskRef, mut regs: UserRegs) -> Option<UserRegs> {
                     continue;
                 }
                 DefaultAction::Stop => {
+                    let stats = task.stats();
+                    // Job-control stop signals do not stop an orphaned group;
+                    // SIGSTOP always does.
+                    if signal.number != SIGSTOP && pgrp_orphaned(stats.pgid, stats.sid) {
+                        continue;
+                    }
                     stop_current(task, signal.number);
                     continue;
                 }
@@ -984,7 +1059,9 @@ pub fn rt_sigaction(signo: u64, act: u64, oldact: u64, sigsetsize: u64) -> i64 {
     };
     let signals = task.signals();
     if oldact != 0 {
-        if let Err(error) = write_action(oldact, &signals.action(signo as u32)) {
+        let mut old = signals.action(signo as u32);
+        old.flags &= SA_KNOWN;
+        if let Err(error) = write_action(oldact, &old) {
             return error.to_errno();
         }
     }
@@ -992,7 +1069,7 @@ pub fn rt_sigaction(signo: u64, act: u64, oldact: u64, sigsetsize: u64) -> i64 {
         if signo == SIGKILL as u64 || signo == SIGSTOP as u64 {
             return -abi::EINVAL;
         }
-        let action = match read_action(act) {
+        let mut action = match read_action(act) {
             Ok(action) => action,
             Err(error) => return error.to_errno(),
         };
@@ -1002,7 +1079,25 @@ pub fn rt_sigaction(signo: u64, act: u64, oldact: u64, sigsetsize: u64) -> i64 {
         {
             return -abi::EINVAL;
         }
+        action.flags &= SA_KNOWN;
+        action.mask &= !(SIGKILL_MASK | SIGSTOP_MASK);
+        let discard_pending = action.handler == SIG_IGN
+            || (action.handler == SIG_DFL
+                && matches!(default_action(signo as u32), DefaultAction::Ignore));
         signals.set_action(signo as u32, action);
+        if discard_pending {
+            let stats = task.stats();
+            let mut shared = signals.shared_pending();
+            shared.retain(|pending| pending.number != signo as u32);
+            drop(shared);
+            for member in sched::tasks_in_group(stats.tgid) {
+                member
+                    .thread_signals()
+                    .lock()
+                    .pending
+                    .retain(|pending| pending.number != signo as u32);
+            }
+        }
     }
     0
 }
@@ -1175,6 +1270,66 @@ fn has_deliverable(task: &sched::TaskRef) -> bool {
         .shared_pending()
         .iter()
         .any(|signal| signal_bit(signal.number) & blocked == 0)
+}
+
+/// Prepare a thread group for `execve`: other threads are killed and waited
+/// for, handled dispositions reset (ignored survive with cleared fields),
+/// pending signals and the blocked mask are preserved, and the alternate stack
+/// is disabled.  A non-leader thread adopts the group leader's PID, matching
+/// Linux's de_thread identity exchange.
+pub fn prepare_exec(task: &sched::TaskRef) -> Result<(), VfsError> {
+    let stats = task.stats();
+    let signals = task.signals();
+    if stats.user {
+        signals.set_exec_leader(Some(stats.ltid));
+        for member in sched::tasks_in_group(stats.tgid) {
+            if member.stats().ltid != stats.ltid {
+                send_to_thread(&member, Signal::kernel(SIGKILL));
+            }
+        }
+        loop {
+            let live_other = sched::tasks_in_group(stats.tgid)
+                .into_iter()
+                .any(|member| member.stats().ltid != stats.ltid);
+            if !live_other {
+                break;
+            }
+            if pending_for_current() {
+                signals.set_exec_leader(None);
+                return Err(VfsError::Interrupted);
+            }
+            sched::sleep_micros(1000);
+        }
+        signals.set_exec_leader(None);
+        if stats.ltid != stats.tgid {
+            // Kernel waits for the old leader to become inactive, discards
+            // its zombie record and takes over its PID.
+            let _ = sched::take_zombie(stats.tgid);
+            task.lock().ltid = stats.tgid;
+        }
+    }
+    {
+        let mut actions = signals.actions.lock();
+        for action in actions.iter_mut() {
+            if action.handler != SIG_IGN {
+                action.handler = SIG_DFL;
+            }
+            action.flags = 0;
+            action.restorer = 0;
+            action.mask = 0;
+        }
+    }
+    let thread = task.thread_signals();
+    {
+        let mut state = thread.lock();
+        state.altstack_sp = 0;
+        state.altstack_size = 0;
+        state.altstack_flags = SS_DISABLE;
+        state.on_altstack = false;
+        state.stopped = false;
+        state.stop_signal = 0;
+    }
+    Ok(())
 }
 
 /// Kernel-internal delivery of a fatal signal (e.g. a non-COW user fault).

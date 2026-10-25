@@ -26,6 +26,23 @@ pub const MAX_FDS: usize = 256;
 pub struct ConsoleInode;
 
 impl Inode for ConsoleInode {
+    fn open(&self, _flags: u32) -> Result<Option<Arc<dyn Inode>>, VfsError> {
+        // Linux assigns the controlling terminal when a session leader opens
+        // it for reading and no session owns it yet.
+        if let Some(task) = crate::sched::current() {
+            let stats = task.stats();
+            if stats.user
+                && stats.sid != 0
+                && stats.tgid == stats.sid
+                && crate::tty::controlling_session() == 0
+                && crate::tty::assign_session(stats.sid)
+            {
+                crate::tty::set_foreground_pgrp(stats.sid, stats.pgid);
+            }
+        }
+        Ok(None)
+    }
+
     fn metadata(&self) -> Result<Stat, VfsError> {
         let mut s = Stat::simple(2, InodeKind::CharDevice, 0o666, 0);
         s.rdev = (5 << 8) | 1;
@@ -44,8 +61,15 @@ impl Inode for ConsoleInode {
                 && stats.sid == session
                 && stats.pgid != tty::foreground_pgrp()
             {
+                // POSIX: a blocked or ignored SIGTTIN turns the read into
+                // EIO; an orphaned background group also gets EIO.
+                if crate::signal::signal_ignored(&task, crate::signal::SIGTTIN)
+                    || crate::signal::pgrp_orphaned(stats.pgid, stats.sid)
+                {
+                    return Err(VfsError::IoError);
+                }
                 let _ = crate::signal::send_to_pgrp(stats.pgid, crate::signal::SIGTTIN);
-                return Err(VfsError::WouldBlock);
+                return Err(VfsError::Interrupted);
             }
         }
         tty::poll_serial();

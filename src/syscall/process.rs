@@ -68,7 +68,16 @@ pub fn execve(path: u64, argv: u64, envp: u64) -> i64 {
     };
     let old = task.address_space();
     // No fallible operation remains after descriptor/image publication.
-    vfs::current_fd_table().lock().close_on_exec();
+    if let Err(error) = crate::signal::prepare_exec(&task) {
+        return error.to_errno();
+    }
+    if task.files_shared() {
+        let replacement = Arc::new(SpinLock::new(task.files().lock().clone()));
+        let mut locked = task.lock();
+        locked.fd_table = replacement;
+        locked.files_shared = false;
+    }
+    task.files().lock().close_on_exec();
     arch::disable_interrupts();
     {
         let mut t = task.lock();
@@ -125,6 +134,9 @@ pub fn poll(pointer: u64, count: u64, timeout_ms: i64) -> i64 {
             if ready != 0 || crate::time::uptime_micros() >= deadline {
                 uaccess::write(pointer, &bytes)?;
                 return Ok(ready);
+            }
+            if crate::signal::pending_for_current() {
+                return Err(VfsError::Interrupted);
             }
             sched::sleep_micros(1000);
         }
@@ -217,6 +229,9 @@ pub fn gettid() -> i64 {
 const WNOHANG: u32 = 1;
 const WUNTRACED: u32 = 2;
 const WCONTINUED: u32 = 8;
+const __WNOTHREAD: u32 = 0x2000_0000;
+const __WCLONE: u32 = 0x8000_0000;
+const __WALL: u32 = 0x4000_0000;
 
 /// Linux wait4.  rusage accounting is not implemented yet and is rejected
 /// rather than filled with fabricated values; stopped/continued states are
@@ -225,9 +240,23 @@ pub fn wait4(pid: i64, status: u64, options: u32, rusage: u64) -> i64 {
     if rusage != 0 {
         return -abi::ENOSYS;
     }
-    if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
+    if options & !(WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WCLONE | __WALL) != 0 {
         return -abi::EINVAL;
     }
+    if pid == i32::MIN as i64 {
+        return -abi::ESRCH;
+    }
+    // Normal wait4 ignores clone children whose exit signal is not SIGCHLD;
+    // __WCLONE selects them and __WALL selects both.
+    let exit_matches = |exit_signal: u32| -> bool {
+        if options & __WALL != 0 {
+            true
+        } else if options & __WCLONE != 0 {
+            exit_signal != crate::signal::SIGCHLD
+        } else {
+            exit_signal == crate::signal::SIGCHLD
+        }
+    };
     let Some(current) = crate::sched::current() else {
         return -abi::ESRCH;
     };
@@ -247,7 +276,10 @@ pub fn wait4(pid: i64, status: u64, options: u32, rusage: u64) -> i64 {
     loop {
         for zombie in crate::sched::zombies() {
             let stats = zombie.stats();
-            if stats.ppid != parent || !matches(stats.tgid, stats.pgid) {
+            if stats.ppid != parent
+                || !matches(stats.tgid, stats.pgid)
+                || !exit_matches(stats.exit_signal)
+            {
                 continue;
             }
             // A process with live threads cannot be reaped yet.
@@ -273,6 +305,7 @@ pub fn wait4(pid: i64, status: u64, options: u32, rusage: u64) -> i64 {
                     || stats.ltid != stats.tgid
                     || stats.state == crate::sched::TaskState::Zombie
                     || !matches(stats.tgid, stats.pgid)
+                    || !exit_matches(stats.exit_signal)
                 {
                     continue;
                 }
@@ -304,6 +337,7 @@ pub fn wait4(pid: i64, status: u64, options: u32, rusage: u64) -> i64 {
                     || stats.ltid != stats.tgid
                     || stats.state == crate::sched::TaskState::Zombie
                     || !matches(stats.tgid, stats.pgid)
+                    || !exit_matches(stats.exit_signal)
                 {
                     continue;
                 }

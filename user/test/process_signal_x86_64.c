@@ -16,6 +16,7 @@ static volatile i64 handler_count;
 volatile i32 futex_gate;
 volatile i32 thread_waiting;
 volatile i32 thread_done;
+volatile i32 thread_loop;
 static volatile i32 futex_never;
 static char thread_stack[65536] __attribute__((aligned(16)));
 
@@ -77,6 +78,7 @@ int main(void) {
 
     install_handler(SIGUSR1, handler);
     install_handler(SIGUSR2, handler);
+    install_handler(SIGTERM, terminate_handler);
 
     if (sys_kill(me, SIGUSR1) != 0) {
         fail("E:kill1\n");
@@ -265,19 +267,54 @@ int main(void) {
         fail("E:stopreap\n");
     }
 
-    /* Controlling terminal: claim it, read back the foreground pgrp and the
-     * session id through the console ioctls. */
+    /* Controlling terminal: a session leader's open claims the console and
+     * sets the foreground pgrp, then the ioctls read it back. */
+    i64 console = sys_openat(AT_FDCWD, "/dev/console", O_RDWR, 0);
+    if (console < 0) {
+        fail("E:consoleopen\n");
+    }
     i32 pgrp = (i32)me;
-    if (sys_ioctl(0, TIOCSPGRP, (u64)&pgrp) != 0) {
+    if (sys_ioctl(console, TIOCSPGRP, (u64)&pgrp) != 0) {
         fail("E:spgrp\n");
     }
     pgrp = 0;
-    if (sys_ioctl(0, TIOCGPGRP, (u64)&pgrp) != 0 || pgrp != (i32)me) {
+    if (sys_ioctl(console, TIOCGPGRP, (u64)&pgrp) != 0 || pgrp != (i32)me) {
         fail("E:gpgrp\n");
     }
     u32 session = 0;
-    if (sys_ioctl(0, TIOCGSID, (u64)&session) != 0 || session != (u32)me) {
+    if (sys_ioctl(console, TIOCGSID, (u64)&session) != 0 || session != (u32)me) {
         fail("E:gsid\n");
+    }
+    struct kernel_termios {
+        u32 iflag;
+        u32 oflag;
+        u32 cflag;
+        u32 lflag;
+        unsigned char line;
+        unsigned char cc[19];
+    } __attribute__((packed));
+    struct kernel_termios settings;
+    if (sys_ioctl(console, TCGETS, (u64)&settings) != 0) {
+        fail("E:tcgets\n");
+    }
+    if ((settings.lflag & (ICANON | ECHO)) != (ICANON | ECHO)
+        || (settings.iflag & ICRNL) == 0) {
+        fail("E:termios_default\n");
+    }
+    struct kernel_termios saved = settings;
+    settings.lflag &= ~(ICANON | ECHO);
+    if (sys_ioctl(console, TCSETS, (u64)&settings) != 0) {
+        fail("E:tsets\n");
+    }
+    if (sys_ioctl(console, TCGETS, (u64)&settings) != 0
+        || (settings.lflag & (ICANON | ECHO)) != 0) {
+        fail("E:termios_roundtrip\n");
+    }
+    if (sys_ioctl(console, TCSETS, (u64)&saved) != 0) {
+        fail("E:tsets_restore\n");
+    }
+    if (sys_close(console) != 0) {
+        fail("E:consoleclose\n");
     }
 
     /* A background process group reading the console gets SIGTTIN. */
@@ -312,7 +349,39 @@ int main(void) {
         fail("E:ttinreap\n");
     }
 
+    /* execve keeps the PID and resets handled dispositions.  The child
+     * installs SIGTERM (inherited handler exits 7) and then replaces itself
+     * with a target that loops; default SIGTERM death must report signal 15. */
+    child = sys_fork();
+    if (child == 0) {
+        volatile i32 exec_ctid = -1;
+        thread_loop = 1;
+        thread_ran = 0;
+        u64 sibling_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+                            CLONE_THREAD | CLONE_CHILD_CLEARTID;
+        clone_thread(sibling_flags, thread_stack + sizeof(thread_stack), &exec_ctid);
+        char *argv[] = {(char *)"exec_target", 0};
+        char *envp[] = {0};
+        sys_execve("/tmp/exec_target", argv, envp);
+        sys_exit(1);
+    }
+    if (child < 0) {
+        fail("E:fork5\n");
+    }
+    wait_frames(50000);
+    if (sys_kill(child, SIGTERM) != 0) {
+        fail("E:execkill\n");
+    }
+    status = 0;
+    reaped = sys_wait4(child, &status, 0, 0);
+    if (reaped != child) {
+        fail("E:execwait\n");
+    }
+    if ((status & 0x7f) != SIGTERM) {
+        fail("E:execsig\n");
+    }
+
     const char ok[] = "process/signal ok\n";
     sys_write(1, ok, sizeof(ok) - 1);
-    sys_exit_group(42);
+    sys_exit_group(43);
 }
