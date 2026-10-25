@@ -1,5 +1,4 @@
 <p align="center">
-  <!-- 将生成的 Logo 保存为 docs/SpaceOS9.png；建议 1024x1024 PNG。 -->
   <img src="docs/SpaceOS9.png" alt="SpaceOS-9" width="420">
 </p>
 
