@@ -8,7 +8,10 @@
 //! Core IPC objects.  This module owns the Linux syscall surface for `eventfd2`
 //! and AF_UNIX sockets; the socket state machine lives in `unix`.
 
+pub mod epoll;
 pub mod futex;
+pub mod signalfd;
+pub mod timerfd;
 pub mod unix;
 
 use crate::{
@@ -986,6 +989,172 @@ pub fn getsockopt(fd: u64, level: u64, name: u64, value: u64, length: u64) -> i6
         return error;
     }
     match write_option(&bytes, value, length) {
+        Ok(()) => 0,
+        Err(error) => error.to_errno(),
+    }
+}
+
+// ---- epoll / signalfd / timerfd -------------------------------------------
+
+fn anon_fd(
+    inode: Arc<dyn Inode>,
+    name: alloc::string::String,
+    cloexec: bool,
+    nonblock: bool,
+) -> i64 {
+    let flags = abi::O_RDWR | if nonblock { O_NONBLOCK } else { 0 };
+    let file = Arc::new(OpenFile::new(inode, name, flags));
+    match alloc_file(file, cloexec) {
+        Ok(fd) => fd as i64,
+        Err(error) => error.to_errno(),
+    }
+}
+
+pub fn epoll_create1(flags: u32) -> i64 {
+    let instance = match epoll::create(flags) {
+        Ok(instance) => instance,
+        Err(error) => return error.to_errno(),
+    };
+    anon_fd(
+        instance,
+        String::from("anon_inode:[eventpoll]"),
+        flags & abi::O_CLOEXEC != 0,
+        false,
+    )
+}
+
+pub fn epoll_create(size: i32) -> i64 {
+    if size <= 0 {
+        return -abi::EINVAL;
+    }
+    epoll_create1(0)
+}
+
+pub fn epoll_ctl(epfd: u64, op: u32, fd: i32, event: u64) -> i64 {
+    let instance = match epoll::instance(epfd) {
+        Ok(instance) => instance,
+        Err(error) => return error.to_errno(),
+    };
+    match instance.control(op, fd, event) {
+        Ok(()) => 0,
+        Err(error) => error.to_errno(),
+    }
+}
+
+pub fn epoll_wait(epfd: u64, events: u64, maxevents: u32, timeout: i64) -> i64 {
+    let instance = match epoll::instance(epfd) {
+        Ok(instance) => instance,
+        Err(error) => return error.to_errno(),
+    };
+    instance.wait(events, maxevents, timeout)
+}
+
+pub fn epoll_pwait(
+    epfd: u64,
+    events: u64,
+    maxevents: u32,
+    timeout: i64,
+    sigmask: u64,
+    sigsetsize: u64,
+) -> i64 {
+    if sigmask != 0 {
+        // Temporarily replacing the mask for the duration of the wait needs
+        // scheduler wake integration that does not exist yet.
+        return -abi::ENOSYS;
+    }
+    if sigsetsize != 8 {
+        return -abi::EINVAL;
+    }
+    epoll_wait(epfd, events, maxevents, timeout)
+}
+
+pub fn signalfd4(fd: i64, mask: u64, sigsetsize: u64, flags: u32) -> i64 {
+    if sigsetsize != 8 {
+        return -abi::EINVAL;
+    }
+    if flags & !(abi::O_CLOEXEC | O_NONBLOCK) != 0 {
+        return -abi::EINVAL;
+    }
+    let mask = match uaccess::read_value::<u64>(mask) {
+        Ok(mask) => mask,
+        Err(error) => return error.to_errno(),
+    };
+    let nonblock = flags & O_NONBLOCK != 0;
+    if fd == -1 {
+        let inode = signalfd::SignalFd::new();
+        inode.set_mask(mask);
+        inode.set_nonblock(nonblock);
+        return anon_fd(
+            inode,
+            String::from("anon_inode:[signalfd]"),
+            flags & abi::O_CLOEXEC != 0,
+            nonblock,
+        );
+    }
+    if fd < 0 {
+        return -abi::EBADF;
+    }
+    let instance = match signalfd::instance(fd as u64) {
+        Ok(instance) => instance,
+        Err(error) => return error.to_errno(),
+    };
+    instance.set_mask(mask);
+    fd
+}
+
+pub fn signalfd(fd: i64, mask: u64, sigsetsize: u64) -> i64 {
+    signalfd4(fd, mask, sigsetsize, 0)
+}
+
+pub fn timerfd_create(clockid: u32, flags: u32) -> i64 {
+    const CLOCK_MONOTONIC: u32 = 1;
+    const CLOCK_BOOTTIME: u32 = 7;
+    if flags & !(abi::O_CLOEXEC | O_NONBLOCK) != 0 {
+        return -abi::EINVAL;
+    }
+    if !matches!(clockid, CLOCK_MONOTONIC | CLOCK_BOOTTIME) {
+        // CLOCK_REALTIME needs a wall-clock source that does not exist yet.
+        return -abi::EINVAL;
+    }
+    let nonblock = flags & O_NONBLOCK != 0;
+    anon_fd(
+        timerfd::TimerFd::create(clockid, nonblock),
+        String::from("anon_inode:[timerfd]"),
+        flags & abi::O_CLOEXEC != 0,
+        nonblock,
+    )
+}
+
+pub fn timerfd_settime(fd: u64, flags: u32, new_value: u64, old_value: u64) -> i64 {
+    let instance = match timerfd::instance(fd) {
+        Ok(instance) => instance,
+        Err(error) => return error.to_errno(),
+    };
+    let spec = match uaccess::read_value::<[u64; 4]>(new_value) {
+        Ok(spec) => spec,
+        Err(error) => return error.to_errno(),
+    };
+    let old = match instance.settime(flags, &spec) {
+        Ok(old) => old,
+        Err(error) => return error.to_errno(),
+    };
+    if old_value != 0
+        && let Err(error) = uaccess::write_value(old_value, &old)
+    {
+        return error.to_errno();
+    }
+    0
+}
+
+pub fn timerfd_gettime(fd: u64, old_value: u64) -> i64 {
+    let instance = match timerfd::instance(fd) {
+        Ok(instance) => instance,
+        Err(error) => return error.to_errno(),
+    };
+    if old_value == 0 {
+        return -abi::EFAULT;
+    }
+    match uaccess::write_value(old_value, &instance.gettime()) {
         Ok(()) => 0,
         Err(error) => error.to_errno(),
     }

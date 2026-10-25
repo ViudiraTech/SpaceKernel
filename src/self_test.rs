@@ -47,6 +47,7 @@ pub fn spawn_late() {
                 .expect("process/signal self-test failed");
             crate::vfs::pseudo_test::processes();
             crate::user::self_test::syscalls();
+            crate::user::self_test::ipc_advanced();
             let gpu_status = crate::gpu::self_test::run();
             let rng_status = if crate::random::supported() {
                 "hw"

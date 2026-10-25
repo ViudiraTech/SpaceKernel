@@ -84,8 +84,8 @@ const SIG_UNBLOCK: u64 = 1;
 const SIG_SETMASK: u64 = 2;
 
 const SIGSET_SIZE: u64 = 8;
-const SIGKILL_MASK: u64 = 1 << (SIGKILL - 1);
-const SIGSTOP_MASK: u64 = 1 << (SIGSTOP - 1);
+pub const SIGKILL_MASK: u64 = 1 << (SIGKILL - 1);
+pub const SIGSTOP_MASK: u64 = 1 << (SIGSTOP - 1);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Signal {
@@ -359,6 +359,43 @@ pub fn send_to_pgrp(pgid: u64, number: u32) -> bool {
         return false;
     }
     send_to_group(pgid, Signal::kernel(number))
+}
+
+/// True when a masked signal is pending for the current thread or its group.
+pub fn pending_masked(mask: u64) -> bool {
+    let Some(task) = sched::current() else {
+        return false;
+    };
+    let thread = task.thread_signals();
+    if thread
+        .lock()
+        .pending
+        .iter()
+        .any(|signal| signal_bit(signal.number) & mask != 0)
+    {
+        return true;
+    }
+    task.signals()
+        .shared_pending()
+        .iter()
+        .any(|signal| signal_bit(signal.number) & mask != 0)
+}
+
+/// Dequeue the lowest matching signal from the thread queue, then the shared
+/// queue.  Used by signalfd.
+pub fn take_pending_masked(mask: u64) -> Option<Signal> {
+    let task = sched::current()?;
+    let thread = task.thread_signals();
+    let signal = {
+        let mut state = thread.lock();
+        take_narrowest(&mut state.pending, !mask)
+    };
+    if signal.is_some() {
+        return signal;
+    }
+    let shared = task.signals();
+    let mut queue = shared.shared_pending();
+    take_narrowest(&mut queue, !mask)
 }
 
 /// True when the signal is blocked or its disposition is SIG_IGN for `task`.
@@ -1279,6 +1316,23 @@ pub fn pending_for_current() -> bool {
         .unwrap_or(false)
 }
 
+/// True when delivering this signal would actually run a handler, stop, or
+/// terminate the task.  Ignored and default-ignore signals (notably SIGCHLD)
+/// are excluded so they do not turn interruptible waits into EINTR.
+fn interrupts_wait(task: &sched::TaskRef, number: u32, blocked: u64) -> bool {
+    if signal_bit(number) & blocked != 0 {
+        return false;
+    }
+    let action = task.signals().action(number);
+    if action.handler == SIG_IGN {
+        return false;
+    }
+    if action.handler == SIG_DFL && matches!(default_action(number), DefaultAction::Ignore) {
+        return false;
+    }
+    true
+}
+
 fn has_deliverable(task: &sched::TaskRef) -> bool {
     let thread = task.thread_signals();
     let blocked = thread.lock().blocked;
@@ -1286,14 +1340,14 @@ fn has_deliverable(task: &sched::TaskRef) -> bool {
         .lock()
         .pending
         .iter()
-        .any(|signal| signal_bit(signal.number) & blocked == 0);
+        .any(|signal| interrupts_wait(task, signal.number, blocked));
     if local {
         return true;
     }
     task.signals()
         .shared_pending()
         .iter()
-        .any(|signal| signal_bit(signal.number) & blocked == 0)
+        .any(|signal| interrupts_wait(task, signal.number, blocked))
 }
 
 /// Prepare a thread group for `execve`: other threads are killed and waited

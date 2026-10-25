@@ -790,3 +790,262 @@ pub fn syscalls() {
         "user mmap/mprotect/brk/EFAULT/exec rollback self-test passed"
     ));
 }
+
+/// epoll, signalfd and timerfd semantics through the real syscall dispatcher.
+#[cfg(feature = "boot-self-test")]
+pub fn ipc_advanced() {
+    use crate::{
+        signal::{self, SIGUSR1},
+        sync::SpinLock,
+        syscall::{dispatch, numbers::*},
+        vfs::abi,
+    };
+    use alloc::sync::Arc;
+
+    let task = crate::sched::current().unwrap();
+    let old = task.address_space();
+    let scratch = Arc::new(SpinLock::new(UserAddressSpace::new().unwrap()));
+    scratch.lock().map_zeroed(0x10000, 0x4000, 3).unwrap();
+    task.lock().set_address_space(scratch.clone());
+    scratch.lock().activate();
+
+    let epoll_wait_call = |epfd: i64, events: u64, maxevents: u32, timeout: i64| -> i64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            dispatch(
+                SYS_EPOLL_WAIT,
+                epfd as u64,
+                events,
+                maxevents as u64,
+                timeout as u64,
+                0,
+                0,
+            )
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            dispatch(
+                SYS_EPOLL_PWAIT,
+                epfd as u64,
+                events,
+                maxevents as u64,
+                timeout as u64,
+                0,
+                8,
+            )
+        }
+    };
+    let event_record = |events: u32, data: u64| -> [u8; 12] {
+        let mut record = [0u8; 12];
+        record[0..4].copy_from_slice(&events.to_le_bytes());
+        record[4..12].copy_from_slice(&data.to_le_bytes());
+        record
+    };
+
+    // Level-triggered epoll over an eventfd.
+    let efd = dispatch(SYS_EVENTFD2, 0, abi::O_NONBLOCK as u64, 0, 0, 0, 0);
+    assert!(efd >= 0);
+    let epfd = dispatch(SYS_EPOLL_CREATE1, 0, 0, 0, 0, 0, 0);
+    assert!(epfd >= 0, "epoll_create1 returned {}", epfd);
+    scratch
+        .lock()
+        .write_bytes(0x10000, &event_record(1, 0x1234))
+        .unwrap();
+    assert_eq!(
+        dispatch(SYS_EPOLL_CTL, epfd as u64, 1, efd as u64, 0x10000, 0, 0),
+        0
+    );
+    assert_eq!(
+        dispatch(SYS_EPOLL_CTL, epfd as u64, 1, efd as u64, 0x10000, 0, 0),
+        -abi::EEXIST
+    );
+    assert_eq!(
+        dispatch(SYS_EPOLL_CTL, epfd as u64, 1, epfd as u64, 0x10000, 0, 0),
+        -abi::EINVAL
+    );
+    assert_eq!(epoll_wait_call(epfd, 0x10100, 8, 0), 0);
+    scratch
+        .lock()
+        .write_bytes(0x10200, &5u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(dispatch(SYS_WRITE, efd as u64, 0x10200, 8, 0, 0, 0), 8);
+    assert_eq!(epoll_wait_call(epfd, 0x10100, 8, 1000), 1);
+    let mut record = [0u8; 12];
+    scratch.lock().read_bytes(0x10100, &mut record).unwrap();
+    assert_ne!(u32::from_le_bytes(record[0..4].try_into().unwrap()) & 1, 0);
+    assert_eq!(
+        u64::from_le_bytes(record[4..12].try_into().unwrap()),
+        0x1234
+    );
+    assert_eq!(dispatch(SYS_READ, efd as u64, 0x10210, 8, 0, 0, 0), 8);
+
+    // Edge-triggered reports only after readiness was drained and set again.
+    let ep2 = dispatch(SYS_EPOLL_CREATE1, 0, 0, 0, 0, 0, 0);
+    assert!(ep2 >= 0);
+    scratch
+        .lock()
+        .write_bytes(0x10020, &event_record(1 | 0x8000_0000, 0x55))
+        .unwrap();
+    assert_eq!(
+        dispatch(SYS_EPOLL_CTL, ep2 as u64, 1, efd as u64, 0x10020, 0, 0),
+        0
+    );
+    scratch
+        .lock()
+        .write_bytes(0x10200, &1u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(dispatch(SYS_WRITE, efd as u64, 0x10200, 8, 0, 0, 0), 8);
+    assert_eq!(epoll_wait_call(ep2, 0x10100, 8, 1000), 1);
+    assert_eq!(dispatch(SYS_READ, efd as u64, 0x10210, 8, 0, 0, 0), 8);
+    assert_eq!(epoll_wait_call(ep2, 0x10100, 8, 100), 0);
+    scratch
+        .lock()
+        .write_bytes(0x10200, &1u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(dispatch(SYS_WRITE, efd as u64, 0x10200, 8, 0, 0, 0), 8);
+    assert_eq!(epoll_wait_call(ep2, 0x10100, 8, 1000), 1);
+    assert_eq!(dispatch(SYS_READ, efd as u64, 0x10210, 8, 0, 0, 0), 8);
+
+    // ONESHOT disables the interest until MOD re-arms it.
+    let ep3 = dispatch(SYS_EPOLL_CREATE1, 0, 0, 0, 0, 0, 0);
+    assert!(ep3 >= 0);
+    scratch
+        .lock()
+        .write_bytes(0x10040, &event_record(1 | 0x4000_0000, 0x66))
+        .unwrap();
+    assert_eq!(
+        dispatch(SYS_EPOLL_CTL, ep3 as u64, 1, efd as u64, 0x10040, 0, 0),
+        0
+    );
+    scratch
+        .lock()
+        .write_bytes(0x10200, &1u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(dispatch(SYS_WRITE, efd as u64, 0x10200, 8, 0, 0, 0), 8);
+    assert_eq!(epoll_wait_call(ep3, 0x10100, 8, 1000), 1);
+    assert_eq!(dispatch(SYS_READ, efd as u64, 0x10210, 8, 0, 0, 0), 8);
+    scratch
+        .lock()
+        .write_bytes(0x10200, &1u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(dispatch(SYS_WRITE, efd as u64, 0x10200, 8, 0, 0, 0), 8);
+    assert_eq!(epoll_wait_call(ep3, 0x10100, 8, 100), 0);
+    assert_eq!(
+        dispatch(SYS_EPOLL_CTL, ep3 as u64, 3, efd as u64, 0x10040, 0, 0),
+        0
+    );
+    assert_eq!(epoll_wait_call(ep3, 0x10100, 8, 1000), 1);
+    assert_eq!(dispatch(SYS_READ, efd as u64, 0x10210, 8, 0, 0, 0), 8);
+    assert_eq!(
+        dispatch(SYS_EPOLL_CTL, epfd as u64, 2, efd as u64, 0, 0, 0),
+        0
+    );
+    assert_eq!(
+        dispatch(SYS_EPOLL_CTL, epfd as u64, 2, efd as u64, 0, 0, 0),
+        -abi::ENOENT
+    );
+
+    // signalfd consumes a pending masked signal as a 128-byte record.
+    scratch
+        .lock()
+        .write_bytes(0x10300, &(1u64 << (SIGUSR1 - 1)).to_le_bytes())
+        .unwrap();
+    let sfd = dispatch(
+        SYS_SIGNALFD4,
+        (-1i64) as u64,
+        0x10300,
+        8,
+        abi::O_NONBLOCK as u64,
+        0,
+        0,
+    );
+    assert!(sfd >= 0);
+    signal::send_to_thread(&task, signal::Signal::kernel(SIGUSR1));
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut pollfd = [0u8; 8];
+        pollfd[0..4].copy_from_slice(&(sfd as i32).to_le_bytes());
+        pollfd[4..6].copy_from_slice(&1u16.to_le_bytes());
+        scratch.lock().write_bytes(0x10380, &pollfd).unwrap();
+        assert_eq!(dispatch(SYS_POLL, 0x10380, 1, 1000, 0, 0, 0), 1);
+        scratch.lock().read_bytes(0x10380, &mut pollfd).unwrap();
+        assert_ne!(u16::from_le_bytes(pollfd[6..8].try_into().unwrap()) & 1, 0);
+    }
+    assert_eq!(dispatch(SYS_READ, sfd as u64, 0x10400, 128, 0, 0, 0), 128);
+    let mut info = [0u8; 128];
+    scratch.lock().read_bytes(0x10400, &mut info).unwrap();
+    assert_eq!(u32::from_le_bytes(info[0..4].try_into().unwrap()), SIGUSR1);
+    assert_eq!(u32::from_le_bytes(info[8..12].try_into().unwrap()), 0x80);
+    assert_eq!(
+        dispatch(SYS_READ, sfd as u64, 0x10400, 128, 0, 0, 0),
+        -abi::EAGAIN
+    );
+    assert_eq!(dispatch(SYS_CLOSE, sfd as u64, 0, 0, 0, 0, 0), 0);
+
+    // timerfd: one-shot expiry, periodic ticks and gettime.
+    let tfd = dispatch(SYS_TIMERFD_CREATE, 1, abi::O_NONBLOCK as u64, 0, 0, 0, 0);
+    assert!(tfd >= 0);
+    let mut spec = [0u64; 4];
+    spec[3] = 20_000_000; // value = 20 ms, interval first in itimerspec
+    scratch
+        .lock()
+        .write_bytes(0x10500, unsafe {
+            core::slice::from_raw_parts(spec.as_ptr() as *const u8, 32)
+        })
+        .unwrap();
+    assert_eq!(
+        dispatch(SYS_TIMERFD_SETTIME, tfd as u64, 0, 0x10500, 0, 0, 0),
+        0
+    );
+    assert_eq!(
+        dispatch(SYS_READ, tfd as u64, 0x10580, 8, 0, 0, 0),
+        -abi::EAGAIN
+    );
+    crate::sched::sleep_micros(25_000);
+    assert_eq!(dispatch(SYS_READ, tfd as u64, 0x10580, 8, 0, 0, 0), 8);
+    let mut ticks = [0u8; 8];
+    scratch.lock().read_bytes(0x10580, &mut ticks).unwrap();
+    assert!(u64::from_le_bytes(ticks) >= 1);
+    let mut periodic = [0u64; 4];
+    periodic[1] = 10_000_000; // interval = 10 ms
+    periodic[3] = 10_000_000;
+    scratch
+        .lock()
+        .write_bytes(0x10520, unsafe {
+            core::slice::from_raw_parts(periodic.as_ptr() as *const u8, 32)
+        })
+        .unwrap();
+    assert_eq!(
+        dispatch(SYS_TIMERFD_SETTIME, tfd as u64, 0, 0x10520, 0, 0, 0),
+        0
+    );
+    crate::sched::sleep_micros(35_000);
+    assert_eq!(dispatch(SYS_READ, tfd as u64, 0x10580, 8, 0, 0, 0), 8);
+    scratch.lock().read_bytes(0x10580, &mut ticks).unwrap();
+    assert!(u64::from_le_bytes(ticks) >= 3);
+    assert_eq!(
+        dispatch(SYS_TIMERFD_GETTIME, tfd as u64, 0x105A0, 0, 0, 0, 0),
+        0
+    );
+    let mut current = [0u8; 32];
+    scratch.lock().read_bytes(0x105A0, &mut current).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(current[8..16].try_into().unwrap()),
+        10_000_000
+    );
+
+    for fd in [epfd, ep2, ep3, efd, tfd] {
+        assert_eq!(dispatch(SYS_CLOSE, fd as u64, 0, 0, 0, 0, 0), 0);
+    }
+
+    task.lock().address_space = old.clone();
+    if let Some(old) = old {
+        old.lock().activate();
+    } else {
+        UserAddressSpace::deactivate();
+    }
+    drop(scratch);
+    crate::self_test::verbose_log(format_args!(
+        "epoll/signalfd/timerfd syscall self-test passed"
+    ));
+}

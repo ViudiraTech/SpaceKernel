@@ -218,6 +218,21 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
         SYS_GETPGID => process::getpgid(arg0 as i64),
         SYS_SETSID => process::setsid(),
         SYS_GETSID => process::getsid(arg0 as i64),
+        SYS_EPOLL_CREATE1 => crate::ipc::epoll_create1(arg0 as u32),
+        #[cfg(target_arch = "x86_64")]
+        SYS_EPOLL_CREATE => crate::ipc::epoll_create(arg0 as i32),
+        SYS_EPOLL_CTL => crate::ipc::epoll_ctl(arg0, arg1 as u32, arg2 as i32, arg3),
+        #[cfg(target_arch = "x86_64")]
+        SYS_EPOLL_WAIT => crate::ipc::epoll_wait(arg0, arg1, arg2 as u32, arg3 as i64),
+        SYS_EPOLL_PWAIT => {
+            crate::ipc::epoll_pwait(arg0, arg1, arg2 as u32, arg3 as i64, arg4, arg5)
+        }
+        #[cfg(target_arch = "x86_64")]
+        SYS_SIGNALFD => crate::ipc::signalfd(arg0 as i64, arg1, arg2),
+        SYS_SIGNALFD4 => crate::ipc::signalfd4(arg0 as i64, arg1, arg2, arg3 as u32),
+        SYS_TIMERFD_CREATE => crate::ipc::timerfd_create(arg0 as u32, arg1 as u32),
+        SYS_TIMERFD_SETTIME => crate::ipc::timerfd_settime(arg0, arg1 as u32, arg2, arg3),
+        SYS_TIMERFD_GETTIME => crate::ipc::timerfd_gettime(arg0, arg1),
         SYS_FUTEX => {
             crate::ipc::futex::futex(arg0, arg1 as u32, arg2 as u32, arg3, arg4, arg5 as u32)
         }

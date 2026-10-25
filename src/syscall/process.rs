@@ -273,6 +273,7 @@ pub fn wait4(pid: i64, status: u64, options: u32, rusage: u64) -> i64 {
             child_pgid == pid.unsigned_abs()
         }
     };
+    let mut rechecked = false;
     loop {
         for zombie in crate::sched::zombies() {
             let stats = zombie.stats();
@@ -363,8 +364,15 @@ pub fn wait4(pid: i64, status: u64, options: u32, rusage: u64) -> i64 {
             return 0;
         }
         if crate::signal::pending_for_current() {
+            // A SIGCHLD handler may be pending because the child just exited;
+            // scan once more before reporting EINTR.
+            if !rechecked {
+                rechecked = true;
+                continue;
+            }
             return -abi::EINTR;
         }
+        rechecked = false;
         crate::sched::sleep_micros(1000);
     }
 }
@@ -701,6 +709,7 @@ pub fn waitid(idtype: u32, id: u32, info: u64, options: u32, rusage: u64) -> i64
             _ => pgid == selector_pgid,
         }
     };
+    let mut rechecked = false;
     loop {
         if options & WEXITED != 0 {
             for zombie in crate::sched::zombies() {
@@ -805,8 +814,13 @@ pub fn waitid(idtype: u32, id: u32, info: u64, options: u32, rusage: u64) -> i64
             return 0;
         }
         if crate::signal::pending_for_current() {
+            if !rechecked {
+                rechecked = true;
+                continue;
+            }
             return -abi::EINTR;
         }
+        rechecked = false;
         crate::sched::sleep_micros(1000);
     }
 }
