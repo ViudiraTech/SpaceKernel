@@ -390,6 +390,55 @@ impl X {
         Ok(())
     }
 
+    /// Move a window without touching its size, so dragging does not send a
+    /// redundant resize request on every pointer sample.
+    pub fn move_window(&self, window: Window, x: i16, y: i16) -> Result<()> {
+        self.conn
+            .configure_window(window, &ConfigureWindowAux::new().x(x as i32).y(y as i32))?;
+        Ok(())
+    }
+
+    /// Create an off-screen pixmap matching `window`'s size and depth.
+    pub fn create_backing(&self, window: Window, width: u16, height: u16) -> Result<u32> {
+        let pixmap = self.conn.generate_id()?;
+        self.conn
+            .create_pixmap(self.depth, pixmap, window, width.max(1), height.max(1))?;
+        Ok(pixmap)
+    }
+
+    /// Make `pixmap` the window's background. Xorg then repaints exposed
+    /// regions from it on its own, without an Expose round-trip to the client.
+    pub fn set_background_pixmap(&self, window: Window, pixmap: u32) -> Result<()> {
+        self.conn.change_window_attributes(
+            window,
+            &ChangeWindowAttributesAux::new().background_pixmap(pixmap),
+        )?;
+        Ok(())
+    }
+
+    /// Repaint `area` from the window's background pixmap (server-side copy).
+    pub fn clear_area(&self, window: Window, area: Rect) -> Result<()> {
+        if area.is_empty() {
+            return Ok(());
+        }
+        self.conn.clear_area(
+            false,
+            window,
+            area.x as i16,
+            area.y as i16,
+            area.w as u16,
+            area.h as u16,
+        )?;
+        Ok(())
+    }
+
+    pub fn free_pixmap(&self, pixmap: u32) -> Result<()> {
+        if pixmap != 0 {
+            self.conn.free_pixmap(pixmap)?;
+        }
+        Ok(())
+    }
+
     pub fn focus(&self, window: Window) -> Result<()> {
         self.conn
             .set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME)?;

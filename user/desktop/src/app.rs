@@ -107,6 +107,10 @@ pub struct App {
     pub min_width: u16,
     pub min_height: u16,
     pub canvas: Canvas,
+    /// Server-side copy of `canvas` installed as the window background. Xorg
+    /// repaints uncovered regions from it during a drag, so other applications
+    /// never receive a redraw storm just because a window moved above them.
+    backing: u32,
     pub text: TextRenderer,
     pub settings: SpuiSettings,
     pub theme: Theme,
@@ -157,6 +161,12 @@ impl App {
 
         let text = TextRenderer::load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         let canvas = x.create_canvas(width as usize, height as usize, theme.window);
+        // Keep a server-side copy so Xorg can repaint exposed areas itself
+        // while another window is dragged across this one.
+        let backing = x.create_backing(win, width, height)?;
+        x.put_canvas(backing, &canvas, canvas.bounds())?;
+        x.set_background_pixmap(win, backing)?;
+        x.flush()?;
         Ok(Self {
             x,
             win,
@@ -166,6 +176,7 @@ impl App {
             min_width: 360.min(width),
             min_height: 220.min(height),
             canvas,
+            backing,
             text,
             settings,
             theme,
@@ -309,19 +320,25 @@ impl App {
     fn translate(&mut self, event: Event, events: &mut Vec<UiEvent>) -> Result<()> {
         match event {
             Event::Expose(e) if e.window == self.win => {
-                if self.drawn {
-                    let area = Rect::new(
-                        i32::from(e.x),
-                        i32::from(e.y),
-                        i32::from(e.width),
-                        i32::from(e.height),
-                    );
-                    self.x.put_canvas(self.win, &self.canvas, area)?;
-                    self.x.flush()?;
-                } else {
-                    self.needs_redraw = true;
+                // With a server-side backing pixmap Xorg has already repainted
+                // the exposed rectangle before delivering this event. Handling
+                // it as a UI redraw would make every extra window multiply the
+                // work done during a drag.
+                if self.backing == 0 {
+                    if self.drawn {
+                        let area = Rect::new(
+                            i32::from(e.x),
+                            i32::from(e.y),
+                            i32::from(e.width),
+                            i32::from(e.height),
+                        );
+                        self.x.put_canvas(self.win, &self.canvas, area)?;
+                        self.x.flush()?;
+                    } else {
+                        self.needs_redraw = true;
+                    }
+                    events.push(UiEvent::Expose);
                 }
-                events.push(UiEvent::Expose);
             }
             Event::ConfigureNotify(e) if e.window == self.win => {
                 if e.width != self.width || e.height != self.height {
@@ -333,6 +350,14 @@ impl App {
                         e.height as usize,
                         self.theme.window,
                     );
+                    // Replace the backing store in lockstep with the canvas so
+                    // exposes during the resize also come from the new pixmap.
+                    let old_backing = self.backing;
+                    self.backing = self.x.create_backing(self.win, e.width, e.height)?;
+                    self.x
+                        .put_canvas(self.backing, &self.canvas, self.canvas.bounds())?;
+                    self.x.set_background_pixmap(self.win, self.backing)?;
+                    let _ = self.x.free_pixmap(old_backing);
                     self.drawn = false;
                     self.needs_redraw = true;
                     events.push(UiEvent::Configure {
@@ -491,8 +516,7 @@ impl App {
                                 let ny = orig_y
                                     .saturating_add(e.root_y.saturating_sub(press_ry))
                                     .max(0);
-                                self.x
-                                    .move_resize(self.win, nx, ny, self.width, self.height)?;
+                                self.x.move_window(self.win, nx, ny)?;
                                 self.x.flush()?;
                             }
                             DragState::Resize {
@@ -618,7 +642,14 @@ impl App {
         } else {
             dirty
         };
-        self.x.put_canvas(self.win, &self.canvas, area)?;
+        if self.backing != 0 {
+            // Update the server-side copy, then let Xorg blit it to the window.
+            // The window keeps a valid backing store for later exposes.
+            self.x.put_canvas(self.backing, &self.canvas, area)?;
+            self.x.clear_area(self.win, area)?;
+        } else {
+            self.x.put_canvas(self.win, &self.canvas, area)?;
+        }
         self.x.flush()?;
         self.drawn = true;
         self.needs_redraw = false;
@@ -633,6 +664,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        let _ = self.x.free_pixmap(self.backing);
         self.x.release_canvas(&self.canvas);
     }
 }
