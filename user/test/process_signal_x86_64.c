@@ -96,6 +96,30 @@ static void wait_frames(int count) {
     }
 }
 
+static void register_handler(int sig, void *info, void *context) {
+    (void)sig;
+    (void)info;
+    /* Linux x86_64 ucontext: mcontext starts at byte 40; gregs indices
+     * RCX=14 and R11=3. Signal return must preserve these independently
+     * of the saved RIP/RFLAGS, even when returning through a syscall. */
+    u64 *gregs = (u64 *)((char *)context + 40);
+    gregs[14] = 0x12345678;
+    gregs[3] = 0x76543210;
+}
+
+static void test_sigreturn_registers(i64 pid) {
+    install_handler(SIGUSR1, register_handler);
+    register u64 r11 __asm__("r11");
+    u64 rcx;
+    i64 result;
+    __asm__ volatile("syscall" : "=a"(result), "=c"(rcx), "=r"(r11)
+                     : "a"(SYS_KILL), "D"(pid), "S"(SIGUSR1)
+                     : "memory");
+    if (result != 0 || rcx != 0x12345678 || r11 != 0x76543210) {
+        fail("E:sigreturn-registers\n");
+    }
+}
+
 int main(void) {
     i64 me = sys_getpid();
     if (me <= 0 || sys_gettid() != me) {
@@ -105,6 +129,7 @@ int main(void) {
         fail("E:session\n");
     }
 
+    test_sigreturn_registers(me);
     install_handler(SIGUSR1, handler);
     install_handler(SIGUSR2, handler);
     install_handler(SIGTERM, terminate_handler);

@@ -41,6 +41,14 @@ fn with_creds(mut update: impl FnMut(&mut Credentials) -> Result<(), i64>) -> i6
     0
 }
 
+/// Filesystem identity of the current task for newly created inodes.
+pub fn fs_ids() -> (u32, u32) {
+    current().map_or((0, 0), |task| {
+        let creds = task.credentials();
+        (creds.fsuid, creds.fsgid)
+    })
+}
+
 pub fn getuid() -> i64 {
     current().map_or(0, |task| task.credentials().uid as i64)
 }

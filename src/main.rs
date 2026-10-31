@@ -24,6 +24,7 @@ pub mod device;
 pub mod fpu;
 pub mod gpu;
 mod hardware;
+pub mod input;
 pub mod ipc;
 pub mod irq;
 mod mm;
@@ -171,11 +172,14 @@ pub extern "C" fn kmain() -> ! {
     block::init();
     vfs::init();
     gpu::init();
+    input::init();
     #[cfg(feature = "boot-self-test")]
     self_test::run_early();
     sched::init(boot::cpu_count());
     smp::start();
     kinfo!("Scheduler: per-CPU EEVDF ready");
+    ipc::start_poll_timer();
+    vfs::start_services();
     match boot::init_path() {
         Some(path) => match vfs::read_file(&path) {
             Ok(image) => match user::spawn_init(&image, &path) {

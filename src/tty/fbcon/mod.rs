@@ -213,6 +213,10 @@ impl FbConsole {
 
     /// `tty0` addresses the current foreground terminal, as on Linux.
     pub fn write(&mut self, tty_number: usize, bytes: &[u8]) -> bool {
+        // A display server owns the scanout; drawing text would corrupt it.
+        if crate::tty::vt::graphics_active() {
+            return true;
+        }
         let index = if tty_number == 0 {
             self.active
         } else {

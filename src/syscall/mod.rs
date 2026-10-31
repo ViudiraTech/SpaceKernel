@@ -10,7 +10,9 @@
 
 //! Linux ABI system call dispatcher integrated with the VFS and scheduler subsystems.
 
-mod identity;
+pub mod identity;
+mod linux;
+pub use linux::{flock_release, inherit_limits};
 mod memory;
 mod metadata;
 pub mod numbers;
@@ -42,12 +44,13 @@ pub fn set_last_user_exit_code(code: i32) {
 
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
-pub extern "C" fn spacekernel_syscall_c(frame: *mut crate::arch::SyscallFrame) {
+pub extern "C" fn spacekernel_syscall_c(frame: *mut crate::arch::SyscallFrame) -> u64 {
     // SAFETY: the assembly entry passes its live saved-register frame.
     let frame = unsafe { &mut *frame };
     crate::fpu::disable_current();
     crate::arch::enable_interrupts();
-    if frame.gpr.rax == SYS_RT_SIGRETURN {
+    let full_restore = frame.gpr.rax == SYS_RT_SIGRETURN;
+    if full_restore {
         crate::signal::rt_sigreturn(frame);
     } else {
         let result = dispatch(
@@ -63,10 +66,15 @@ pub extern "C" fn spacekernel_syscall_c(frame: *mut crate::arch::SyscallFrame) {
     }
     crate::arch::disable_interrupts();
     crate::signal::deliver_on_syscall_return(frame);
+    if !full_restore {
+        frame.gpr.rcx = frame.rip;
+        frame.gpr.r11 = frame.flags;
+    }
     // SAFETY: this CPU owns the task and interrupts are masked until SYSRETQ.
     unsafe {
         let _ = crate::fpu::enable_user();
     }
+    u64::from(full_restore)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -91,7 +99,66 @@ pub extern "C" fn spacekernel_syscall_c(
     result
 }
 
+/// Syscall each task is currently inside, exposed as `/proc/<pid>/syscall`
+/// (the standard way to see where a hung process is blocked).
+const CURRENT_SLOTS: usize = 1024;
+static CURRENT_NR: [core::sync::atomic::AtomicU64; CURRENT_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; CURRENT_SLOTS];
+static CURRENT_ARG: [[core::sync::atomic::AtomicU64; 2]; CURRENT_SLOTS] =
+    [const { [const { core::sync::atomic::AtomicU64::new(0) }; 2] }; CURRENT_SLOTS];
+
+/// `(number, arg0, arg1)` of the syscall `tid` is executing, or `None` when it
+/// is running in user mode.
+pub fn current_syscall(tid: u64) -> Option<(u64, u64, u64)> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let slot = tid as usize % CURRENT_SLOTS;
+    let nr = CURRENT_NR[slot].load(Relaxed);
+    (nr != u64::MAX).then(|| (nr, CURRENT_ARG[slot][0].load(Relaxed), CURRENT_ARG[slot][1].load(Relaxed)))
+}
+
 pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    let slot = sched::current().map_or(0, |task| task.stats().tid as usize % CURRENT_SLOTS);
+    CURRENT_ARG[slot][0].store(arg0, core::sync::atomic::Ordering::Relaxed);
+    CURRENT_ARG[slot][1].store(arg1, core::sync::atomic::Ordering::Relaxed);
+    CURRENT_NR[slot].store(num, core::sync::atomic::Ordering::Relaxed);
+    let result = dispatch_inner(num, arg0, arg1, arg2, arg3, arg4, arg5);
+    CURRENT_NR[slot].store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+    // These calls can make another task's descriptor readable or writable.
+    if matches!(
+        num,
+        SYS_WRITE
+            | SYS_WRITEV
+            | SYS_PWRITE64
+            | SYS_SENDTO
+            | SYS_SENDMSG
+            | SYS_CLOSE
+            | SYS_SHUTDOWN
+            | SYS_CONNECT
+            | SYS_ACCEPT
+            | SYS_ACCEPT4
+            | SYS_READ
+            | SYS_READV
+            | SYS_RECVFROM
+            | SYS_RECVMSG
+            | SYS_KILL
+            | SYS_TKILL
+            | SYS_TGKILL
+            | SYS_IOCTL
+    ) {
+        crate::ipc::wake_pollers();
+    }
+    result
+}
+
+fn dispatch_inner(
+    num: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64,
+) -> i64 {
     match num {
         // Core File I/O
         SYS_READ => sys_read(arg0 as i32, arg1 as *mut u8, arg2 as usize),
@@ -126,7 +193,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
         SYS_SETSOCKOPT => crate::ipc::setsockopt(arg0, arg1, arg2, arg3, arg4),
         SYS_GETSOCKOPT => crate::ipc::getsockopt(arg0, arg1, arg2, arg3, arg4),
         SYS_FCNTL => sys_fcntl(arg0 as i32, arg1 as u32, arg2),
-        SYS_IOCTL => sys_ioctl(arg0 as i32, arg1, arg2),
+        SYS_IOCTL => sys_ioctl(arg0 as i32, arg1 as u32, arg2),
 
         // Metadata, Directories & Links
         SYS_FSTAT => sys_fstat(arg0 as i32, arg1 as *mut LinuxStat),
@@ -287,10 +354,10 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
             metadata::fchownat(arg0 as i32, arg1, arg2 as u32, arg3 as u32, arg4 as u32)
         }
         SYS_EXECVE => process::execve(arg0, arg1, arg2),
-        SYS_PPOLL => process::ppoll(arg0, arg1, arg2, arg3),
+        SYS_PPOLL => process::ppoll(arg0, arg1, arg2, arg3, arg4),
         #[cfg(target_arch = "x86_64")]
         SYS_POLL => process::poll(arg0, arg1, arg2 as i32 as i64),
-        SYS_CLOCK_GETTIME => process::clock_gettime(arg0 as u32, arg1),
+        SYS_CLOCK_GETTIME => linux::clock_gettime(arg0 as u32, arg1),
         SYS_GETRANDOM => process::getrandom(arg0, arg1 as usize, arg2 as u32),
         SYS_BRK => sys_brk(arg0),
         SYS_MMAP => memory::mmap(arg0, arg1, arg2 as u32, arg3 as u32, arg4 as i32, arg5),
@@ -298,6 +365,112 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64,
         SYS_MPROTECT => memory::mprotect(arg0, arg1, arg2 as u32),
         #[cfg(target_arch = "x86_64")]
         SYS_ARCH_PRCTL => sys_arch_prctl(arg0 as u32, arg1),
+        SYS_MREMAP => memory::mremap(arg0, arg1, arg2, arg3 as u32, arg4),
+        SYS_MADVISE => memory::madvise(arg0, arg1, arg2 as u32),
+        SYS_MSYNC => memory::msync(arg0, arg1, arg2 as u32),
+        SYS_MINCORE => memory::mincore(arg0, arg1, arg2),
+        SYS_MLOCK | SYS_MUNLOCK => memory::mlock(arg0, arg1),
+        SYS_MLOCK2 => memory::mlock(arg0, arg1),
+        SYS_MLOCKALL | SYS_MUNLOCKALL => 0,
+        SYS_SHMGET => crate::ipc::shm::shmget(arg0 as i32, arg1, arg2 as u32),
+        SYS_SHMAT => crate::ipc::shm::shmat(arg0 as i32, arg1, arg2 as u32),
+        SYS_SHMDT => crate::ipc::shm::shmdt(arg0),
+        SYS_SHMCTL => crate::ipc::shm::shmctl(arg0 as i32, arg1 as u32, arg2),
+        SYS_CLOCK_GETRES => linux::clock_getres(arg0 as u32, arg1),
+        SYS_CLOCK_NANOSLEEP => linux::clock_nanosleep(arg0 as u32, arg1 as u32, arg2, arg3),
+        SYS_CLOCK_SETTIME => linux::clock_settime(arg0 as u32, arg1),
+        SYS_SETTIMEOFDAY => linux::settimeofday(arg0),
+        SYS_GETTIMEOFDAY => linux::gettimeofday(arg0, arg1),
+        SYS_TIMES => linux::times(arg0),
+        SYS_GETRUSAGE => linux::getrusage(arg0 as i32, arg1),
+        SYS_SYSINFO => linux::sysinfo(arg0),
+        SYS_GETRLIMIT => linux::getrlimit(arg0 as u32, arg1),
+        SYS_SETRLIMIT => linux::setrlimit(arg0 as u32, arg1),
+        SYS_PRLIMIT64 => linux::prlimit64(arg0, arg1 as u32, arg2, arg3),
+        SYS_SET_ROBUST_LIST => linux::set_robust_list(arg0, arg1),
+        SYS_GET_ROBUST_LIST => linux::get_robust_list(arg0, arg1, arg2),
+        SYS_RT_SIGTIMEDWAIT => crate::signal::rt_sigtimedwait(arg0, arg1, arg2, arg3),
+        SYS_STATX => linux::statx(arg0 as i32, arg1, arg2 as u32, arg3 as u32, arg4),
+        SYS_PSELECT6 => linux::pselect6(arg0 as i32, arg1, arg2, arg3, arg4, arg5),
+        SYS_EPOLL_PWAIT2 => crate::ipc::epoll_pwait2(arg0, arg1, arg2 as u32, arg3, arg4, arg5),
+        SYS_RENAMEAT => linux::renameat2(arg0 as i32, arg1, arg2 as i32, arg3, 0),
+        SYS_RENAMEAT2 => linux::renameat2(arg0 as i32, arg1, arg2 as i32, arg3, arg4 as u32),
+        SYS_LINKAT => linux::linkat(arg0 as i32, arg1, arg2 as i32, arg3, arg4 as u32),
+        SYS_UTIMENSAT => linux::utimensat(arg0 as i32, arg1, arg2, arg3 as u32),
+        SYS_FCHDIR => linux::fchdir(arg0 as i32),
+        SYS_TRUNCATE => linux::truncate(arg0, arg1),
+        SYS_FDATASYNC => linux::fdatasync(arg0 as i32),
+        SYS_SYNCFS => linux::syncfs(arg0 as i32),
+        SYS_FLOCK => linux::flock(arg0 as i32, arg1 as u32),
+        SYS_PREADV => linux::preadv(arg0 as i32, arg1, arg2, arg3),
+        SYS_PWRITEV => linux::pwritev(arg0 as i32, arg1, arg2, arg3),
+        SYS_FALLOCATE => linux::fallocate(arg0 as i32, arg1 as u32, arg2 as i64, arg3 as i64),
+        SYS_READAHEAD => 0,
+        SYS_CLOSE_RANGE => linux::close_range(arg0 as u32, arg1 as u32, arg2 as u32),
+        SYS_FACCESSAT2 => sys_faccessat(arg0 as i32, arg1 as *const u8, arg2 as u32, arg3 as u32),
+        SYS_CAPGET => linux::capget(arg0, arg1),
+        SYS_CAPSET => linux::capset(arg0, arg1),
+        SYS_PERSONALITY => linux::personality(arg0),
+        SYS_RSEQ => linux::rseq(),
+        SYS_MEMBARRIER => linux::membarrier(arg0 as u32, arg1 as u32),
+        SYS_GETCPU => linux::getcpu(arg0, arg1),
+        SYS_GETPRIORITY => linux::getpriority(arg0 as u32, arg1),
+        SYS_SETPRIORITY => linux::setpriority(arg0 as u32, arg1, arg2 as i32),
+        SYS_SCHED_GETSCHEDULER => linux::sched_getscheduler(arg0),
+        SYS_SCHED_SETSCHEDULER => linux::sched_setscheduler(arg0, arg1 as u32, arg2),
+        SYS_SCHED_GETPARAM => linux::sched_getparam(arg0, arg1),
+        SYS_SCHED_SETPARAM => linux::sched_setparam(arg0, arg1),
+        SYS_SCHED_GET_PRIORITY_MAX => linux::sched_get_priority_max(arg0 as u32),
+        SYS_SCHED_GET_PRIORITY_MIN => linux::sched_get_priority_limit(arg0 as u32),
+        SYS_SCHED_RR_GET_INTERVAL => linux::sched_rr_get_interval(arg0, arg1),
+        SYS_REBOOT => linux::reboot(arg0 as u32, arg1 as u32, arg2 as u32),
+        SYS_SETXATTR | SYS_LSETXATTR | SYS_FSETXATTR => linux::xattr_unsupported(),
+        SYS_REMOVEXATTR | SYS_LREMOVEXATTR | SYS_FREMOVEXATTR => linux::xattr_unsupported(),
+        SYS_GETXATTR | SYS_LGETXATTR | SYS_FGETXATTR => linux::xattr_get_missing(),
+        SYS_LISTXATTR | SYS_LLISTXATTR | SYS_FLISTXATTR => linux::xattr_list_empty(),
+        SYS_CHROOT => -abi::EPERM,
+        SYS_SETITIMER => process::setitimer(arg0 as u32, arg1, arg2),
+        SYS_GETITIMER => process::getitimer(arg0 as u32, arg1),
+        SYS_INOTIFY_INIT1 => crate::ipc::inotify_init1(arg0 as u32),
+        SYS_INOTIFY_ADD_WATCH => crate::ipc::inotify_add_watch(arg0, arg1, arg2 as u32),
+        SYS_INOTIFY_RM_WATCH => crate::ipc::inotify_rm_watch(arg0, arg1 as i32),
+        SYS_CLONE3 => process::clone3(arg0, arg1),
+        #[cfg(target_arch = "x86_64")]
+        SYS_SELECT => linux::select(arg0 as i32, arg1, arg2, arg3, arg4),
+        #[cfg(target_arch = "x86_64")]
+        SYS_RENAME => linux::renameat2(abi::AT_FDCWD, arg0, abi::AT_FDCWD, arg1, 0),
+        #[cfg(target_arch = "x86_64")]
+        SYS_LINK => linux::linkat(abi::AT_FDCWD, arg0, abi::AT_FDCWD, arg1, 0),
+        #[cfg(target_arch = "x86_64")]
+        SYS_CHMOD => metadata::fchmodat(abi::AT_FDCWD, arg0, arg1 as u32, 0),
+        #[cfg(target_arch = "x86_64")]
+        SYS_CHOWN => metadata::fchownat(abi::AT_FDCWD, arg0, arg1 as u32, arg2 as u32, 0),
+        #[cfg(target_arch = "x86_64")]
+        SYS_LCHOWN => metadata::fchownat(
+            abi::AT_FDCWD,
+            arg0,
+            arg1 as u32,
+            arg2 as u32,
+            abi::AT_SYMLINK_NOFOLLOW,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        SYS_TIME => linux::time(arg0),
+        #[cfg(target_arch = "x86_64")]
+        SYS_FUTIMESAT => linux::futimesat(arg0 as i32, arg1, arg2),
+        #[cfg(target_arch = "x86_64")]
+        SYS_UTIMES => linux::futimesat(abi::AT_FDCWD, arg0, arg1),
+        #[cfg(target_arch = "x86_64")]
+        SYS_UTIME => linux::utime(arg0, arg1),
+        #[cfg(target_arch = "x86_64")]
+        SYS_INOTIFY_INIT => crate::ipc::inotify_init1(0),
+        #[cfg(target_arch = "x86_64")]
+        SYS_VFORK => process::clone(0x4000 | 0x100 | 17, 0, 0, 0, 0),
+        #[cfg(target_arch = "x86_64")]
+        SYS_ALARM => process::alarm(arg0 as u32),
+        // I/O port access has no user of record, and granting IOPL 3 would bypass
+        // every kernel driver. Xorg treats this failure as "no legacy VGA ports".
+        #[cfg(target_arch = "x86_64")]
+        SYS_IOPL | SYS_IOPERM => -abi::EPERM,
         _ => {
             kwarn!("unimplemented syscall: num={}", num);
             -abi::ENOSYS
@@ -355,6 +528,20 @@ fn sys_close(fd: i32) -> i64 {
     }
 }
 
+/// Bytes moved per kernel buffer. Regular files and memory devices continue
+/// past it, so large transfers do not surface as short counts.
+const IO_CHUNK: usize = 1024 * 1024;
+
+fn continues_past_chunk(entry: &FdEntry) -> bool {
+    entry.file.inode.metadata().is_ok_and(|meta| {
+        matches!(
+            meta.kind,
+            vfs::InodeKind::Regular | vfs::InodeKind::BlockDevice | vfs::InodeKind::CharDevice
+        ) && !entry.file.abs_path.starts_with("/dev/tty")
+            && entry.file.abs_path != "/dev/console"
+    })
+}
+
 fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     let entry = match get_open_file(fd) {
         Ok(e) => e,
@@ -366,21 +553,42 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     if buf.is_null() {
         return -abi::EFAULT;
     }
-    if let Err(e) = uaccess::check(buf as u64, count.min(65536), true) {
-        return e.to_errno();
-    }
-    let mut kbuf = vec![0u8; count.min(65536)];
-    match entry.file.read(&mut kbuf) {
-        Ok(n) => {
-            if let Err(e) = uaccess::write(buf as u64, &kbuf[..n]) {
-                return e.to_errno();
-            }
-            n as i64
+    let chunk = count.min(IO_CHUNK);
+    let mut kbuf = vec![0u8; chunk];
+    let mut total = 0usize;
+    loop {
+        let want = (count - total).min(chunk);
+        if let Err(e) = uaccess::check(buf as u64 + total as u64, want, true) {
+            return if total > 0 {
+                total as i64
+            } else {
+                e.to_errno()
+            };
         }
-        Err(e) => e.to_errno(),
+        match entry.file.read(&mut kbuf[..want]) {
+            Ok(n) => {
+                if let Err(e) = uaccess::write(buf as u64 + total as u64, &kbuf[..n]) {
+                    return if total > 0 {
+                        total as i64
+                    } else {
+                        e.to_errno()
+                    };
+                }
+                total += n;
+                if n < want || total == count || !continues_past_chunk(&entry) {
+                    return total as i64;
+                }
+            }
+            Err(e) => {
+                return if total > 0 {
+                    total as i64
+                } else {
+                    e.to_errno()
+                };
+            }
+        }
     }
 }
-
 fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
     let entry = match get_open_file(fd) {
         Ok(e) => e,
@@ -392,14 +600,33 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> i64 {
     if buf.is_null() {
         return -abi::EFAULT;
     }
-    let limit = count.min(65536);
-    let mut kbuf = vec![0u8; limit];
-    if let Err(e) = uaccess::read(buf as u64, &mut kbuf) {
-        return e.to_errno();
-    }
-    match entry.file.write(&kbuf) {
-        Ok(n) => n as i64,
-        Err(e) => e.to_errno(),
+    let chunk = count.min(IO_CHUNK);
+    let mut kbuf = vec![0u8; chunk];
+    let mut total = 0usize;
+    loop {
+        let want = (count - total).min(chunk);
+        if let Err(e) = uaccess::read(buf as u64 + total as u64, &mut kbuf[..want]) {
+            return if total > 0 {
+                total as i64
+            } else {
+                e.to_errno()
+            };
+        }
+        match entry.file.write(&kbuf[..want]) {
+            Ok(n) => {
+                total += n;
+                if n < want || total == count || !continues_past_chunk(&entry) {
+                    return total as i64;
+                }
+            }
+            Err(e) => {
+                return if total > 0 {
+                    total as i64
+                } else {
+                    e.to_errno()
+                };
+            }
+        }
     }
 }
 
@@ -839,12 +1066,63 @@ fn decode_termios(bytes: &[u8]) -> crate::tty::Termios {
     }
 }
 
-fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
+const FIONBIO: u64 = 0x5421;
+const FIONCLEX: u64 = 0x5450;
+const FIOCLEX: u64 = 0x5451;
+const FIOASYNC: u64 = 0x5452;
+const TIOCSCTTY: u64 = 0x540E;
+const TIOCNOTTY: u64 = 0x5422;
+
+fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
+    // Linux declares the request as `unsigned int`; musl passes its 32-bit
+    // `int` request through the 64-bit syscall register, so the sign-extended
+    // high half must be discarded before comparing against _IOC-encoded
+    // numbers whose direction bits set bit 31.
+    let cmd = u64::from(cmd);
     let entry = match get_open_file(fd) {
         Ok(e) => e,
         Err(e) => return e.to_errno(),
     };
-    if cmd == abi::TIOCGWINSZ {
+    match cmd {
+        // Generic descriptor ioctls, valid on every file type.
+        FIONBIO => {
+            let enable = match uaccess::read_value::<i32>(arg) {
+                Ok(value) => value != 0,
+                Err(e) => return e.to_errno(),
+            };
+            let flags = entry.file.flags();
+            let updated = if enable {
+                flags | abi::O_NONBLOCK
+            } else {
+                flags & !abi::O_NONBLOCK
+            };
+            return match entry.file.set_flags(updated) {
+                Ok(()) => 0,
+                Err(e) => e.to_errno(),
+            };
+        }
+        FIOCLEX | FIONCLEX => {
+            let result = vfs::current_fd_table()
+                .lock()
+                .set_cloexec(fd as usize, cmd == FIOCLEX);
+            return match result {
+                Ok(()) => 0,
+                Err(e) => e.to_errno(),
+            };
+        }
+        FIOASYNC => return 0,
+        _ => {}
+    }
+    let console_vt = entry.file.inode.console_vt();
+    if let Some(vt) = console_vt
+        && let Some(result) = crate::tty::vt::ioctl(vt, cmd, arg)
+    {
+        return match result {
+            Ok(value) => value as i64,
+            Err(e) => e.to_errno(),
+        };
+    }
+    if console_vt.is_some() && cmd == abi::TIOCGWINSZ {
         let status = crate::tty::status();
         let ws = WinSize {
             ws_row: status.rows.max(25) as u16,
@@ -857,8 +1135,41 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
             Err(e) => e.to_errno(),
         };
     }
-    let console =
-        entry.file.abs_path == "/dev/console" || entry.file.abs_path.starts_with("/dev/tty");
+    let console = console_vt.is_some();
+    if console && cmd == TIOCNOTTY {
+        let Some(task) = sched::current() else {
+            return -abi::ESRCH;
+        };
+        let stats = task.stats();
+        if crate::tty::controlling_session() != stats.sid {
+            return -abi::ENOTTY;
+        }
+        if stats.tgid == stats.sid {
+            crate::tty::release_session(stats.sid);
+        }
+        return 0;
+    }
+    if console && cmd == TIOCSCTTY {
+        let Some(task) = sched::current() else {
+            return -abi::ESRCH;
+        };
+        let stats = task.stats();
+        if stats.tgid != stats.sid {
+            return -abi::EPERM;
+        }
+        if crate::tty::controlling_session() == stats.sid {
+            return 0;
+        }
+        if !crate::tty::assign_session(stats.sid) {
+            if arg != 1 || task.credentials().euid != 0 {
+                return -abi::EPERM;
+            }
+            crate::tty::release_session(crate::tty::controlling_session());
+            crate::tty::assign_session(stats.sid);
+        }
+        crate::tty::set_foreground_pgrp(stats.sid, stats.pgid);
+        return 0;
+    }
     if console && matches!(cmd, abi::TCGETS | abi::TCSETS | abi::TCSETSW | abi::TCSETSF) {
         if cmd == abi::TCGETS {
             let settings = match crate::tty::termios(crate::tty::TtyDevice::Foreground) {
@@ -886,10 +1197,9 @@ fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> i64 {
             -abi::ENOTTY
         };
     }
-    if matches!(cmd, abi::TIOCGPGRP | abi::TIOCSPGRP | abi::TIOCGSID) {
-        if !console {
-            return -abi::ENOTTY;
-        }
+    // Only the console is handled here; other terminals (pty slaves) implement
+    // these requests in their own `Inode::ioctl`.
+    if console && matches!(cmd, abi::TIOCGPGRP | abi::TIOCSPGRP | abi::TIOCGSID) {
         let Some(task) = sched::current() else {
             return -abi::ESRCH;
         };
@@ -1391,6 +1701,17 @@ fn sys_nanosleep(req_ptr: u64) -> i64 {
 }
 
 fn sys_exit(code: i32, group: bool) -> i64 {
+    if let Some(task) = sched::current() {
+        let stats = task.stats();
+        if group || stats.ltid == stats.tgid {
+            crate::tty::vt::release_owner(stats.tgid);
+        }
+        if let Some(space) = task.address_space()
+            && sched::tasks_in_group(stats.tgid).len() <= 1
+        {
+            crate::ipc::shm::release_address_space(space.lock().root_physical());
+        }
+    }
     let leader = sched::current()
         .map(|task| {
             let stats = task.stats();

@@ -1,0 +1,8 @@
+[Unit]
+Description=Serial and framebuffer console shell
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -l
+Restart=always
+RestartSec=1

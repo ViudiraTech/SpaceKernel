@@ -48,6 +48,8 @@ pub const ELOOP: i64 = 40;
 pub const EPROTO: i64 = 71;
 pub const ENOTSOCK: i64 = 88;
 pub const EDESTADDRREQ: i64 = 89;
+pub const EOPNOTSUPP: i64 = 95;
+pub const ENODATA: i64 = 61;
 pub const EMSGSIZE: i64 = 90;
 pub const EPROTOTYPE: i64 = 91;
 pub const ENOPROTOOPT: i64 = 92;
@@ -160,6 +162,19 @@ pub struct WinSize {
     pub ws_ypixel: u16,
 }
 
+/// glibc/Linux 64-bit `dev_t` encoding.
+pub const fn makedev(major: u64, minor: u64) -> u64 {
+    ((major & 0xFFF) << 8) | (minor & 0xFF) | ((major & !0xFFF) << 32) | ((minor & !0xFF) << 12)
+}
+
+pub const fn major(dev: u64) -> u64 {
+    ((dev >> 8) & 0xFFF) | ((dev >> 32) & !0xFFF)
+}
+
+pub const fn minor(dev: u64) -> u64 {
+    (dev & 0xFF) | ((dev >> 12) & !0xFF)
+}
+
 /// Linux `struct stat` on `x86_64` (144 bytes).
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
@@ -238,12 +253,12 @@ impl From<Stat> for LinuxStat {
                 st_size: s.size as i64,
                 st_blksize: s.blksize as i64,
                 st_blocks: s.blocks as i64,
-                st_atime: s.mtime,
-                st_atime_nsec: 0,
+                st_atime: s.atime,
+                st_atime_nsec: s.atime_nsec,
                 st_mtime: s.mtime,
-                st_mtime_nsec: 0,
-                st_ctime: s.mtime,
-                st_ctime_nsec: 0,
+                st_mtime_nsec: s.mtime_nsec,
+                st_ctime: s.ctime,
+                st_ctime_nsec: s.ctime_nsec,
                 __unused: [0; 3],
             }
         }
@@ -262,12 +277,12 @@ impl From<Stat> for LinuxStat {
                 st_blksize: s.blksize as i32,
                 __pad2: 0,
                 st_blocks: s.blocks as i64,
-                st_atime: s.mtime,
-                st_atime_nsec: 0,
+                st_atime: s.atime,
+                st_atime_nsec: s.atime_nsec,
                 st_mtime: s.mtime,
-                st_mtime_nsec: 0,
-                st_ctime: s.mtime,
-                st_ctime_nsec: 0,
+                st_mtime_nsec: s.mtime_nsec,
+                st_ctime: s.ctime,
+                st_ctime_nsec: s.ctime_nsec,
                 __unused4: 0,
                 __unused5: 0,
             }

@@ -17,7 +17,6 @@
 //! file-release cleanup.
 
 use crate::{
-    sched,
     sync::SpinLock,
     user::uaccess,
     vfs::{self, Inode, InodeKind, OpenFile, Stat, VfsError},
@@ -51,6 +50,7 @@ struct Interest {
     data: u64,
     enabled: bool,
     last_ready: u32,
+    last_read_generation: u64,
 }
 
 pub struct EpollInstance {
@@ -117,6 +117,7 @@ impl EpollInstance {
                     data,
                     enabled: true,
                     last_ready: 0,
+                    last_read_generation: 0,
                 });
                 Ok(())
             }
@@ -133,6 +134,7 @@ impl EpollInstance {
                 interest.data = data;
                 interest.enabled = true;
                 interest.last_ready = 0;
+                interest.last_read_generation = 0;
                 Ok(())
             }
             EPOLL_CTL_DEL => {
@@ -189,8 +191,13 @@ impl EpollInstance {
                         continue;
                     }
                     let report = if interest.events & EPOLLET != 0 {
-                        let novel = ready & !interest.last_ready;
+                        let generation = interest.file.inode.poll_read_generation();
+                        let mut novel = ready & !interest.last_ready;
+                        if generation != interest.last_read_generation {
+                            novel |= ready & EPOLLIN;
+                        }
                         interest.last_ready = ready;
+                        interest.last_read_generation = generation;
                         novel
                     } else {
                         ready
@@ -222,7 +229,7 @@ impl EpollInstance {
             if crate::signal::pending_for_current() {
                 return -crate::vfs::abi::EINTR;
             }
-            sched::sleep_micros(1000);
+            crate::ipc::wait_pollers(None);
         }
     }
 

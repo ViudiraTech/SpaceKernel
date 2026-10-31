@@ -39,7 +39,7 @@ pub const F_SEAL_FUTURE_WRITE: u32 = 16;
 pub const F_SEAL_EXEC: u32 = 32;
 
 const PAGE_SIZE: u64 = 4096;
-const MAX_SIZE: u64 = 256 * 1024 * 1024;
+const MAX_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 
 struct MemFdState {
     pages: BTreeMap<u64, u64>,
@@ -145,17 +145,26 @@ impl Inode for MemFd {
             return Ok(0);
         }
         let count = (state.size - offset).min(buf.len() as u64) as usize;
-        for (index, slot) in buf[..count].iter_mut().enumerate() {
-            let position = offset + index as u64;
+        let mut done = 0;
+        while done < count {
+            let position = offset + done as u64;
             let page = position / PAGE_SIZE;
             let within = (position % PAGE_SIZE) as usize;
-            *slot = if let Some(&frame) = state.pages.get(&page) {
-                // SAFETY: the frame is owned by this inode and the offset is
-                // within the page.
-                unsafe { (pmm::phys_to_virt(frame) as *const u8).add(within).read() }
+            let chunk = (4096 - within).min(count - done);
+            if let Some(&frame) = state.pages.get(&page) {
+                // SAFETY: the frame is owned by this inode and the range stays
+                // within one page.
+                let source = unsafe {
+                    core::slice::from_raw_parts(
+                        (pmm::phys_to_virt(frame) as *const u8).add(within),
+                        chunk,
+                    )
+                };
+                buf[done..done + chunk].copy_from_slice(source);
             } else {
-                0
-            };
+                buf[done..done + chunk].fill(0);
+            }
+            done += chunk;
         }
         Ok(count)
     }
@@ -175,17 +184,23 @@ impl Inode for MemFd {
         if state.seals & F_SEAL_GROW != 0 && end > state.size {
             return Err(VfsError::NotPermitted);
         }
-        for (index, &byte) in buf.iter().enumerate() {
-            let position = offset + index as u64;
+        let mut done = 0;
+        while done < buf.len() {
+            let position = offset + done as u64;
             let page = position / PAGE_SIZE;
             let within = (position % PAGE_SIZE) as usize;
+            let chunk = (4096 - within).min(buf.len() - done);
             let frame = Self::ensure_page(&mut state, page)?;
-            // SAFETY: the frame is owned by this inode.
+            // SAFETY: the frame is owned by this inode and the range stays
+            // within one page.
             unsafe {
-                (pmm::phys_to_virt(frame) as *mut u8)
-                    .add(within)
-                    .write(byte);
+                core::ptr::copy_nonoverlapping(
+                    buf[done..].as_ptr(),
+                    (pmm::phys_to_virt(frame) as *mut u8).add(within),
+                    chunk,
+                );
             }
+            done += chunk;
         }
         state.size = state.size.max(end);
         Ok(buf.len())
@@ -201,6 +216,33 @@ impl Inode for MemFd {
         }
         if size > state.size && state.seals & F_SEAL_GROW != 0 {
             return Err(VfsError::NotPermitted);
+        }
+        // Pages past the new EOF are zeroed, not freed: other address spaces may
+        // still map them, and a later grow must read back zeroes.
+        if size < state.size {
+            let first_whole = size.div_ceil(PAGE_SIZE);
+            let frames: Vec<u64> = state
+                .pages
+                .range(first_whole..)
+                .map(|(_, &frame)| frame)
+                .collect();
+            for frame in frames {
+                // SAFETY: the frame stays owned by this inode.
+                unsafe { core::ptr::write_bytes(pmm::phys_to_virt(frame) as *mut u8, 0, 4096) };
+            }
+            let within = (size % PAGE_SIZE) as usize;
+            if within != 0
+                && let Some(&frame) = state.pages.get(&(size / PAGE_SIZE))
+            {
+                // SAFETY: as above; the range stays within one page.
+                unsafe {
+                    core::ptr::write_bytes(
+                        (pmm::phys_to_virt(frame) as *mut u8).add(within),
+                        0,
+                        4096 - within,
+                    );
+                }
+            }
         }
         state.size = size;
         Ok(())
@@ -230,35 +272,35 @@ impl Inode for MemFd {
         if writable && state.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
             return Err(VfsError::NotPermitted);
         }
-        let mut mappings = Vec::new();
-        let mut delta = 0u64;
-        while delta < length {
-            let file_offset = offset.saturating_add(delta);
-            if file_offset >= state.size {
-                break;
-            }
-            let page = file_offset / PAGE_SIZE;
-            let frame = Self::ensure_page(&mut state, page)?;
-            mappings.push((address + delta, frame));
-            delta += PAGE_SIZE;
-        }
-        drop(state);
-        for (index, (target, frame)) in mappings.iter().enumerate() {
-            if space
-                .map_external(*target, *frame, prot, owner.clone())
-                .is_err()
-            {
-                for (mapped, _) in &mappings[..index] {
-                    let _ = space.unmap(*mapped, PAGE_SIZE);
-                }
-                return Err(VfsError::NoMemory);
-            }
-        }
         if writable {
-            let mut state = self.state.lock();
             state.writable_maps = state.writable_maps.saturating_add(1);
         }
-        Ok(())
+        drop(state);
+        space.map_lazy(address, length, prot, 7, Some(owner), offset, true)
+    }
+
+    fn mmap_page(
+        &self,
+        space: &mut UserAddressSpace,
+        page: u64,
+        offset: u64,
+        prot: u32,
+    ) -> Result<(), VfsError> {
+        let owner: Arc<dyn Inode> = self
+            .self_reference
+            .lock()
+            .upgrade()
+            .ok_or(VfsError::NoDevice)?;
+        let mut state = self.state.lock();
+        // Touching past EOF is a bus error on Linux; there is no page to map.
+        if offset >= state.size {
+            return Err(VfsError::Fault);
+        }
+        let frame = Self::ensure_page(&mut state, offset / PAGE_SIZE)?;
+        drop(state);
+        space
+            .map_external(page, frame, prot, owner)
+            .map_err(|_| VfsError::NoMemory)
     }
 }
 

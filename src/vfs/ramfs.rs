@@ -59,6 +59,16 @@ impl RamInode {
         })
     }
 
+    fn new_socket(mode: u32) -> Arc<Self> {
+        Arc::new(Self {
+            ino: alloc_ino(),
+            kind: InodeKind::Socket,
+            owner: SpinLock::new((0, 0)),
+            mode: SpinLock::new(mode),
+            data: SpinLock::new(RamNodeData::Regular(Vec::new())),
+        })
+    }
+
     pub fn new_symlink(target: &str) -> Arc<Self> {
         Arc::new(Self {
             ino: alloc_ino(),
@@ -193,6 +203,7 @@ impl Inode for RamInode {
                     InodeKind::Regular => RamInode::new_file(mode),
                     InodeKind::Directory => RamInode::new_dir(mode),
                     InodeKind::Fifo => super::FifoInode::new(),
+                    InodeKind::Socket => RamInode::new_socket(mode),
                     _ => return Err(VfsError::NotSupported),
                 };
                 children.insert(String::from(name), node.clone());
@@ -239,6 +250,73 @@ impl Inode for RamInode {
             }
             _ => Err(VfsError::NotADirectory),
         }
+    }
+
+    fn link(&self, name: &str, target: &Arc<dyn Inode>) -> Result<(), VfsError> {
+        if target.metadata()?.kind == InodeKind::Directory {
+            return Err(VfsError::NotPermitted);
+        }
+        self.insert_node(name, target.clone())
+    }
+
+    fn rename(
+        &self,
+        old_name: &str,
+        new_parent: &Arc<dyn Inode>,
+        new_name: &str,
+        no_replace: bool,
+    ) -> Result<(), VfsError> {
+        let any: Arc<dyn core::any::Any + Send + Sync> = new_parent.clone();
+        let destination = any
+            .downcast::<RamInode>()
+            .map_err(|_| VfsError::CrossDevice)?;
+        if new_name.is_empty() || new_name == "." || new_name == ".." || new_name.contains('/') {
+            return Err(VfsError::InvalidArgument);
+        }
+        let node = match &*self.data.lock() {
+            RamNodeData::Directory(children) => {
+                children.get(old_name).cloned().ok_or(VfsError::NotFound)?
+            }
+            _ => return Err(VfsError::NotADirectory),
+        };
+        let moving_dir = node.metadata()?.kind == InodeKind::Directory;
+        let existing = match &*destination.data.lock() {
+            RamNodeData::Directory(children) => children.get(new_name).cloned(),
+            _ => return Err(VfsError::NotADirectory),
+        };
+        if let Some(existing) = existing {
+            if Arc::ptr_eq(&existing, &node) {
+                return Ok(());
+            }
+            if no_replace {
+                return Err(VfsError::AlreadyExists);
+            }
+            let existing_dir = existing.metadata()?.kind == InodeKind::Directory;
+            if moving_dir && !existing_dir {
+                return Err(VfsError::NotADirectory);
+            }
+            if !moving_dir && existing_dir {
+                return Err(VfsError::IsADirectory);
+            }
+            if existing_dir
+                && existing
+                    .readdir()?
+                    .iter()
+                    .any(|e| e.name != "." && e.name != "..")
+            {
+                return Err(VfsError::NotEmpty);
+            }
+        }
+        if let RamNodeData::Directory(children) = &mut *destination.data.lock() {
+            children.insert(String::from(new_name), node);
+        }
+        if let RamNodeData::Directory(children) = &mut *self.data.lock() {
+            if core::ptr::eq(self, destination.as_ref()) && old_name == new_name {
+                return Ok(());
+            }
+            children.remove(old_name);
+        }
+        Ok(())
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn Inode>, VfsError> {

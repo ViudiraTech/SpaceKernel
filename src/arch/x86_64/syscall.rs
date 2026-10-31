@@ -20,7 +20,13 @@ spacekernel_x86_64_syscall_entry:
     swapgs
     mov gs:[16], rsp
     mov rsp, gs:[8]
-    push qword ptr gs:[16]   /* user RSP */
+    /* Separate IRET state from RCX/R11: rt_sigreturn must restore both
+       registers when an asynchronous signal interrupted ordinary code. */
+    push 0x1b
+    push qword ptr gs:[16]
+    push r11
+    push 0x23
+    push rcx
     push rax
     push rdi
     push rsi
@@ -40,6 +46,8 @@ spacekernel_x86_64_syscall_entry:
     mov rdi, rsp
     call spacekernel_syscall_c
     mov qword ptr gs:[24], 0
+    test eax, eax
+    jnz .Lsyscall_iret
     pop r15
     pop r14
     pop r13
@@ -55,9 +63,28 @@ spacekernel_x86_64_syscall_entry:
     pop rsi
     pop rdi
     pop rax
+    add rsp, 24              /* skip RIP, CS, RFLAGS */
     pop rsp
     swapgs
     sysretq
+.Lsyscall_iret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    pop r11
+    pop rcx
+    pop r9
+    pop r8
+    pop r10
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rax
+    swapgs
+    iretq
 "#
 );
 
@@ -165,8 +192,8 @@ pub unsafe fn enter_user_mode(entry: u64, user_sp: u64) -> ! {
 }
 
 /// User register state captured at a `syscall` boundary.  Only the state that
-/// the x86-64 syscall ABI does not permit the kernel to clobber is needed for
-/// a fork child to resume after the syscall with RAX = 0.
+/// the x86-64 syscall ABI preserves is needed for a clone child to resume
+/// after the syscall with RAX = 0, including the argument registers.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct UserContext {
@@ -181,6 +208,12 @@ pub struct UserContext {
     pub r15: u64,
     pub fs_base: u64,
     pub gs_base: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub r10: u64,
+    pub r8: u64,
+    pub r9: u64,
 }
 
 fn read_msr(msr: u32) -> u64 {
@@ -230,8 +263,8 @@ pub fn capture_user_context() -> Option<UserContext> {
     unsafe {
         let frame = &*(frame as *const crate::arch::SyscallFrame);
         Some(UserContext {
-            rip: frame.gpr.rcx,
-            rflags: frame.gpr.r11,
+            rip: frame.rip,
+            rflags: frame.flags,
             rsp: frame.rsp,
             rbx: frame.gpr.rbx,
             rbp: frame.gpr.rbp,
@@ -239,6 +272,12 @@ pub fn capture_user_context() -> Option<UserContext> {
             r13: frame.gpr.r13,
             r14: frame.gpr.r14,
             r15: frame.gpr.r15,
+            rdi: frame.gpr.rdi,
+            rsi: frame.gpr.rsi,
+            rdx: frame.gpr.rdx,
+            r10: frame.gpr.r10,
+            r8: frame.gpr.r8,
+            r9: frame.gpr.r9,
             fs_base: read_msr(0xc000_0100),
             gs_base: read_msr(0xc000_0102),
         })
@@ -273,6 +312,12 @@ pub unsafe fn enter_user_context(context: &UserContext) -> ! {
             "mov rcx, [rdi + 0]",
             "mov r11, [rdi + 8]",
             "mov rsp, [rdi + 16]",
+            "mov rsi, [rdi + 96]",
+            "mov rdx, [rdi + 104]",
+            "mov r10, [rdi + 112]",
+            "mov r8, [rdi + 120]",
+            "mov r9, [rdi + 128]",
+            "mov rdi, [rdi + 88]",
             "xor eax, eax",
             "swapgs",
             "sysretq",

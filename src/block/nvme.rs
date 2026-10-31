@@ -18,7 +18,7 @@ use crate::{
     kinfo, kwarn,
     mm::{pmm, vmm},
     pci,
-    sync::SpinLock,
+    sync::Mutex,
 };
 use alloc::{format, string::String, sync::Arc, vec::Vec};
 
@@ -50,6 +50,7 @@ const NVME_IO_FLUSH: u8 = 0x00;
 const NVME_IO_WRITE: u8 = 0x01;
 const NVME_IO_READ: u8 = 0x02;
 
+const COMMAND_TIMEOUT_MICROS: u64 = 30_000_000;
 const QUEUE_DEPTH: usize = 64; // 64 entries: SQ = 4096 B (1 page), CQ = 1024 B (1 page)
 
 /// 64-byte NVMe Submission Queue Entry (SQE).
@@ -143,15 +144,24 @@ impl QueuePair {
         }
 
         // Poll Completion Queue Entry for matching Phase Tag
+        // A flush can take as long as the host's fsync, so the limit is wall
+        // time. Spin briefly for the fast read case, then let other tasks run.
         let mut cqe = NvmeCompletion::default();
         let mut completed = false;
-        for _ in 0..2_000_000 {
+        let started = crate::time::uptime_micros();
+        let mut spins = 0u32;
+        while crate::time::uptime_micros().saturating_sub(started) < COMMAND_TIMEOUT_MICROS {
             cqe = unsafe { cq_ptr.add(self.cq_head as usize).read_volatile() };
             if (cqe.status & 1) == self.phase {
                 completed = true;
                 break;
             }
-            core::hint::spin_loop();
+            spins += 1;
+            if spins > 2000 && crate::sched::current().is_some() {
+                crate::sched::yield_now();
+            } else {
+                core::hint::spin_loop();
+            }
         }
         if !completed {
             return Err(BlockError::Timeout);
@@ -189,7 +199,7 @@ struct NvmeControllerState {
 
 pub struct NvmeNamespace {
     info: BlockDeviceInfo,
-    ctrl: Arc<SpinLock<NvmeControllerState>>,
+    ctrl: Arc<Mutex<NvmeControllerState>>,
     nsid: u32,
     lba_shift: u8,
 }
@@ -505,7 +515,7 @@ fn init_controller(dev: &pci::DeviceInfo, ctrl_index: usize) -> Option<Vec<Arc<d
             return None;
         }
 
-        let ctrl_state = Arc::new(SpinLock::new(NvmeControllerState {
+        let ctrl_state = Arc::new(Mutex::new(NvmeControllerState {
             mmio_base: mmio,
             db_stride,
             admin_qp,

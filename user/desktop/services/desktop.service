@@ -1,0 +1,8 @@
+[Unit]
+Description=SpaceOS desktop session (Xorg and SPUI)
+
+[Service]
+Type=simple
+ExecStart=/bin/sh /usr/share/spui/session.sh
+Restart=on-failure
+RestartSec=3

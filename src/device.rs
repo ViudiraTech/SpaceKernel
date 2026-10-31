@@ -112,6 +112,12 @@ impl Inode for DeviceNode {
         self.check()?;
         self.session.sync()
     }
+    fn set_nonblock(&self, nonblock: bool) -> Result<(), VfsError> {
+        self.session.set_nonblock(nonblock)
+    }
+    fn console_vt(&self) -> Option<usize> {
+        self.session.console_vt()
+    }
     fn chmod(&self, mode: u32) -> Result<(), VfsError> {
         self.metadata.lock().mode = mode & 0o7777;
         Ok(())
@@ -245,6 +251,51 @@ pub fn register(
     backend: Option<Arc<dyn Inode>>,
     attributes: Vec<(&str, Arc<dyn Inode>)>,
 ) -> Result<Arc<Device>, VfsError> {
+    register_inner(name, subsystem, node, backend, attributes, None, Vec::new())
+}
+
+/// Like `register`, with extra `KEY=VALUE` properties for `uevent` and netlink.
+pub fn register_with_uevent(
+    name: &str,
+    subsystem: &str,
+    node: Option<&str>,
+    backend: Option<Arc<dyn Inode>>,
+    attributes: Vec<(&str, Arc<dyn Inode>)>,
+    properties: Vec<(String, String)>,
+) -> Result<Arc<Device>, VfsError> {
+    register_inner(name, subsystem, node, backend, attributes, None, properties)
+}
+
+/// Register a device nested below `parent` in `/sys/devices`, as udev expects
+/// for class devices such as `input0/event0`.
+pub fn register_child(
+    parent: &Arc<Device>,
+    name: &str,
+    subsystem: &str,
+    node: Option<&str>,
+    backend: Option<Arc<dyn Inode>>,
+    attributes: Vec<(&str, Arc<dyn Inode>)>,
+) -> Result<Arc<Device>, VfsError> {
+    register_inner(
+        name,
+        subsystem,
+        node,
+        backend,
+        attributes,
+        Some(parent),
+        Vec::new(),
+    )
+}
+
+fn register_inner(
+    name: &str,
+    subsystem: &str,
+    node: Option<&str>,
+    backend: Option<Arc<dyn Inode>>,
+    attributes: Vec<(&str, Arc<dyn Inode>)>,
+    parent_device: Option<&Arc<Device>>,
+    properties: Vec<(String, String)>,
+) -> Result<Arc<Device>, VfsError> {
     init_empty();
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err(VfsError::InvalidArgument);
@@ -254,7 +305,12 @@ pub fn register(
     }
     let directory = Directory::new(0o555, false);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path = format!("/devices/{}", name);
+    let path = match parent_device {
+        Some(parent) => format!("{}/{}", parent.path, name),
+        None => format!("/devices/{}", name),
+    };
+    // Relative route from this device's sysfs directory back to /sys.
+    let to_sys = "../".repeat(path.split('/').filter(|part| !part.is_empty()).count());
     let mut meta = if let Some(b) = &backend {
         b.metadata()?
     } else {
@@ -280,17 +336,19 @@ pub fn register(
         });
         directory.insert(key, wrapped)?;
     }
+    let extra: String = properties
+        .iter()
+        .map(|(key, value)| format!("{}={}\n", key, value))
+        .collect();
+    let major = crate::vfs::abi::major(meta.rdev);
+    let minor = crate::vfs::abi::minor(meta.rdev);
     let uevent_text = format!(
-        "DEVPATH={}\nSUBSYSTEM={}\n{}",
+        "DEVPATH={}\nSUBSYSTEM={}\n{}{}",
         path,
         subsystem,
-        node.map(|n| format!(
-            "DEVNAME={}\nMAJOR={}\nMINOR={}\n",
-            n,
-            meta.rdev >> 8,
-            meta.rdev & 255
-        ))
-        .unwrap_or_default()
+        node.map(|n| format!("DEVNAME={}\nMAJOR={}\nMINOR={}\n", n, major, minor))
+            .unwrap_or_default(),
+        extra
     );
     let uevent_attr = Attribute::writable(
         0o644,
@@ -320,7 +378,7 @@ pub fn register(
             "dev",
             Arc::new(ActiveAttr {
                 device: device.clone(),
-                inner: Attribute::text(format!("{}:{}\n", meta.rdev >> 8, meta.rdev & 255)),
+                inner: Attribute::text(format!("{}:{}\n", major, minor)),
             }),
         )?;
     }
@@ -374,14 +432,20 @@ pub fn register(
     directory.insert(
         "subsystem",
         Symlink::new(&format!(
-            "../../{}/{}",
+            "{}{}/{}",
+            to_sys,
             if subsystem == "pci" { "bus" } else { "class" },
             subsystem
         )),
     )?;
-    m.devices.insert(name, directory.clone())?;
+    if let Some(parent) = parent_device {
+        parent.directory.insert(name, directory.clone())?;
+        directory.insert("device", Symlink::new(".."))?;
+    } else {
+        m.devices.insert(name, directory.clone())?;
+    }
     let class = m.classes.get(subsystem).unwrap().clone();
-    class.insert(name, Symlink::new(&format!("../../devices/{}", name)))?;
+    class.insert(name, Symlink::new(&format!("../..{}", path)))?;
     if let Some((parent, leaf)) = node_parent {
         let wrapper: Arc<dyn Inode> = Arc::new(DeviceNode {
             device: device.clone(),
@@ -412,9 +476,9 @@ pub fn register(
                 d
             }
         };
-        let key = format!("{}:{}", meta.rdev >> 8, meta.rdev & 255);
+        let key = format!("{}:{}", major, minor);
         if parent.lookup(&key).is_err() {
-            parent.insert_node(&key, Symlink::new(&format!("../../devices/{}", name)))?;
+            parent.insert_node(&key, Symlink::new(&format!("../..{}", path)))?;
         }
     }
     if subsystem == "pci" {
@@ -456,8 +520,20 @@ pub fn register(
     m.events.push_back(Event {
         sequence,
         action: "add",
-        path,
+        path: path.clone(),
     });
+    drop(manager);
+    let mut uevent: Vec<(String, String)> = alloc::vec![
+        (String::from("SUBSYSTEM"), String::from(subsystem)),
+        (String::from("SEQNUM"), format!("{}", sequence)),
+    ];
+    if let Some(node) = node {
+        uevent.push((String::from("DEVNAME"), String::from(node)));
+        uevent.push((String::from("MAJOR"), format!("{}", major)));
+        uevent.push((String::from("MINOR"), format!("{}", minor)));
+    }
+    uevent.extend(properties);
+    crate::ipc::netlink::broadcast_uevent("add", &path, &uevent);
     Ok(device)
 }
 pub fn unregister(id: u64) -> Result<(), VfsError> {
@@ -622,7 +698,53 @@ pub fn init() {
             } else {
                 None
             };
+        let address = pci.address;
+        let config_attr = Attribute::new(0o444, move || {
+            let config = crate::pci::config_for(address).map_err(|_| VfsError::IoError)?;
+            let mut bytes = alloc::vec![0u8; 256];
+            for (offset, byte) in bytes.iter_mut().enumerate() {
+                *byte = config.read_u8(offset as u16).unwrap_or(0xFF);
+            }
+            Ok(bytes)
+        });
+        let mut resource_text = String::new();
+        for slot in 0..6 {
+            use crate::pci::Bar;
+            // `start end flags`, as Linux prints; 0x200 is IORESOURCE_MEM.
+            match pci.bars.get(slot).copied().flatten() {
+                Some(Bar::Memory32 { base, .. }) => resource_text.push_str(&format!(
+                    "0x{:016x} 0x{:016x} 0x{:016x}\n",
+                    base,
+                    u64::from(base) + 0xFFF,
+                    0x40200u64
+                )),
+                Some(Bar::Memory64 { base, .. }) => resource_text.push_str(&format!(
+                    "0x{:016x} 0x{:016x} 0x{:016x}\n",
+                    base,
+                    base + 0xFFF,
+                    0x140204u64
+                )),
+                _ => resource_text
+                    .push_str("0x0000000000000000 0x0000000000000000 0x0000000000000000\n"),
+            }
+        }
+        let is_display = pci.class == 0x03;
         let mut attrs: Vec<(&str, Arc<dyn Inode>)> = alloc::vec![
+            ("config", config_attr),
+            ("resource", Attribute::text(resource_text)),
+            ("irq", Attribute::text("0\n")),
+            (
+                "subsystem_vendor",
+                Attribute::text(format!("0x{:04x}\n", pci.vendor_id))
+            ),
+            (
+                "subsystem_device",
+                Attribute::text(format!("0x{:04x}\n", pci.device_id))
+            ),
+            (
+                "boot_vga",
+                Attribute::text(if is_display { "1\n" } else { "0\n" })
+            ),
             (
                 "vendor",
                 Attribute::text(format!("0x{:04x}\n", pci.vendor_id))

@@ -16,6 +16,7 @@ pub mod abi;
 pub mod dcache;
 pub mod devfs;
 pub mod devtmpfs;
+pub mod ext4;
 pub mod fat32;
 pub mod fd;
 pub mod fifo;
@@ -36,7 +37,7 @@ pub use fifo::FifoInode;
 pub use inode::{CacheMode, DirEntry, FileSystem, Inode, InodeKind, Stat, StatFs, VfsError};
 pub use path::{normalize_path, split_parent_name};
 
-use crate::{block, kinfo, sched, sync::SpinLock};
+use crate::{block, kinfo, kwarn, sched, sync::SpinLock};
 use alloc::{format, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -170,7 +171,13 @@ pub fn mount_by_type(source: &str, target: &str, fstype: &str) -> Result<(), Vfs
         "ramfs" | "tmpfs" => Arc::new(ramfs::RamFs::new()),
         "devfs" | "devtmpfs" => Arc::new(devtmpfs::DevTmpFs),
         "sysfs" => Arc::new(sysfs::SysFs),
+        "devpts" => Arc::new(crate::tty::pty::DevPts),
         "proc" | "procfs" => Arc::new(procfs::ProcFs::new()),
+        "ext4" | "ext3" | "ext2" => {
+            let dev_name = source.strip_prefix("/dev/").unwrap_or(source);
+            let (_, dev) = block::find_device(dev_name).ok_or(VfsError::NotFound)?;
+            ext4::Ext4Fs::mount(dev)?
+        }
         "vfat" | "fat32" | "msdos" => {
             let dev_name = source.strip_prefix("/dev/").unwrap_or(source);
             let (dev_id, dev) = block::find_device(dev_name).ok_or(VfsError::NotFound)?;
@@ -413,14 +420,22 @@ pub fn open_abs(abs_path: &str, flags: u32, mode: u32) -> Result<Arc<OpenFile>, 
             let (parent_inode, _) = lookup_abs(&parent_path, true)?;
             let parent_meta = parent_inode.metadata()?;
             let mount_id = find_mount(&parent_path)?.0.id;
-            let created = parent_inode.create(&filename, InodeKind::Regular, mode & 0o7777)?;
+            let created = parent_inode.create(
+                &filename,
+                InodeKind::Regular,
+                mode & 0o7777 & !current_umask(),
+            )?;
             publish_created(mount_id, parent_meta.ino, &filename, &created, &norm);
+            crate::ipc::inotify::notify(&norm, crate::ipc::inotify::IN_CREATE);
             (created, norm, true)
         }
         Err(e) => return Err(e),
     };
 
     let meta = inode.metadata()?;
+    if meta.kind == InodeKind::Socket {
+        return Err(VfsError::NoSuchDeviceOrAddress);
+    }
     if must_dir && meta.kind != InodeKind::Directory {
         return Err(VfsError::NotADirectory);
     }
@@ -444,6 +459,19 @@ pub fn open_abs(abs_path: &str, flags: u32, mode: u32) -> Result<Arc<OpenFile>, 
     Ok(Arc::new(OpenFile::new(inode, final_path, flags)))
 }
 
+/// Create a persistent filesystem entry for a pathname socket.
+pub fn create_socket_abs(abs_path: &str) -> Result<(), VfsError> {
+    let norm = normalize_path("/", abs_path);
+    let (parent_path, name) = split_parent_name(&norm).ok_or(VfsError::InvalidArgument)?;
+    let (parent, _) = lookup_abs(&parent_path, true)?;
+    let parent_meta = parent.metadata()?;
+    let mount_id = find_mount(&parent_path)?.0.id;
+    let created = parent.create(&name, InodeKind::Socket, 0o777 & !current_umask())?;
+    publish_created(mount_id, parent_meta.ino, &name, &created, &norm);
+    crate::ipc::inotify::notify(&norm, crate::ipc::inotify::IN_CREATE);
+    Ok(())
+}
+
 /// Create a directory at normalized absolute path `abs_path`.
 pub fn mkdir_abs(abs_path: &str, mode: u32) -> Result<Arc<dyn Inode>, VfsError> {
     let norm = normalize_path("/", abs_path);
@@ -454,8 +482,12 @@ pub fn mkdir_abs(abs_path: &str, mode: u32) -> Result<Arc<dyn Inode>, VfsError> 
     let (parent_inode, _) = lookup_abs(&parent_path, true)?;
     let parent_meta = parent_inode.metadata()?;
     let mount_id = find_mount(&parent_path)?.0.id;
-    let created = parent_inode.mkdir(&name, mode & 0o7777)?;
+    let created = parent_inode.mkdir(&name, mode & 0o7777 & !current_umask())?;
     publish_created(mount_id, parent_meta.ino, &name, &created, &norm);
+    crate::ipc::inotify::notify(
+        &norm,
+        crate::ipc::inotify::IN_CREATE | crate::ipc::inotify::IN_ISDIR,
+    );
     Ok(created)
 }
 
@@ -477,6 +509,7 @@ pub fn unlink_abs(abs_path: &str, remove_dir: bool) -> Result<(), VfsError> {
         parent_inode.rmdir(&name)?;
     } else {
         parent_inode.unlink(&name)?;
+        crate::ipc::unix::unbind_path(&norm);
     }
     dcache::invalidate(&dcache::DentryKey::new(mount_id, parent_meta.ino, &name));
     if remove_dir {
@@ -485,6 +518,71 @@ pub fn unlink_abs(abs_path: &str, remove_dir: bool) -> Result<(), VfsError> {
     if let Some(ino) = target_ino {
         dcache::icache_remove(mount_id, ino);
     }
+    crate::ipc::inotify::notify(&norm, crate::ipc::inotify::IN_DELETE);
+    Ok(())
+}
+
+/// Create the hard link `new_abs` to the existing file `old_abs`.
+pub fn link_abs(old_abs: &str, new_abs: &str, follow: bool) -> Result<(), VfsError> {
+    let (target, _) = lookup_abs(old_abs, follow)?;
+    let norm = normalize_path("/", new_abs);
+    if lookup_abs(&norm, false).is_ok() {
+        return Err(VfsError::AlreadyExists);
+    }
+    let (parent_path, name) = split_parent_name(&norm).ok_or(VfsError::InvalidArgument)?;
+    let (parent_inode, _) = lookup_abs(&parent_path, true)?;
+    if find_mount(&norm)?.0.id != find_mount(old_abs)?.0.id {
+        return Err(VfsError::CrossDevice);
+    }
+    let parent_meta = parent_inode.metadata()?;
+    let mount_id = find_mount(&parent_path)?.0.id;
+    parent_inode.link(&name, &target)?;
+    dcache::invalidate(&dcache::DentryKey::new(mount_id, parent_meta.ino, &name));
+    crate::ipc::inotify::notify(&norm, crate::ipc::inotify::IN_CREATE);
+    Ok(())
+}
+
+/// Atomically rename a path, replacing an existing compatible target.
+pub fn rename_abs(old_abs: &str, new_abs: &str, no_replace: bool) -> Result<(), VfsError> {
+    let old = normalize_path("/", old_abs);
+    let new = normalize_path("/", new_abs);
+    if old == "/" || new == "/" {
+        return Err(VfsError::Busy);
+    }
+    if old == new {
+        return lookup_abs(&old, false).map(|_| ());
+    }
+    if new.starts_with(&format!("{}/", old)) {
+        return Err(VfsError::InvalidArgument);
+    }
+    let (old_parent, old_name) = split_parent_name(&old).ok_or(VfsError::InvalidArgument)?;
+    let (new_parent, new_name) = split_parent_name(&new).ok_or(VfsError::InvalidArgument)?;
+    let mount = find_mount(&old)?.0;
+    if mount.id != find_mount(&new)?.0.id || list_mounts().iter().any(|m| m.mount_point == old) {
+        return Err(VfsError::CrossDevice);
+    }
+    let (old_dir, _) = lookup_abs(&old_parent, true)?;
+    let (new_dir, _) = lookup_abs(&new_parent, true)?;
+    let old_dir_ino = old_dir.metadata()?.ino;
+    let new_dir_ino = new_dir.metadata()?.ino;
+    let moved = lookup_abs(&old, false)?.0;
+    let moved_ino = moved.metadata()?.ino;
+    let replaced_ino = lookup_abs(&new, false)
+        .ok()
+        .and_then(|(inode, _)| inode.metadata().ok())
+        .map(|meta| meta.ino);
+    old_dir.rename(&old_name, &new_dir, &new_name, no_replace)?;
+    dcache::invalidate(&dcache::DentryKey::new(mount.id, old_dir_ino, &old_name));
+    dcache::invalidate(&dcache::DentryKey::new(mount.id, new_dir_ino, &new_name));
+    dcache::invalidate_path_prefix(mount.id, &old);
+    dcache::invalidate_path_prefix(mount.id, &new);
+    if let Some(ino) = replaced_ino
+        && ino != moved_ino
+    {
+        dcache::icache_remove(mount.id, ino);
+    }
+    crate::ipc::inotify::notify(&old, crate::ipc::inotify::IN_MOVED_FROM);
+    crate::ipc::inotify::notify(&new, crate::ipc::inotify::IN_MOVED_TO);
     Ok(())
 }
 
@@ -500,6 +598,7 @@ pub fn symlink_abs(target: &str, link_abs: &str) -> Result<Arc<dyn Inode>, VfsEr
     let mount_id = find_mount(&parent_path)?.0.id;
     let created = parent_inode.symlink(&name, target)?;
     publish_created(mount_id, parent_meta.ino, &name, &created, &norm);
+    crate::ipc::inotify::notify(&norm, crate::ipc::inotify::IN_CREATE);
     Ok(created)
 }
 
@@ -526,15 +625,31 @@ pub fn write_file(abs_path: &str, data: &[u8]) -> Result<(), VfsError> {
 /// Convenience helper to read an entire file at `abs_path` into a `Vec<u8>`.
 pub fn read_file(abs_path: &str) -> Result<Vec<u8>, VfsError> {
     let f = open_abs(abs_path, abi::O_RDONLY, 0)?;
-    let mut out = Vec::new();
-    let mut chunk = alloc::vec![0u8; 64 * 1024];
+    // Size the buffer up front and read straight into it: growing a Vec in
+    // 64 KiB steps reallocates and copies the whole image repeatedly.
+    let hint = f
+        .inode
+        .metadata()
+        .map(|meta| meta.size as usize)
+        .unwrap_or(0)
+        .min(256 * 1024 * 1024);
+    let mut out = alloc::vec![0u8; hint];
+    let mut filled = 0;
     loop {
-        let n = f.read(&mut chunk)?;
+        if filled == out.len() {
+            // Unknown or understated size (procfs, growing files): keep going.
+            out.resize((out.len() * 2).max(64 * 1024), 0);
+        }
+        // Keep each read at 64 KiB, the size the block/ext4 path has always
+        // been driven with; a single multi-megabyte read failed with EIO.
+        let end = (filled + 64 * 1024).min(out.len());
+        let n = f.read(&mut out[filled..end])?;
         if n == 0 {
             break;
         }
-        out.extend_from_slice(&chunk[..n]);
+        filled += n;
     }
+    out.truncate(filled);
     Ok(out)
 }
 
@@ -561,7 +676,60 @@ fn init_module_root() {
     );
 }
 
+/// Mount the ext4 volume named by `root=` on the kernel command line.
+fn init_disk_root() -> bool {
+    let Some(source) = crate::boot::cmdline()
+        .split_ascii_whitespace()
+        .find_map(|word| word.strip_prefix("root="))
+    else {
+        return false;
+    };
+    let name = source.strip_prefix("/dev/").unwrap_or(source);
+    let Some((_, device)) = block::find_device(name) else {
+        kwarn!("VFS: root device {} not found", source);
+        return false;
+    };
+    let filesystem = match ext4::Ext4Fs::mount(device) {
+        Ok(filesystem) => filesystem,
+        Err(error) => {
+            kwarn!("VFS: ext4 mount of {} failed: {:?}", source, error);
+            return false;
+        }
+    };
+    ROOT_EXT4.lock().replace(filesystem.clone());
+    if mount_fs(source, "/", filesystem).is_err() {
+        return false;
+    }
+    crate::device::init();
+    for directory in ["/dev", "/proc", "/sys", "/tmp", "/run"] {
+        let _ = mkdir_abs(directory, 0o755);
+    }
+    let _ = mount_fs("devtmpfs", "/dev", Arc::new(devtmpfs::DevTmpFs));
+    let _ = mount_fs("sysfs", "/sys", Arc::new(sysfs::SysFs));
+    let _ = mount_fs("proc", "/proc", Arc::new(procfs::ProcFs::new()));
+    let _ = mount_fs("tmpfs", "/tmp", Arc::new(ramfs::RamFs::new()));
+    let _ = mount_fs("tmpfs", "/run", Arc::new(ramfs::RamFs::new()));
+    let _ = mkdir_abs("/dev/pts", 0o755);
+    let _ = mount_fs("devpts", "/dev/pts", Arc::new(crate::tty::pty::DevPts));
+    let _ = mkdir_abs("/dev/shm", 0o1777);
+    let _ = mount_fs("tmpfs", "/dev/shm", Arc::new(ramfs::RamFs::new()));
+    kinfo!("VFS: ext4 root {} mounted on /", source);
+    true
+}
+
+static ROOT_EXT4: SpinLock<Option<Arc<ext4::Ext4Fs>>> = SpinLock::new(None);
+
+/// Start background services that need the scheduler, such as journal commit.
+pub fn start_services() {
+    if let Some(filesystem) = ROOT_EXT4.lock().clone() {
+        filesystem.start_flusher();
+    }
+}
+
 pub fn init() {
+    if init_disk_root() {
+        return;
+    }
     // When a FAT32 root module is attached, it becomes `/`; the kernel's
     // RamFS remains only for /tmp and /run.
     if rootfs::module_disk().is_some() {

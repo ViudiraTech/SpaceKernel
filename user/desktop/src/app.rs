@@ -1,0 +1,638 @@
+/*
+ *
+ *       user/desktop/src/app.rs
+ *       Application window lifecycle, 8-edge resize, SHM present and live theme sync
+ *
+ *       2026/10/30 By JiTianYu391
+ *       Copyright (C) 2026 ViudiraTech.
+ *
+ */
+
+//! Every SPUI application owns one top-level window with 34px client-side
+//! decorations. `App` manages `MIT-SHM` canvas resizing, Minimize / Maximize /
+//! Close buttons, titlebar double-click maximize, 4-edge + 4-corner resizing
+//! with Breeze resize cursors, and live `_SPUI_SETTINGS` theme updates.
+
+use crate::draw::{Canvas, Rect};
+use crate::icons::Icon;
+use crate::settings_store::SpuiSettings;
+use crate::text::TextRenderer;
+use crate::theme::{Theme, TASKBAR_HEIGHT, TITLEBAR_HEIGHT};
+use crate::ui::{self, CaptionHit};
+use crate::x11::{CursorKind, Key, Result, X};
+use std::time::{Duration, Instant};
+use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt, EventMask, Window};
+use x11rb::protocol::Event;
+
+const RESIZE_BORDER: i32 = 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResizeDir {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl ResizeDir {
+    fn cursor(self) -> CursorKind {
+        match self {
+            Self::Left | Self::Right => CursorKind::ResizeH,
+            Self::Top | Self::Bottom => CursorKind::ResizeV,
+            Self::TopLeft | Self::BottomRight => CursorKind::ResizeDiagF,
+            Self::TopRight | Self::BottomLeft => CursorKind::ResizeDiagB,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DragState {
+    Move {
+        orig_x: i16,
+        orig_y: i16,
+        press_rx: i16,
+        press_ry: i16,
+    },
+    Resize {
+        dir: ResizeDir,
+        orig_x: i32,
+        orig_y: i32,
+        orig_w: i32,
+        orig_h: i32,
+        press_rx: i32,
+        press_ry: i32,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum UiEvent {
+    Expose,
+    Configure {
+        width: u16,
+        height: u16,
+    },
+    Key(Key),
+    Button {
+        x: i32,
+        y: i32,
+        button: u8,
+        down: bool,
+        state: u16,
+    },
+    Wheel {
+        x: i32,
+        y: i32,
+        delta: i32,
+    },
+    Motion {
+        x: i32,
+        y: i32,
+        state: u16,
+    },
+    ThemeChanged,
+    Close,
+}
+
+pub struct App {
+    pub x: X,
+    pub win: Window,
+    pub icon: Icon,
+    pub width: u16,
+    pub height: u16,
+    pub min_width: u16,
+    pub min_height: u16,
+    pub canvas: Canvas,
+    pub text: TextRenderer,
+    pub settings: SpuiSettings,
+    pub theme: Theme,
+    pub title: String,
+    pub active: bool,
+    pub maximized: bool,
+    pub needs_redraw: bool,
+    pub close: bool,
+    drawn: bool,
+    saved_geom: Option<(i16, i16, u16, u16)>,
+    drag: Option<DragState>,
+    caption_hover: CaptionHit,
+    current_cursor: CursorKind,
+    content_cursor: CursorKind,
+    last_title_click: Option<Instant>,
+}
+
+impl App {
+    pub fn new(title: &str, icon: Icon, width: u16, height: u16) -> Result<Self> {
+        let x = X::connect()?;
+        let settings = x.read_settings().unwrap_or_else(SpuiSettings::load);
+        let theme = Theme::from_settings(&settings);
+
+        // Listen for `_SPUI_SETTINGS` and `_NET_ACTIVE_WINDOW` changes on the root window.
+        let _ = x.conn.change_window_attributes(
+            x.root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        );
+
+        let win = x.generate_id()?;
+        let mask = EventMask::EXPOSURE
+            | EventMask::KEY_PRESS
+            | EventMask::KEY_RELEASE
+            | EventMask::BUTTON_PRESS
+            | EventMask::BUTTON_RELEASE
+            | EventMask::POINTER_MOTION
+            | EventMask::STRUCTURE_NOTIFY
+            | EventMask::FOCUS_CHANGE
+            | EventMask::LEAVE_WINDOW;
+        x.create_window(win, x.root, 0, 0, width, height, false, mask, theme.window)?;
+        x.set_title(win, title)?;
+        x.set_class(win, "spui", "Spui")?;
+        x.set_wm_type(win, x.atoms.net_wm_type_normal)?;
+        x.set_pid(win, std::process::id())?;
+        x.set_protocols(win)?;
+        x.map(win)?;
+        x.flush()?;
+
+        let text = TextRenderer::load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let canvas = x.create_canvas(width as usize, height as usize, theme.window);
+        Ok(Self {
+            x,
+            win,
+            icon,
+            width,
+            height,
+            min_width: 360.min(width),
+            min_height: 220.min(height),
+            canvas,
+            text,
+            settings,
+            theme,
+            title: title.to_string(),
+            active: true,
+            maximized: false,
+            needs_redraw: true,
+            close: false,
+            drawn: false,
+            saved_geom: None,
+            drag: None,
+            caption_hover: CaptionHit::None,
+            current_cursor: CursorKind::Default,
+            content_cursor: CursorKind::Default,
+            last_title_click: None,
+        })
+    }
+
+    pub fn content(&self) -> Rect {
+        Rect::new(
+            1,
+            TITLEBAR_HEIGHT,
+            (self.width as i32 - 2).max(1),
+            (self.height as i32 - TITLEBAR_HEIGHT - 1).max(1),
+        )
+    }
+
+    pub fn set_content_cursor(&mut self, kind: CursorKind) {
+        self.content_cursor = kind;
+    }
+
+    fn apply_cursor(&mut self, kind: CursorKind) {
+        if kind != self.current_cursor {
+            self.current_cursor = kind;
+            let _ = self.x.set_cursor(self.win, kind);
+            let _ = self.x.flush();
+        }
+    }
+
+    fn hit_resize(&self, x: i32, y: i32) -> Option<ResizeDir> {
+        if self.maximized {
+            return None;
+        }
+        let w = self.width as i32;
+        let h = self.height as i32;
+        let left = x < RESIZE_BORDER;
+        let right = x >= w - RESIZE_BORDER;
+        let top = y < RESIZE_BORDER;
+        let bottom = y >= h - RESIZE_BORDER;
+        let corner = 12;
+        if (left && y < corner) || (top && x < corner) {
+            Some(ResizeDir::TopLeft)
+        } else if (right && y < corner) || (top && x >= w - corner) {
+            Some(ResizeDir::TopRight)
+        } else if (left && y >= h - corner) || (bottom && x < corner) {
+            Some(ResizeDir::BottomLeft)
+        } else if (right && y >= h - corner) || (bottom && x >= w - corner) {
+            Some(ResizeDir::BottomRight)
+        } else if left {
+            Some(ResizeDir::Left)
+        } else if right {
+            Some(ResizeDir::Right)
+        } else if top {
+            Some(ResizeDir::Top)
+        } else if bottom {
+            Some(ResizeDir::Bottom)
+        } else {
+            None
+        }
+    }
+
+    pub fn toggle_maximize(&mut self) -> Result<()> {
+        if self.maximized {
+            self.maximized = false;
+            if let Some((sx, sy, sw, sh)) = self.saved_geom.take() {
+                self.x.move_resize(self.win, sx, sy, sw, sh)?;
+            }
+        } else {
+            let geom = self.x.conn.get_geometry(self.win)?.reply()?;
+            let root_geom = self.x.conn.get_geometry(self.x.root)?.reply()?;
+            self.saved_geom = Some((geom.x, geom.y, self.width, self.height));
+            self.maximized = true;
+            let max_h = root_geom
+                .height
+                .saturating_sub(TASKBAR_HEIGHT as u16)
+                .max(200);
+            self.x.move_resize(self.win, 0, 0, root_geom.width, max_h)?;
+        }
+        self.needs_redraw = true;
+        self.x.flush()?;
+        Ok(())
+    }
+
+    pub fn pump(&mut self) -> Result<Vec<UiEvent>> {
+        let (events, _) = self.pump_with_fd(None, 50)?;
+        Ok(events)
+    }
+
+    /// Block via `poll(2)` up to `timeout_ms` for X11 or `extra_fd` activity,
+    /// coalescing burst pointer motion events so redraws never fall behind input.
+    pub fn pump_with_fd(
+        &mut self,
+        extra_fd: Option<i32>,
+        timeout_ms: i32,
+    ) -> Result<(Vec<UiEvent>, bool)> {
+        let mut raw = Vec::new();
+        while let Some(ev) = self.x.poll()? {
+            raw.push(ev);
+        }
+        let mut extra_ready = false;
+        if raw.is_empty() {
+            let (_, ext) = self.x.wait_readable(extra_fd, timeout_ms);
+            extra_ready = ext;
+            while let Some(ev) = self.x.poll()? {
+                raw.push(ev);
+            }
+        } else if let Some(fd) = extra_fd {
+            let (_, ext) = self.x.wait_readable(Some(fd), 0);
+            extra_ready = ext;
+        }
+
+        // Coalesce consecutive MotionNotify events on our window.
+        let mut coalesced: Vec<Event> = Vec::with_capacity(raw.len());
+        for ev in raw {
+            if matches!(ev, Event::MotionNotify(_))
+                && matches!(coalesced.last(), Some(Event::MotionNotify(_)))
+            {
+                *coalesced.last_mut().unwrap() = ev;
+            } else {
+                coalesced.push(ev);
+            }
+        }
+
+        let mut events = Vec::new();
+        for ev in coalesced {
+            self.translate(ev, &mut events)?;
+        }
+        Ok((events, extra_ready))
+    }
+
+    fn translate(&mut self, event: Event, events: &mut Vec<UiEvent>) -> Result<()> {
+        match event {
+            Event::Expose(e) if e.window == self.win => {
+                if self.drawn {
+                    let area = Rect::new(
+                        i32::from(e.x),
+                        i32::from(e.y),
+                        i32::from(e.width),
+                        i32::from(e.height),
+                    );
+                    self.x.put_canvas(self.win, &self.canvas, area)?;
+                    self.x.flush()?;
+                } else {
+                    self.needs_redraw = true;
+                }
+                events.push(UiEvent::Expose);
+            }
+            Event::ConfigureNotify(e) if e.window == self.win => {
+                if e.width != self.width || e.height != self.height {
+                    self.width = e.width;
+                    self.height = e.height;
+                    self.x.release_canvas(&self.canvas);
+                    self.canvas = self.x.create_canvas(
+                        e.width as usize,
+                        e.height as usize,
+                        self.theme.window,
+                    );
+                    self.drawn = false;
+                    self.needs_redraw = true;
+                    events.push(UiEvent::Configure {
+                        width: e.width,
+                        height: e.height,
+                    });
+                }
+            }
+            Event::FocusIn(e) if e.event == self.win => {
+                if !self.active {
+                    self.active = true;
+                    self.needs_redraw = true;
+                }
+            }
+            Event::FocusOut(e) if e.event == self.win => {
+                if self.active {
+                    self.active = false;
+                    self.needs_redraw = true;
+                }
+            }
+            Event::LeaveNotify(e) if e.event == self.win => {
+                if self.caption_hover != CaptionHit::None {
+                    self.caption_hover = CaptionHit::None;
+                    self.needs_redraw = true;
+                }
+                if self.drag.is_none() {
+                    self.apply_cursor(CursorKind::Default);
+                }
+            }
+            Event::PropertyNotify(e) if e.window == self.x.root => {
+                if e.atom == self.x.atoms.spui_settings {
+                    if let Some(new_settings) = self.x.read_settings() {
+                        if new_settings != self.settings {
+                            self.settings = new_settings;
+                            self.theme = Theme::from_settings(&self.settings);
+                            self.needs_redraw = true;
+                            events.push(UiEvent::ThemeChanged);
+                        }
+                    }
+                } else if e.atom == self.x.atoms.net_active_window {
+                    let is_active = self.x.get_active_window() == Some(self.win);
+                    if is_active != self.active {
+                        self.active = is_active;
+                        self.needs_redraw = true;
+                    }
+                }
+            }
+            Event::KeyPress(e) => {
+                let key = Key {
+                    code: e.detail,
+                    state: e.state.into(),
+                    sym: self.x.key_symbol(e.detail, e.state.into()),
+                };
+                events.push(UiEvent::Key(key));
+            }
+            Event::ButtonPress(e) if e.event == self.win => {
+                let (x, y) = (e.event_x as i32, e.event_y as i32);
+                // Mouse wheel events (buttons 4 / 5).
+                if e.detail == 4 {
+                    events.push(UiEvent::Wheel { x, y, delta: -3 });
+                    return Ok(());
+                } else if e.detail == 5 {
+                    events.push(UiEvent::Wheel { x, y, delta: 3 });
+                    return Ok(());
+                }
+
+                let _ = self.x.focus(self.win);
+                let _ = self.x.set_active_window(self.win);
+
+                if e.detail == 1 {
+                    let cap = ui::hit_caption(self.width as i32, x, y);
+                    if cap != CaptionHit::None {
+                        match cap {
+                            CaptionHit::Close => events.push(UiEvent::Close),
+                            CaptionHit::Minimize => {
+                                let _ = self.x.send_window_cmd(self.win, 1);
+                                let _ = self.x.flush();
+                            }
+                            CaptionHit::Maximize => {
+                                self.toggle_maximize()?;
+                            }
+                            CaptionHit::None => {}
+                        }
+                        return Ok(());
+                    }
+                    if let Some(dir) = self.hit_resize(x, y) {
+                        let geom = self.x.conn.get_geometry(self.win)?.reply()?;
+                        self.drag = Some(DragState::Resize {
+                            dir,
+                            orig_x: i32::from(geom.x),
+                            orig_y: i32::from(geom.y),
+                            orig_w: i32::from(self.width),
+                            orig_h: i32::from(self.height),
+                            press_rx: i32::from(e.root_x),
+                            press_ry: i32::from(e.root_y),
+                        });
+                        self.apply_cursor(dir.cursor());
+                        return Ok(());
+                    }
+                    if y < TITLEBAR_HEIGHT {
+                        let now = Instant::now();
+                        if self.last_title_click.is_some_and(|prev| {
+                            now.duration_since(prev) <= Duration::from_millis(380)
+                        }) {
+                            self.last_title_click = None;
+                            self.toggle_maximize()?;
+                            return Ok(());
+                        }
+                        self.last_title_click = Some(now);
+                        if !self.maximized {
+                            let geom = self.x.conn.get_geometry(self.win)?.reply()?;
+                            self.drag = Some(DragState::Move {
+                                orig_x: geom.x,
+                                orig_y: geom.y,
+                                press_rx: e.root_x,
+                                press_ry: e.root_y,
+                            });
+                        }
+                        return Ok(());
+                    }
+                }
+
+                events.push(UiEvent::Button {
+                    x,
+                    y,
+                    button: e.detail,
+                    down: true,
+                    state: e.state.into(),
+                });
+            }
+            Event::ButtonRelease(e) if e.event == self.win => {
+                if self.drag.take().is_some() {
+                    self.apply_cursor(CursorKind::Default);
+                }
+                events.push(UiEvent::Button {
+                    x: e.event_x as i32,
+                    y: e.event_y as i32,
+                    button: e.detail,
+                    down: false,
+                    state: e.state.into(),
+                });
+            }
+            Event::MotionNotify(e) if e.event == self.win => {
+                let (x, y) = (e.event_x as i32, e.event_y as i32);
+                let btn1_held = u16::from(e.state) & (1 << 8) != 0;
+                if let Some(drag) = self.drag {
+                    if btn1_held {
+                        match drag {
+                            DragState::Move {
+                                orig_x,
+                                orig_y,
+                                press_rx,
+                                press_ry,
+                            } => {
+                                let nx = orig_x.saturating_add(e.root_x.saturating_sub(press_rx));
+                                let ny = orig_y
+                                    .saturating_add(e.root_y.saturating_sub(press_ry))
+                                    .max(0);
+                                self.x
+                                    .move_resize(self.win, nx, ny, self.width, self.height)?;
+                                self.x.flush()?;
+                            }
+                            DragState::Resize {
+                                dir,
+                                orig_x,
+                                orig_y,
+                                orig_w,
+                                orig_h,
+                                press_rx,
+                                press_ry,
+                            } => {
+                                let dx = i32::from(e.root_x) - press_rx;
+                                let dy = i32::from(e.root_y) - press_ry;
+                                let min_w = i32::from(self.min_width);
+                                let min_h = i32::from(self.min_height);
+                                let (mut nx, mut ny, mut nw, mut nh) =
+                                    (orig_x, orig_y, orig_w, orig_h);
+                                match dir {
+                                    ResizeDir::Right => nw = (orig_w + dx).max(min_w),
+                                    ResizeDir::Bottom => nh = (orig_h + dy).max(min_h),
+                                    ResizeDir::Left => {
+                                        nw = (orig_w - dx).max(min_w);
+                                        nx = orig_x + (orig_w - nw);
+                                    }
+                                    ResizeDir::Top => {
+                                        nh = (orig_h - dy).max(min_h);
+                                        ny = (orig_y + (orig_h - nh)).max(0);
+                                    }
+                                    ResizeDir::BottomRight => {
+                                        nw = (orig_w + dx).max(min_w);
+                                        nh = (orig_h + dy).max(min_h);
+                                    }
+                                    ResizeDir::BottomLeft => {
+                                        nw = (orig_w - dx).max(min_w);
+                                        nx = orig_x + (orig_w - nw);
+                                        nh = (orig_h + dy).max(min_h);
+                                    }
+                                    ResizeDir::TopRight => {
+                                        nw = (orig_w + dx).max(min_w);
+                                        nh = (orig_h - dy).max(min_h);
+                                        ny = (orig_y + (orig_h - nh)).max(0);
+                                    }
+                                    ResizeDir::TopLeft => {
+                                        nw = (orig_w - dx).max(min_w);
+                                        nx = orig_x + (orig_w - nw);
+                                        nh = (orig_h - dy).max(min_h);
+                                        ny = (orig_y + (orig_h - nh)).max(0);
+                                    }
+                                }
+                                self.x.move_resize(
+                                    self.win, nx as i16, ny as i16, nw as u16, nh as u16,
+                                )?;
+                                self.x.flush()?;
+                            }
+                        }
+                        return Ok(());
+                    } else {
+                        self.drag = None;
+                    }
+                }
+
+                let cap = ui::hit_caption(self.width as i32, x, y);
+                if cap != self.caption_hover {
+                    self.caption_hover = cap;
+                    self.needs_redraw = true;
+                }
+
+                let desired_cursor = if cap != CaptionHit::None {
+                    CursorKind::Default
+                } else if let Some(dir) = self.hit_resize(x, y) {
+                    dir.cursor()
+                } else if y < TITLEBAR_HEIGHT {
+                    CursorKind::Default
+                } else {
+                    self.content_cursor
+                };
+                self.apply_cursor(desired_cursor);
+
+                events.push(UiEvent::Motion {
+                    x,
+                    y,
+                    state: e.state.into(),
+                });
+            }
+            Event::ClientMessage(e) => {
+                if e.type_ == self.x.atoms.wm_protocols
+                    && e.data.as_data32()[0] == self.x.atoms.wm_delete
+                {
+                    events.push(UiEvent::Close);
+                }
+            }
+            Event::DestroyNotify(e) if e.window == self.win => {
+                self.close = true;
+                events.push(UiEvent::Close);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn draw_chrome(&mut self) {
+        ui::titlebar(
+            &mut self.canvas,
+            &mut self.text,
+            &self.theme,
+            self.width as i32,
+            self.icon,
+            &self.title,
+            self.active,
+            self.maximized,
+            self.caption_hover,
+        );
+        ui::window_border(&mut self.canvas, &self.theme, self.active, self.maximized);
+    }
+
+    pub fn present(&mut self) -> Result<()> {
+        if !self.needs_redraw {
+            return Ok(());
+        }
+        let dirty = self.canvas.take_dirty();
+        let area = if dirty.is_empty() {
+            Rect::new(0, 0, self.width as i32, self.height as i32)
+        } else {
+            dirty
+        };
+        self.x.put_canvas(self.win, &self.canvas, area)?;
+        self.x.flush()?;
+        self.drawn = true;
+        self.needs_redraw = false;
+        Ok(())
+    }
+
+    pub fn request_close(&mut self) {
+        let _ = self.x.send_delete(self.win);
+        self.close = true;
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.x.release_canvas(&self.canvas);
+    }
+}

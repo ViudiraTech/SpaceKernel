@@ -24,6 +24,73 @@ unsafe impl UserPod for crate::vfs::abi::WinSize {}
 unsafe impl UserPod for crate::vfs::abi::LinuxStat {}
 unsafe impl UserPod for crate::vfs::abi::LinuxStatFs {}
 
+/// Make every page in the range resident so a later locked copy cannot miss.
+///
+/// May sleep for file I/O, so the caller must not hold any spin lock.
+pub fn prefault(address: u64, length: usize, write: bool) -> Result<(), VfsError> {
+    if length == 0 {
+        return Ok(());
+    }
+    if !UserAddressSpace::valid_range(address, length) {
+        return Err(VfsError::Fault);
+    }
+    let space = current_space()?;
+    loop {
+        let absent = space.lock().first_absent(address, length);
+        let Some(page) = absent else {
+            return Ok(());
+        };
+        if !resolve_fault(&space, page, write, false)? {
+            return Err(VfsError::Fault);
+        }
+    }
+}
+
+/// Bring one page in. Returns false when no mapping permits the access.
+pub fn resolve_fault(
+    space: &alloc::sync::Arc<crate::sync::SpinLock<UserAddressSpace>>,
+    address: u64,
+    write: bool,
+    exec: bool,
+) -> Result<bool, VfsError> {
+    use super::address_space::FaultWork;
+    let work = space.lock().fault(address, write, exec)?;
+    match work {
+        FaultWork::Done => Ok(true),
+        FaultWork::Violation => Ok(false),
+        FaultWork::ReadFile { file, offset } => {
+            let frame = crate::mm::pmm::alloc(1).ok_or(VfsError::NoMemory)?;
+            let kernel = crate::mm::pmm::phys_to_virt(frame) as *mut u8;
+            // SAFETY: the frame is exclusively owned until finish_file_fault.
+            let buffer = unsafe { core::slice::from_raw_parts_mut(kernel, 4096) };
+            buffer.fill(0);
+            match file.read_at(offset, buffer) {
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = crate::mm::pmm::free(frame, 1);
+                    return Err(error);
+                }
+            }
+            space.lock().finish_file_fault(address, frame);
+            // A write fault on a read-only reservation already failed above; a
+            // private writable page is exclusively owned, so nothing else to do.
+            Ok(true)
+        }
+        FaultWork::MapShared {
+            file,
+            page,
+            offset,
+            prot,
+        } => {
+            let mut locked = space.lock();
+            if !locked.page_present(page) {
+                file.mmap_page(&mut locked, page, offset, prot)?;
+            }
+            Ok(true)
+        }
+    }
+}
+
 pub fn current_space() -> Result<alloc::sync::Arc<crate::sync::SpinLock<UserAddressSpace>>, VfsError>
 {
     sched::current()
@@ -76,6 +143,7 @@ pub fn check(address: u64, length: usize, write: bool) -> Result<(), VfsError> {
             Err(VfsError::Fault)
         };
     }
+    prefault(address, length, write)?;
     current_space()?.lock().validate(address, length, write)
 }
 
@@ -91,6 +159,7 @@ pub fn read(address: u64, dst: &mut [u8]) -> Result<(), VfsError> {
         };
         return Ok(());
     }
+    prefault(address, dst.len(), false)?;
     current_space()?.lock().read_bytes(address, dst)
 }
 
@@ -104,6 +173,7 @@ pub fn write(address: u64, src: &[u8]) -> Result<(), VfsError> {
         unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), address as *mut u8, src.len()) };
         return Ok(());
     }
+    prefault(address, src.len(), true)?;
     current_space()?.lock().write_bytes(address, src)
 }
 

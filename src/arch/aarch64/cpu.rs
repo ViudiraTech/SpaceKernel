@@ -43,3 +43,11 @@ pub fn counter() -> u64 {
     unsafe { asm!("mrs {}, cntpct_el0", out(reg) value, options(nomem, nostack)) }
     value
 }
+
+/// Reset or power off the machine. Without a platform reset driver this halts.
+pub fn system_reset(_restart: bool) -> ! {
+    crate::arch::disable_interrupts();
+    loop {
+        halt();
+    }
+}

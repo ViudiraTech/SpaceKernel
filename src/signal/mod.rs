@@ -408,6 +408,52 @@ pub fn take_pending_masked(mask: u64) -> Option<Signal> {
     take_narrowest(&mut queue, !mask)
 }
 
+/// `rt_sigtimedwait(2)`: synchronously dequeue one of `set`.
+pub fn rt_sigtimedwait(set: u64, info: u64, timeout: u64, sigsetsize: u64) -> i64 {
+    if sigsetsize != SIGSET_SIZE {
+        return -abi::EINVAL;
+    }
+    let mask = match uaccess::read_value::<u64>(set) {
+        Ok(mask) => mask & !(SIGKILL_MASK | SIGSTOP_MASK),
+        Err(error) => return error.to_errno(),
+    };
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        let value: [i64; 2] = match uaccess::read_value(timeout) {
+            Ok(value) => value,
+            Err(error) => return error.to_errno(),
+        };
+        if value[0] < 0 || !(0..1_000_000_000).contains(&value[1]) {
+            return -abi::EINVAL;
+        }
+        Some(
+            crate::time::uptime_micros()
+                .saturating_add((value[0] as u64).saturating_mul(1_000_000))
+                .saturating_add((value[1] as u64).div_ceil(1000)),
+        )
+    };
+    loop {
+        if let Some(signal) = take_pending_masked(mask) {
+            if info != 0 {
+                let mut raw = [0u8; 128];
+                raw[0..4].copy_from_slice(&signal.number.to_le_bytes());
+                if let Err(error) = uaccess::write(info, &raw) {
+                    return error.to_errno();
+                }
+            }
+            return i64::from(signal.number);
+        }
+        if deadline.is_some_and(|deadline| crate::time::uptime_micros() >= deadline) {
+            return -abi::EAGAIN;
+        }
+        if pending_for_current() {
+            return -abi::EINTR;
+        }
+        crate::sched::sleep_micros(1000);
+    }
+}
+
 /// True when the signal is blocked or its disposition is SIG_IGN for `task`.
 pub fn signal_ignored(task: &sched::TaskRef, number: u32) -> bool {
     if task.thread_signals().lock().blocked & signal_bit(number) != 0 {
@@ -645,8 +691,8 @@ mod x86_64 {
                 rdi: frame.gpr.rdi,
                 rax: frame.gpr.rax,
                 rsp: frame.rsp,
-                rip: frame.gpr.rcx,
-                flags: frame.gpr.r11,
+                rip: frame.rip,
+                flags: frame.flags,
             }
         }
 
@@ -657,8 +703,8 @@ mod x86_64 {
             frame.gpr.r12 = self.r12;
             frame.gpr.rbp = self.rbp;
             frame.gpr.rbx = self.rbx;
-            frame.gpr.r11 = self.flags;
-            frame.gpr.rcx = self.rip;
+            frame.gpr.r11 = self.r11;
+            frame.gpr.rcx = self.rcx;
             frame.gpr.r9 = self.r9;
             frame.gpr.r8 = self.r8;
             frame.gpr.r10 = self.r10;
@@ -667,6 +713,8 @@ mod x86_64 {
             frame.gpr.rdi = self.rdi;
             frame.gpr.rax = self.rax;
             frame.rsp = self.rsp;
+            frame.rip = self.rip;
+            frame.flags = self.flags;
         }
 
         pub fn from_interrupt(frame: &InterruptFrame) -> Self {
@@ -959,6 +1007,7 @@ fn terminate_group(task: &sched::TaskRef, signal: u32, core: bool) -> ! {
         crate::sched::exit(status);
     }
     if stats.tgid != 0 {
+        crate::tty::vt::release_owner(stats.tgid);
         for member in sched::tasks_in_group(stats.tgid) {
             if member.stats().ltid != stats.ltid {
                 send_to_thread(&member, Signal::kernel(SIGKILL));
@@ -1046,6 +1095,14 @@ pub fn deliver_on_syscall_return(frame: &mut crate::arch::SyscallFrame) {
     };
     if let Some(regs) = deliver(&task, UserRegs::from_syscall(frame)) {
         regs.to_syscall(frame);
+    } else {
+        // A temporary wait mask outlives the syscall only while a handler that
+        // it admitted is running; rt_sigreturn restores it in that case.
+        let thread = task.thread_signals();
+        let mut state = thread.lock();
+        if let Some(mask) = state.sigsuspend_restore.take() {
+            state.blocked = mask & !(SIGKILL_MASK | SIGSTOP_MASK);
+        }
     }
 }
 
@@ -1303,21 +1360,28 @@ pub fn rt_sigsuspend(mask: u64, sigsetsize: u64) -> i64 {
         Ok(mask) => mask & !(SIGKILL_MASK | SIGSTOP_MASK),
         Err(error) => return error.to_errno(),
     };
-    let thread = task.thread_signals();
-    let old = {
-        let mut state = thread.lock();
-        let old = state.blocked;
-        state.blocked = mask;
-        old
-    };
+    install_wait_mask(mask);
     loop {
         if has_deliverable(&task) {
             break;
         }
         crate::sched::sleep_micros(1000);
     }
-    thread.lock().blocked = old;
     -abi::EINTR
+}
+
+/// Replace the blocked mask for the rest of this syscall (`ppoll`, `pselect`,
+/// `sigsuspend`). The previous mask returns when the syscall exits or, if a
+/// signal handler is delivered, when that handler returns.
+pub fn install_wait_mask(mask: u64) {
+    let Some(task) = sched::current() else {
+        return;
+    };
+    let thread = task.thread_signals();
+    let mut state = thread.lock();
+    let old = state.blocked;
+    state.blocked = mask & !(SIGKILL_MASK | SIGSTOP_MASK);
+    state.sigsuspend_restore = Some(old);
 }
 
 pub fn pending_for_current() -> bool {

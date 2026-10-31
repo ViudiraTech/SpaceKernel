@@ -390,6 +390,7 @@ fn set_sample_rate(rate: u8) {
 pub fn handle_byte(byte: u8) {
     let event = DECODER.lock().process_byte(byte);
     if let Some(event) = event {
+        crate::input::ps2::mouse_event(&event);
         QUEUE.lock().push(event);
     }
 }

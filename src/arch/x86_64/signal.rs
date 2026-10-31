@@ -36,13 +36,17 @@ pub struct GprFrame {
     pub rax: u64,
 }
 
-/// Frame at `gs:[24]` during a syscall.  `rcx`/`r11` hold the user return RIP
-/// and RFLAGS that `sysretq` consumes.
+/// Frame at `gs:[24]` during a syscall. IRET state is independent of the
+/// general registers so signal return can restore interrupted RCX and R11.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SyscallFrame {
     pub gpr: GprFrame,
+    pub rip: u64,
+    pub cs: u64,
+    pub flags: u64,
     pub rsp: u64,
+    pub ss: u64,
 }
 
 /// Frame at the top of the kernel stack during a hardware interrupt.  `rsp` and
@@ -60,19 +64,19 @@ pub struct InterruptFrame {
 
 impl SyscallFrame {
     pub fn user_rip(&self) -> u64 {
-        self.gpr.rcx
+        self.rip
     }
 
     pub fn set_user_rip(&mut self, rip: u64) {
-        self.gpr.rcx = rip;
+        self.rip = rip;
     }
 
     pub fn user_flags(&self) -> u64 {
-        self.gpr.r11
+        self.flags
     }
 
     pub fn set_user_flags(&mut self, flags: u64) {
-        self.gpr.r11 = flags;
+        self.flags = flags;
     }
 }
 

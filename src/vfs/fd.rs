@@ -21,12 +21,14 @@ use crate::{
 use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-pub const MAX_FDS: usize = 256;
+pub const MAX_FDS: usize = 4096;
 
 /// Console character device inode backing `/dev/console` and default FDs 0, 1, 2.
 pub struct ConsoleInode {
     nonblock: AtomicBool,
     ino: u64,
+    vt: usize,
+    rdev: u64,
 }
 
 impl ConsoleInode {
@@ -38,6 +40,18 @@ impl ConsoleInode {
         Self {
             nonblock: AtomicBool::new(false),
             ino,
+            vt: 0,
+            rdev: (5 << 8) | 1,
+        }
+    }
+
+    /// `/dev/ttyN` for `vt` in 1..=8, or `/dev/tty0` for the foreground VT.
+    pub fn for_vt(ino: u64, vt: usize) -> Self {
+        Self {
+            nonblock: AtomicBool::new(false),
+            ino,
+            vt,
+            rdev: (4 << 8) | vt as u64,
         }
     }
 }
@@ -48,7 +62,31 @@ impl Default for ConsoleInode {
     }
 }
 
+/// `/dev/tty`: the opener's controlling terminal, a pty or the console.
+pub struct ControllingTty;
+
+impl Inode for ControllingTty {
+    fn metadata(&self) -> Result<Stat, VfsError> {
+        let mut stat = Stat::simple(0x6FFF_FFF0, InodeKind::CharDevice, 0o666, 0);
+        stat.rdev = 5 << 8;
+        Ok(stat)
+    }
+
+    fn open(&self, flags: u32) -> Result<Option<Arc<dyn Inode>>, VfsError> {
+        if let Some(slave) = crate::tty::pty::open_controlling() {
+            return Ok(Some(slave));
+        }
+        let console = Arc::new(ConsoleInode::new());
+        console.open(flags)?;
+        Ok(Some(console))
+    }
+}
+
 impl Inode for ConsoleInode {
+    fn console_vt(&self) -> Option<usize> {
+        Some(self.vt)
+    }
+
     fn open(&self, _flags: u32) -> Result<Option<Arc<dyn Inode>>, VfsError> {
         // Linux assigns the controlling terminal when a session leader opens
         // it for reading and no session owns it yet.
@@ -68,7 +106,7 @@ impl Inode for ConsoleInode {
 
     fn metadata(&self) -> Result<Stat, VfsError> {
         let mut s = Stat::simple(self.ino, InodeKind::CharDevice, 0o666, 0);
-        s.rdev = (5 << 8) | 1;
+        s.rdev = self.rdev;
         Ok(s)
     }
 
@@ -333,9 +371,26 @@ pub struct OpenFile {
     flags: SpinLock<u32>,
     offset: SpinLock<u64>,
     dir_cursor: SpinLock<usize>,
+    /// `flock` key held by this description, released when it is destroyed.
+    flock_key: SpinLock<Option<(u64, u64)>>,
+}
+
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        if let Some(key) = *self.flock_key.lock() {
+            crate::syscall::flock_release(key, self as *const Self as u64);
+        }
+        if self.can_write() {
+            crate::ipc::inotify::notify(&self.abs_path, crate::ipc::inotify::IN_CLOSE_WRITE);
+        }
+    }
 }
 
 impl OpenFile {
+    pub fn track_flock(&self, key: (u64, u64)) {
+        *self.flock_key.lock() = Some(key);
+    }
+
     pub fn new(inode: Arc<dyn Inode>, abs_path: String, flags: u32) -> Self {
         Self {
             inode,
@@ -343,6 +398,7 @@ impl OpenFile {
             flags: SpinLock::new(flags),
             offset: SpinLock::new(0),
             dir_cursor: SpinLock::new(0),
+            flock_key: SpinLock::new(None),
         }
     }
 

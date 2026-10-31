@@ -28,7 +28,7 @@ const SYSTEM: &[&str] = &[
     "loadavg",
 ];
 const PROCESS: &[&str] = &[
-    "status", "stat", "statm", "comm", "cmdline", "environ", "maps", "auxv", "cwd", "exe", "root",
+    "status", "stat", "statm", "syscall", "comm", "cmdline", "environ", "maps", "auxv", "cwd", "exe", "root",
     "fd", "fdinfo", "task", "mounts",
 ];
 const SYS_FS: &[&str] = &["dentry-state", "inode-nr", "inode-state"];
@@ -91,6 +91,10 @@ impl Node {
                     "environ" => return Ok(image.map(|i| i.environ.clone()).unwrap_or_default()),
                     "auxv" => return Ok(image.map(|i| i.auxv.clone()).unwrap_or_default()),
                     "comm" => format!("{}\n", taskname),
+                    "syscall" => match crate::syscall::current_syscall(stats.tid) {
+                        Some((nr, a0, a1)) => format!("{nr} {a0:#x} {a1:#x}\n"),
+                        None => String::from("running\n"),
+                    },
                     "status" => format!(
                         "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nVmSize:\t{} kB\nVmRSS:\t{} kB\nvoluntary_ctxt_switches:\t{}\nnonvoluntary_ctxt_switches:\t{}\n",
                         taskname,

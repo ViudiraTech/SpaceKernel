@@ -23,6 +23,14 @@ pub struct Framebuffer {
     pub format: u32,
     pub offset: u32,
 }
+
+#[derive(Clone, Copy)]
+struct Clip {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
 #[derive(Clone)]
 struct Config {
     crtc: [u64; 18],
@@ -640,7 +648,11 @@ pub fn ioctl(
             count_out(arg, 24, 20, FORMATS)
         }
         0xb9 => {
-            let obj = arg.r32(16)?;
+            // struct drm_mode_obj_get_properties: props_ptr, prop_values_ptr,
+            // count_props, obj_id, obj_type.
+            let capacity = arg.r32(16)? as usize;
+            let obj = arg.r32(20)?;
+            let object_type = arg.r32(24)?;
             let (kind, _) = object(gpu, obj)?;
             let expected = match kind {
                 0x100 => 0xcccccccc,
@@ -648,15 +660,15 @@ pub fn ioctl(
                 0x400 => 0xeeeeeeee,
                 _ => return Err(VfsError::InvalidArgument),
             };
-            if arg.r32(20)? != expected {
+            if object_type != expected {
                 return Err(VfsError::InvalidArgument);
             }
             let (props, values) = props(gpu, state, obj)?;
-            if arg.r32(24)? as usize >= props.len() {
+            if capacity >= props.len() {
                 write32(arg.r64(0)?, &props)?;
                 write64(arg.r64(8)?, &values)?;
             }
-            arg.w32(24, props.len() as u32);
+            arg.w32(16, props.len() as u32);
             Ok(())
         }
         0xbd => {
@@ -821,9 +833,11 @@ pub fn ioctl(
         0xa2 => {
             master(session)?;
             let (kind, index) = object(gpu, arg.r32(12)?)?;
-            if kind != 0x100 || arg.r32(20)? != 0 || arg.r32(24)? != 0 {
+            if kind != 0x100 {
                 return Err(VfsError::InvalidArgument);
             }
+            let x = arg.r32(20)?;
+            let y = arg.r32(24)?;
             let mut configs = gpu.displays.lock().configs.clone();
             if arg.r32(32)? == 0 {
                 configs[index] = Config::new();
@@ -833,25 +847,32 @@ pub fn ioctl(
                     return Err(VfsError::InvalidArgument);
                 }
                 let framebuffer = fb(gpu, state, arg.r32(16)?)?;
+                let mode_bytes = arg.data[36..104].to_vec();
+                let mode_w = u16::from_le_bytes([mode_bytes[4], mode_bytes[5]]) as u64;
+                let mode_h = u16::from_le_bytes([mode_bytes[14], mode_bytes[15]]) as u64;
                 let blob = {
                     let mut d = gpu.displays.lock();
                     let id = d.next_blob;
                     d.next_blob += 1;
-                    d.blobs.insert(id, arg.data[36..104].to_vec());
+                    d.blobs.insert(id, mode_bytes.clone());
                     d.blob_owners.insert(id, session.id);
                     id
                 };
-                state.blobs.insert(blob, arg.data[36..104].to_vec());
+                state.blobs.insert(blob, mode_bytes);
                 let c = &mut configs[index];
                 c.crtc[1] = 1;
                 c.crtc[2] = blob as u64;
                 c.connector[3] = id(0x100, index) as u64;
                 c.plane[3] = id(0x100, index) as u64;
                 c.plane[4] = framebuffer.id as u64;
-                c.plane[7] = (framebuffer.width as u64) << 16;
-                c.plane[8] = (framebuffer.height as u64) << 16;
-                c.plane[11] = framebuffer.width as u64;
-                c.plane[12] = framebuffer.height as u64;
+                c.plane[5] = (x as u64) << 16;
+                c.plane[6] = (y as u64) << 16;
+                c.plane[7] = mode_w << 16;
+                c.plane[8] = mode_h << 16;
+                c.plane[9] = 0;
+                c.plane[10] = 0;
+                c.plane[11] = mode_w;
+                c.plane[12] = mode_h;
                 validate(gpu, &mut configs, &[index], state)?;
             }
             commit(session, state, configs, vec![index], Vec::new(), 0, 0, None)?;
@@ -879,11 +900,59 @@ pub fn ioctl(
             Ok(())
         }
         0xb1 => {
-            let framebuffer = fb(gpu, state, arg.r32(0)?)?;
-            if arg.r32(4)? != 0 || arg.r32(12)? != 0 {
+            let fb_id = arg.r32(0)?;
+            let flags = arg.r32(4)?;
+            let count = arg.r32(12)? as usize;
+            if DRM_TRACE.load(Ordering::Relaxed) {
+                crate::kinfo!(
+                    "DIRTYFB fb={:#x} flags={:#x} count={} clips={:#x}",
+                    fb_id,
+                    flags,
+                    count,
+                    arg.r64(16).unwrap_or(0)
+                );
+            }
+            let framebuffer = fb(gpu, state, fb_id)?;
+            if flags & !3 != 0 || (flags & 1 != 0 && count % 2 != 0) {
                 return Err(VfsError::InvalidArgument);
             }
-            flush(gpu, &framebuffer)
+            let full = Clip {
+                x: 0,
+                y: 0,
+                width: framebuffer.width,
+                height: framebuffer.height,
+            };
+            // ANNOTATE_COPY carries source/destination pairs; a full transfer
+            // is still correct and avoids depending on that annotation.
+            // Xorg can legitimately report thousands of glyph-sized damage
+            // rectangles in one frame. Refusing them makes the server disable
+            // dirty updates permanently, so fall back to a full transfer.
+            let clips = if count == 0 || flags & 1 != 0 || count > 4096 {
+                vec![full]
+            } else {
+                let data = uaccess::read_vec(arg.r64(16)?, count * 8, 4096 * 8)?;
+                let mut clips = Vec::with_capacity(count);
+                for rect in data.chunks_exact(8) {
+                    let x1 = u16::from_ne_bytes([rect[0], rect[1]]) as u32;
+                    let y1 = u16::from_ne_bytes([rect[2], rect[3]]) as u32;
+                    let x2 = u16::from_ne_bytes([rect[4], rect[5]]) as u32;
+                    let y2 = u16::from_ne_bytes([rect[6], rect[7]]) as u32;
+                    if x2 > x1 && y2 > y1 && x2 <= framebuffer.width && y2 <= framebuffer.height {
+                        clips.push(Clip {
+                            x: x1,
+                            y: y1,
+                            width: x2 - x1,
+                            height: y2 - y1,
+                        });
+                    }
+                }
+                if clips.is_empty() { vec![full] } else { clips }
+            };
+            let result = flush(gpu, &framebuffer, &clips);
+            if let Err(error) = &result {
+                crate::kwarn!("DIRTYFB flush failed: {:?}", error);
+            }
+            result
         }
         0xa3 | 0xbb => {
             master(session)?;
@@ -963,21 +1032,84 @@ pub fn ioctl(
         _ => Err(VfsError::NotSupported),
     }
 }
-fn flush(gpu: &Gpu, fb: &Framebuffer) -> Result<(), VfsError> {
-    if fb.resource.blob_mem == 0 {
+fn flush(gpu: &Gpu, fb: &Framebuffer, clips: &[Clip]) -> Result<(), VfsError> {
+    if clips.is_empty() {
+        return Ok(());
+    }
+    let mut min_x = fb.width;
+    let mut min_y = fb.height;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    for clip in clips {
+        min_x = min_x.min(clip.x);
+        min_y = min_y.min(clip.y);
+        max_x = max_x.max(clip.x.saturating_add(clip.width).min(fb.width));
+        max_y = max_y.max(clip.y.saturating_add(clip.height).min(fb.height));
+    }
+    if max_x <= min_x || max_y <= min_y {
+        return Ok(());
+    }
+    let bounds = [Clip {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x,
+        height: max_y - min_y,
+    }];
+    let transfers = if clips.len() > 32 { &bounds[..] } else { clips };
+    if DRM_TRACE.load(Ordering::Relaxed) {
+        let pixels: u64 = transfers
+            .iter()
+            .map(|c| u64::from(c.width) * u64::from(c.height))
+            .sum();
+        crate::kinfo!(
+            "flush clips={} transfers={} pixels={} bounds={}x{}+{}+{}",
+            clips.len(),
+            transfers.len(),
+            pixels,
+            max_x - min_x,
+            max_y - min_y,
+            min_x,
+            min_y
+        );
+    }
+    for clip in transfers {
+        let offset = (clip.y as u64)
+            .checked_mul(fb.pitch as u64)
+            .and_then(|value| value.checked_add((clip.x as u64) * 4))
+            .ok_or(VfsError::InvalidArgument)?;
         gpu.call(
             0x105,
             0,
-            &[0, 0, fb.width, fb.height, 0, 0, fb.resource.id, 0],
+            &[
+                clip.x,
+                clip.y,
+                clip.width,
+                clip.height,
+                offset as u32,
+                (offset >> 32) as u32,
+                fb.resource.id,
+                0,
+            ],
             24,
         )?;
     }
-    gpu.call(
-        0x104,
-        0,
-        &[0, 0, fb.width, fb.height, fb.resource.id, 0],
-        24,
-    )?;
+    if fb.resource.blob_mem == 0 {
+        // One flush for the union: each RESOURCE_FLUSH makes the host present
+        // the display again, so the count matters more than the area.
+        gpu.call(
+            0x104,
+            0,
+            &[
+                min_x,
+                min_y,
+                max_x - min_x,
+                max_y - min_y,
+                fb.resource.id,
+                0,
+            ],
+            24,
+        )?;
+    }
     Ok(())
 }
 pub fn service(gpu: &Gpu) {
@@ -1000,7 +1132,16 @@ pub fn service(gpu: &Gpu) {
                 if let Some(f) = last {
                     f.wait(gpu)?;
                 }
-                flush(gpu, fb)?;
+                flush(
+                    gpu,
+                    fb,
+                    &[Clip {
+                        x: 0,
+                        y: 0,
+                        width: fb.width,
+                        height: fb.height,
+                    }],
+                )?;
                 let x = (c.plane[5] >> 16) as u32;
                 let y = (c.plane[6] >> 16) as u32;
                 let w = c.plane[11] as u32;
@@ -1030,6 +1171,7 @@ pub fn service(gpu: &Gpu) {
                     words.clear();
                 } else {
                     gpu.call(0x103, 0, &[x, y, w, h, index as u32, fb.resource.id], 24)?;
+                    gpu.call(0x104, 0, &[x, y, w, h, fb.resource.id, 0], 24)?;
                 }
             } else {
                 gpu.call(0x103, 0, &[0, 0, 0, 0, index as u32, 0], 24)?;

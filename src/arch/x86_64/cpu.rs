@@ -47,3 +47,25 @@ pub fn counter() -> u64 {
     // SAFETY: RDTSC has no memory side effects; Limine reports its frequency.
     unsafe { core::arch::x86_64::_rdtsc() }
 }
+
+/// Reset or power off the machine. Never returns.
+///
+/// Restart pulses the keyboard controller reset line. Power off enters S5 through
+/// the ACPI PM1a control block at the fixed port QEMU's chipsets decode; real
+/// hardware that ignores it simply halts.
+pub fn system_reset(restart: bool) -> ! {
+    use x86_64::instructions::port::Port;
+    crate::arch::disable_interrupts();
+    // SAFETY: the machine is going down, and these ports only trigger reset or sleep.
+    unsafe {
+        if restart {
+            Port::<u8>::new(0x64).write(0xFE);
+        } else {
+            Port::<u16>::new(0x604).write(0x2000);
+            Port::<u16>::new(0xB004).write(0x2000);
+        }
+    }
+    loop {
+        halt();
+    }
+}

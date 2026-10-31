@@ -10,7 +10,10 @@
 
 pub mod epoll;
 pub mod futex;
+pub mod inotify;
 pub mod memfd;
+pub mod netlink;
+pub mod shm;
 pub mod signalfd;
 pub mod timerfd;
 pub mod unix;
@@ -262,6 +265,9 @@ fn socket_from_kind(kind: u64) -> Result<(unix::SocketKind, bool, bool), i64> {
 }
 
 pub fn socket(domain: u64, kind: u64, protocol: u64) -> i64 {
+    if domain == netlink::AF_NETLINK {
+        return netlink_socket(kind, protocol);
+    }
     if domain != unix::AF_UNIX as u64 {
         return -abi::EAFNOSUPPORT;
     }
@@ -335,7 +341,57 @@ pub fn socketpair(domain: u64, kind: u64, protocol: u64, address: u64) -> i64 {
     0
 }
 
+fn netlink_socket(kind: u64, protocol: u64) -> i64 {
+    const SOCK_RAW: u32 = 3;
+    const SOCK_DGRAM: u32 = 2;
+    let raw = kind as u32;
+    let base = raw & !(unix::SOCK_CLOEXEC | unix::SOCK_NONBLOCK);
+    if base != SOCK_RAW && base != SOCK_DGRAM {
+        return -abi::ESOCKTNOSUPPORT;
+    }
+    if protocol != netlink::NETLINK_KOBJECT_UEVENT {
+        return -abi::EPROTONOSUPPORT;
+    }
+    let nonblock = raw & unix::SOCK_NONBLOCK != 0;
+    let socket = netlink::NetlinkSocket::create(nonblock);
+    let flags = abi::O_RDWR | if nonblock { O_NONBLOCK } else { 0 };
+    let file = Arc::new(OpenFile::new(socket, String::from("socket:netlink"), flags));
+    match alloc_file(file, raw & unix::SOCK_CLOEXEC != 0) {
+        Ok(fd) => fd as i64,
+        Err(error) => error.to_errno(),
+    }
+}
+
+/// Deliver a queued netlink datagram into a user buffer and source address.
+fn netlink_receive(
+    socket: &Arc<netlink::NetlinkSocket>,
+    buffer: u64,
+    capacity: usize,
+    flags: u64,
+    source: u64,
+    source_length: u64,
+) -> Result<(usize, usize), VfsError> {
+    let (pid, groups, payload) = socket.receive(flags & MSG_DONTWAIT != 0)?;
+    let copied = capacity.min(payload.len());
+    uaccess::write(buffer, &payload[..copied])?;
+    if source != 0 {
+        let raw = netlink::encoded_source(pid, groups);
+        let room = uaccess::read_value::<u32>(source_length)? as usize;
+        uaccess::write(source, &raw[..room.min(raw.len())])?;
+        uaccess::write_value(source_length, &(raw.len() as u32))?;
+    }
+    Ok((copied, payload.len()))
+}
+
 pub fn bind(fd: u64, address: u64, length: u64) -> i64 {
+    if let Some(socket) = netlink::instance(fd) {
+        let result =
+            uaccess::read_vec(address, length as usize, 128).and_then(|raw| socket.bind(&raw));
+        return match result {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        };
+    }
     let socket = match socket_inode(fd) {
         Ok(socket) => socket,
         Err(error) => return error.to_errno(),
@@ -407,6 +463,17 @@ pub fn accept4(fd: u64, address: u64, length: u64, flags: u64) -> i64 {
 }
 
 pub fn getsockname(fd: u64, address: u64, length: u64) -> i64 {
+    if let Some(socket) = netlink::instance(fd) {
+        let raw = socket.address();
+        let result = uaccess::read_value::<u32>(length).and_then(|room| {
+            uaccess::write(address, &raw[..(room as usize).min(raw.len())])?;
+            uaccess::write_value(length, &(raw.len() as u32))
+        });
+        return match result {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        };
+    }
     let socket = match socket_inode(fd) {
         Ok(socket) => socket,
         Err(error) => return error.to_errno(),
@@ -601,6 +668,26 @@ fn send_with_control(
 }
 
 pub fn sendmsg(fd: u64, message: u64, flags: u64) -> i64 {
+    if let Some(socket) = netlink::instance(fd) {
+        let result = (|| -> Result<usize, VfsError> {
+            let header = read_msghdr(message)?;
+            let destination = uaccess::read_vec(header.name, header.namelen as usize, 128)?;
+            let mut payload = Vec::new();
+            for index in 0..header.iovlen.min(1024) {
+                let vector = uaccess::read_value::<abi::IoVec>(header.iov + index * 16)?;
+                payload.extend_from_slice(&uaccess::read_vec(
+                    vector.iov_base as u64,
+                    vector.iov_len as usize,
+                    65536,
+                )?);
+            }
+            socket.send(&destination, &payload)
+        })();
+        return match result {
+            Ok(count) => count as i64,
+            Err(error) => error.to_errno(),
+        };
+    }
     if flags & !SEND_FLAGS != 0 {
         return -abi::EINVAL;
     }
@@ -808,6 +895,38 @@ fn install_rights(
 }
 
 pub fn recvmsg(fd: u64, message: u64, flags: u64) -> i64 {
+    if let Some(socket) = netlink::instance(fd) {
+        const MSG_TRUNC_OUT: u32 = 0x20;
+        let result = (|| -> Result<usize, VfsError> {
+            let header = read_msghdr(message)?;
+            let vector = uaccess::read_value::<abi::IoVec>(header.iov)?;
+            let (pid, groups, payload) = socket.receive(flags & MSG_DONTWAIT != 0)?;
+            let copied = (vector.iov_len as usize).min(payload.len());
+            uaccess::write(vector.iov_base as u64, &payload[..copied])?;
+            if header.name != 0 {
+                let raw = netlink::encoded_source(pid, groups);
+                let room = (header.namelen as usize).min(raw.len());
+                uaccess::write(header.name, &raw[..room])?;
+                uaccess::write_value(message + 8, &(raw.len() as u32))?;
+            }
+            uaccess::write_value(message + 40, &0u64)?;
+            let out = if copied < payload.len() {
+                MSG_TRUNC_OUT
+            } else {
+                0
+            };
+            uaccess::write_value(message + 48, &out)?;
+            Ok(if flags & MSG_TRUNC != 0 {
+                payload.len()
+            } else {
+                copied
+            })
+        })();
+        return match result {
+            Ok(count) => count as i64,
+            Err(error) => error.to_errno(),
+        };
+    }
     if flags & !RECV_FLAGS != 0 {
         return -abi::EINVAL;
     }
@@ -899,6 +1018,33 @@ pub fn recvmsg(fd: u64, message: u64, flags: u64) -> i64 {
     received.bytes.len() as i64
 }
 
+pub fn recvfrom_netlink(
+    socket: &Arc<netlink::NetlinkSocket>,
+    buffer: u64,
+    capacity: u64,
+    flags: u64,
+    source: u64,
+    source_length: u64,
+) -> i64 {
+    match netlink_receive(
+        socket,
+        buffer,
+        capacity as usize,
+        flags,
+        source,
+        source_length,
+    ) {
+        Ok((copied, total)) => {
+            if flags & MSG_TRUNC != 0 {
+                total as i64
+            } else {
+                copied as i64
+            }
+        }
+        Err(error) => error.to_errno(),
+    }
+}
+
 pub fn recvfrom(
     fd: u64,
     buffer: u64,
@@ -907,6 +1053,9 @@ pub fn recvfrom(
     address: u64,
     address_len: u64,
 ) -> i64 {
+    if let Some(socket) = netlink::instance(fd) {
+        return recvfrom_netlink(&socket, buffer, length, flags, address, address_len);
+    }
     let allowed = MSG_PEEK | MSG_DONTWAIT | MSG_TRUNC | MSG_WAITALL;
     if flags & !allowed != 0 {
         return -abi::EINVAL;
@@ -960,6 +1109,25 @@ fn write_option(value: &[u8], pointer: u64, length_pointer: u64) -> Result<(), V
 }
 
 pub fn getsockopt(fd: u64, level: u64, name: u64, value: u64, length: u64) -> i64 {
+    if netlink::instance(fd).is_some() {
+        let answer: Option<u32> = match (level, name) {
+            (1, 3) => Some(3),                                       // SO_TYPE: SOCK_RAW
+            (1, 39) => Some(netlink::AF_NETLINK as u32),             // SO_DOMAIN
+            (1, 38) => Some(netlink::NETLINK_KOBJECT_UEVENT as u32), // SO_PROTOCOL
+            (1, 4) => Some(0),                                       // SO_ERROR
+            (1, 7 | 8) => Some(212_992),                             // SO_SNDBUF, SO_RCVBUF
+            _ => None,
+        };
+        let Some(answer) = answer else {
+            return -abi::ENOPROTOOPT;
+        };
+        let result =
+            uaccess::write_value(value, &answer).and_then(|()| uaccess::write_value(length, &4u32));
+        return match result {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        };
+    }
     let socket = match socket_inode(fd) {
         Ok(socket) => socket,
         Err(error) => return error.to_errno(),
@@ -1079,14 +1247,127 @@ pub fn epoll_pwait(
     sigsetsize: u64,
 ) -> i64 {
     if sigmask != 0 {
-        // Temporarily replacing the mask for the duration of the wait needs
-        // scheduler wake integration that does not exist yet.
-        return -abi::ENOSYS;
-    }
-    if sigsetsize != 8 {
-        return -abi::EINVAL;
+        if sigsetsize != 8 {
+            return -abi::EINVAL;
+        }
+        match uaccess::read_value::<u64>(sigmask) {
+            Ok(mask) => crate::signal::install_wait_mask(mask),
+            Err(error) => return error.to_errno(),
+        }
     }
     epoll_wait(epfd, events, maxevents, timeout)
+}
+
+pub fn epoll_pwait2(
+    epfd: u64,
+    events: u64,
+    maxevents: u32,
+    timeout: u64,
+    sigmask: u64,
+    sigsetsize: u64,
+) -> i64 {
+    let millis = if timeout == 0 {
+        -1
+    } else {
+        let value: [i64; 2] = match uaccess::read_value(timeout) {
+            Ok(value) => value,
+            Err(error) => return error.to_errno(),
+        };
+        if value[0] < 0 || !(0..1_000_000_000).contains(&value[1]) {
+            return -abi::EINVAL;
+        }
+        value[0]
+            .saturating_mul(1000)
+            .saturating_add((value[1] as u64).div_ceil(1_000_000) as i64)
+    };
+    epoll_pwait(epfd, events, maxevents, millis, sigmask, sigsetsize)
+}
+
+pub fn inotify_init1(flags: u32) -> i64 {
+    const IN_CLOEXEC: u32 = 0o2000000;
+    const IN_NONBLOCK: u32 = 0o4000;
+    if flags & !(IN_CLOEXEC | IN_NONBLOCK) != 0 {
+        return -abi::EINVAL;
+    }
+    let instance = inotify::Inotify::create(flags & IN_NONBLOCK != 0);
+    let file = Arc::new(OpenFile::new(
+        instance,
+        alloc::string::String::from("anon_inode:inotify"),
+        abi::O_RDONLY,
+    ));
+    match alloc_file(file, flags & IN_CLOEXEC != 0) {
+        Ok(fd) => fd as i64,
+        Err(error) => error.to_errno(),
+    }
+}
+
+pub fn inotify_add_watch(fd: u64, path: u64, mask: u32) -> i64 {
+    let instance = match inotify::instance(fd) {
+        Ok(instance) => instance,
+        Err(error) => return error.to_errno(),
+    };
+    let result = uaccess::string(path, 4096).and_then(|text| {
+        let full = vfs::resolve_at_path(&vfs::current_fd_table().lock(), abi::AT_FDCWD, &text)?;
+        instance.add_watch(&full, mask)
+    });
+    match result {
+        Ok(wd) => i64::from(wd),
+        Err(error) => error.to_errno(),
+    }
+}
+
+pub fn inotify_rm_watch(fd: u64, wd: i32) -> i64 {
+    match inotify::instance(fd).and_then(|instance| instance.remove_watch(wd)) {
+        Ok(()) => 0,
+        Err(error) => error.to_errno(),
+    }
+}
+
+// ---- readiness wakeups -----------------------------------------------------
+
+static POLL_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static POLLERS: SpinLock<Option<crate::sched::WaitQueue>> = SpinLock::new(None);
+
+fn poll_queue() -> Option<crate::sched::WaitQueue> {
+    POLLERS.lock().clone()
+}
+
+/// Wake every task blocked in poll, select or epoll so it re-checks readiness.
+///
+/// Callable from IRQ context. Readiness is recomputed from each inode's `poll`,
+/// so spurious wakeups are harmless and no per-object wait lists are needed.
+pub fn wake_pollers() {
+    POLL_EPOCH.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    if let Some(queue) = poll_queue()
+        && !queue.is_empty()
+    {
+        queue.wake_all();
+    }
+}
+
+/// Block until the next `wake_pollers` or the coarse timer tick below.
+pub fn wait_pollers(_timeout_micros: Option<u64>) {
+    let Some(queue) = poll_queue() else {
+        crate::sched::sleep_micros(1000);
+        return;
+    };
+    let seen = POLL_EPOCH.load(core::sync::atomic::Ordering::Acquire);
+    queue.wait_until(|| POLL_EPOCH.load(core::sync::atomic::Ordering::Acquire) != seen);
+}
+
+/// Start the 1 ms tick that serves deadlines and time-based readiness such as
+/// timerfd, which no event source announces.
+pub fn start_poll_timer() {
+    *POLLERS.lock() = Some(crate::sched::WaitQueue::new());
+    let _ = crate::sched::spawn(
+        || {
+            loop {
+                crate::sched::sleep_micros(1000);
+                wake_pollers();
+            }
+        },
+        0,
+    );
 }
 
 pub fn signalfd4(fd: i64, mask: u64, sigsetsize: u64, flags: u32) -> i64 {
@@ -1182,6 +1463,12 @@ pub fn timerfd_gettime(fd: u64, old_value: u64) -> i64 {
 }
 
 pub fn setsockopt(fd: u64, level: u64, name: u64, value: u64, length: u64) -> i64 {
+    if netlink::instance(fd).is_some() {
+        return match netlink::setsockopt(level, name) {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        };
+    }
     let socket = match socket_inode(fd) {
         Ok(socket) => socket,
         Err(error) => return error.to_errno(),

@@ -140,7 +140,7 @@ pub fn poll(pointer: u64, count: u64, timeout_ms: i64) -> i64 {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            sched::sleep_micros(1000);
+            crate::ipc::wait_pollers(None);
         }
     })();
     match result {
@@ -148,9 +148,15 @@ pub fn poll(pointer: u64, count: u64, timeout_ms: i64) -> i64 {
         Err(e) => e.to_errno(),
     }
 }
-pub fn ppoll(pointer: u64, count: u64, timeout: u64, sigmask: u64) -> i64 {
+pub fn ppoll(pointer: u64, count: u64, timeout: u64, sigmask: u64, setsize: u64) -> i64 {
     if sigmask != 0 {
-        return -abi::ENOSYS;
+        if setsize != 8 {
+            return -abi::EINVAL;
+        }
+        match uaccess::read_value::<u64>(sigmask) {
+            Ok(mask) => crate::signal::install_wait_mask(mask),
+            Err(e) => return e.to_errno(),
+        }
     }
     let millis = if timeout == 0 {
         -1
@@ -168,16 +174,6 @@ pub fn ppoll(pointer: u64, count: u64, timeout: u64, sigmask: u64) -> i64 {
             .min(i64::MAX as u64) as i64
     };
     poll(pointer, count, millis)
-}
-pub fn clock_gettime(clock: u32, pointer: u64) -> i64 {
-    if !matches!(clock, 1 | 4 | 7) {
-        return -abi::EINVAL;
-    }
-    let us = crate::time::uptime_micros();
-    match uaccess::write_value(pointer, &[us / 1_000_000, us % 1_000_000 * 1000]) {
-        Ok(()) => 0,
-        Err(e) => e.to_errno(),
-    }
 }
 pub fn getrandom(pointer: u64, count: usize, flags: u32) -> i64 {
     if flags & !3 != 0 {
@@ -391,9 +387,14 @@ const CLONE_SIGHAND: u64 = 0x0000_0800;
 const CLONE_VFORK: u64 = 0x0000_4000;
 const CLONE_PARENT: u64 = 0x0000_8000;
 const CLONE_THREAD: u64 = 0x0001_0000;
+// SysV semaphore operations are not implemented, so there can be no undo
+// list to share yet. Keep this flag accepted for pthread implementations.
+const CLONE_SYSVSEM: u64 = 0x0004_0000;
 const CLONE_SETTLS: u64 = 0x0008_0000;
 const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
 const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+// CLONE_DETACHED is ignored by Linux for the classic clone syscall.
+const CLONE_DETACHED: u64 = 0x0040_0000;
 const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 
 const CLONE_KNOWN: u64 = CLONE_VM
@@ -403,9 +404,11 @@ const CLONE_KNOWN: u64 = CLONE_VM
     | CLONE_VFORK
     | CLONE_PARENT
     | CLONE_THREAD
+    | CLONE_SYSVSEM
     | CLONE_SETTLS
     | CLONE_PARENT_SETTID
     | CLONE_CHILD_CLEARTID
+    | CLONE_DETACHED
     | CLONE_CHILD_SETTID
     | 0xff;
 
@@ -416,17 +419,11 @@ pub fn clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
     if flags & !CLONE_KNOWN != 0 {
         return -abi::ENOSYS;
     }
-    if flags & CLONE_VFORK != 0 {
-        return -abi::ENOSYS;
-    }
     let thread = flags & CLONE_THREAD != 0;
     if thread && (flags & (CLONE_SIGHAND | CLONE_VM)) != (CLONE_SIGHAND | CLONE_VM) {
         return -abi::EINVAL;
     }
     if flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0 {
-        return -abi::EINVAL;
-    }
-    if stack != 0 && stack & 15 != 0 {
         return -abi::EINVAL;
     }
     let Some(parent) = crate::sched::current() else {
@@ -556,7 +553,26 @@ pub fn clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) 
         spec,
     );
     match result {
-        Ok(_) => ltid as i64,
+        Ok(_) => {
+            crate::syscall::inherit_limits(parent_stats.tgid, tgid);
+            if flags & CLONE_VFORK != 0 {
+                // The parent stays suspended until the child gives the address
+                // space back, by exec or by exit.
+                // `ltid` is the Linux thread id; `find_task` takes the kernel tid.
+                // Mixing them up finds the parent itself whenever the two id
+                // spaces collide, which suspended it forever.
+                while let Some(child) = crate::sched::find_by_ltid(ltid) {
+                    let shared = child
+                        .address_space()
+                        .is_some_and(|space| Arc::ptr_eq(&space, &parent_space));
+                    if !shared {
+                        break;
+                    }
+                    crate::sched::sleep_micros(50);
+                }
+            }
+            ltid as i64
+        }
         Err(_) => -abi::ENOMEM,
     }
 }
@@ -829,4 +845,174 @@ pub fn waitid(idtype: u32, id: u32, info: u64, options: u32, rusage: u64) -> i64
         rechecked = false;
         crate::sched::sleep_micros(1000);
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn clone3(_args: u64, _size: u64) -> i64 {
+    -abi::ENOSYS
+}
+
+/// `clone3(2)` over the classic entry point. `args` is `struct clone_args`.
+#[cfg(target_arch = "x86_64")]
+pub fn clone3(args: u64, size: u64) -> i64 {
+    if !(64..=4096).contains(&size) {
+        return -abi::EINVAL;
+    }
+    let raw: [u64; 8] = match uaccess::read_value(args) {
+        Ok(raw) => raw,
+        Err(error) => return error.to_errno(),
+    };
+    let [
+        flags,
+        pidfd,
+        child_tid,
+        parent_tid,
+        exit_signal,
+        stack,
+        stack_size,
+        tls,
+    ] = raw;
+    if pidfd != 0 || exit_signal > 64 || flags & 0xff != 0 {
+        return -abi::EINVAL;
+    }
+    if (stack == 0) != (stack_size == 0) {
+        return -abi::EINVAL;
+    }
+    let top = stack.saturating_add(stack_size);
+    clone(flags | exit_signal, top, parent_tid, child_tid, tls)
+}
+
+struct IntervalTimer {
+    /// Absolute expiry in monotonic microseconds, zero when disarmed.
+    expiry: u64,
+    interval: u64,
+}
+
+static ALARMS: SpinLock<alloc::collections::BTreeMap<u64, IntervalTimer>> =
+    SpinLock::new(alloc::collections::BTreeMap::new());
+static ALARM_THREAD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn start_alarm_thread() {
+    if ALARM_THREAD.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let _ = sched::spawn(
+        || {
+            loop {
+                sched::sleep_micros(1000);
+                let now = crate::time::uptime_micros();
+                let mut fired = alloc::vec::Vec::new();
+                {
+                    let mut alarms = ALARMS.lock();
+                    alarms.retain(|&pid, timer| {
+                        if timer.expiry == 0 || timer.expiry > now {
+                            return true;
+                        }
+                        fired.push(pid);
+                        if timer.interval == 0 {
+                            return false;
+                        }
+                        timer.expiry = now + timer.interval;
+                        true
+                    });
+                }
+                for pid in fired {
+                    let _ = crate::signal::kill(pid as i64, u64::from(crate::signal::SIGALRM));
+                }
+            }
+        },
+        0,
+    );
+}
+
+/// `ITIMER_REAL` for a process; the virtual and profiling timers would need CPU
+/// accounting hooks that nothing here uses, so they report `EINVAL`.
+pub fn setitimer(which: u32, new_value: u64, old_value: u64) -> i64 {
+    if which != 0 {
+        return -abi::EINVAL;
+    }
+    let Some(task) = sched::current() else {
+        return -abi::ESRCH;
+    };
+    let pid = task.stats().tgid;
+    let value: [u64; 4] = if new_value != 0 {
+        match uaccess::read_value(new_value) {
+            Ok(value) => value,
+            Err(error) => return error.to_errno(),
+        }
+    } else {
+        [0; 4]
+    };
+    if value[1] >= 1_000_000 || value[3] >= 1_000_000 {
+        return -abi::EINVAL;
+    }
+    let now = crate::time::uptime_micros();
+    let previous = {
+        let mut alarms = ALARMS.lock();
+        let previous = alarms.get(&pid).map_or([0u64; 4], |timer| {
+            let left = timer.expiry.saturating_sub(now);
+            [
+                timer.interval / 1_000_000,
+                timer.interval % 1_000_000,
+                left / 1_000_000,
+                left % 1_000_000,
+            ]
+        });
+        if new_value != 0 {
+            let delay = value[2] * 1_000_000 + value[3];
+            if delay == 0 {
+                alarms.remove(&pid);
+            } else {
+                alarms.insert(
+                    pid,
+                    IntervalTimer {
+                        expiry: now + delay,
+                        interval: value[0] * 1_000_000 + value[1],
+                    },
+                );
+            }
+        }
+        previous
+    };
+    start_alarm_thread();
+    if old_value != 0 {
+        return match uaccess::write_value(old_value, &previous) {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        };
+    }
+    0
+}
+
+pub fn getitimer(which: u32, value: u64) -> i64 {
+    if which != 0 {
+        return -abi::EINVAL;
+    }
+    setitimer(0, 0, value)
+}
+
+pub fn alarm(seconds: u32) -> i64 {
+    let Some(task) = sched::current() else {
+        return -abi::ESRCH;
+    };
+    let pid = task.stats().tgid;
+    let now = crate::time::uptime_micros();
+    let mut alarms = ALARMS.lock();
+    let previous = alarms.get(&pid).map_or(0, |timer| {
+        timer.expiry.saturating_sub(now).div_ceil(1_000_000)
+    });
+    if seconds == 0 {
+        alarms.remove(&pid);
+    } else {
+        alarms.insert(
+            pid,
+            IntervalTimer {
+                expiry: now + u64::from(seconds) * 1_000_000,
+                interval: 0,
+            },
+        );
+    }
+    drop(alarms);
+    start_alarm_thread();
+    previous as i64
 }

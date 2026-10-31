@@ -140,8 +140,18 @@ pub fn assign_session(sid: u64) -> bool {
     state.session == sid
 }
 
+/// Drop the console's controlling session and foreground group when `sid`
+/// owns the console.
+pub fn release_session(sid: u64) {
+    let mut state = CONSOLE.lock();
+    if state.session == sid {
+        state.session = 0;
+        state.foreground_pgrp = 0;
+    }
+}
+
 /// Set the foreground process group. The caller has already checked that the
-/// group belongs to this session.
+/// group belongs to this session; the console adopts `sid` when unclaimed.
 pub fn set_foreground_pgrp(sid: u64, pgrp: u64) -> bool {
     let mut state = CONSOLE.lock();
     if state.session == 0 {
@@ -198,6 +208,16 @@ pub fn switch_to(tty_number: usize) -> bool {
     } else {
         false
     }
+}
+
+/// Redraw a VT after a display server gave the screen back.
+pub fn repaint(tty_number: usize) -> bool {
+    DIRTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    CONSOLE
+        .lock()
+        .framebuffer
+        .as_mut()
+        .is_some_and(|fb| fb.switch_to(tty_number))
 }
 
 pub fn scrollback(tty_number: usize, delta: isize) -> bool {

@@ -26,6 +26,8 @@ use alloc::{
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use transport::{Dma, Request, Transport};
 static GPU: SpinLock<Option<Arc<Gpu>>> = SpinLock::new(None);
+/// Enabled by the `drmtrace` kernel command line; traces every DRM request.
+static DRM_TRACE: AtomicBool = AtomicBool::new(false);
 pub fn device() -> Option<Arc<Gpu>> {
     GPU.lock().clone()
 }
@@ -981,7 +983,9 @@ impl Session {
                     let capacity = arg.r64(length)? as usize;
                     let dst = arg.r64(pointer)?;
                     let n = capacity.min(text.len());
-                    if n != 0 {
+                    // Linux copies a field only when the caller supplied a
+                    // buffer; a NULL pointer just reports the required length.
+                    if n != 0 && dst != 0 {
                         uaccess::write(dst, &text.as_bytes()[..n])?;
                     }
                     arg.w64(length, text.len() as u64);
@@ -1404,6 +1408,10 @@ impl Inode for Session {
             return Err(VfsError::NoDevice);
         }
         let mut arg = Ioctl::new(cmd, address)?;
+        let trace = DRM_TRACE.load(Ordering::Relaxed);
+        if trace {
+            crate::kinfo!("drm: enter nr={:#04x} arg={:#x}", cmd as u8, address);
+        }
         while self
             .busy
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -1421,6 +1429,9 @@ impl Inode for Session {
         *self.map_handles.lock() = handles;
         *self.state.lock() = Some(state);
         self.busy.store(false, Ordering::Release);
+        if trace {
+            crate::kinfo!("drm: exit nr={:#04x} -> {:?}", cmd as u8, result);
+        }
         result?;
         arg.finish()?;
         Ok(0)
@@ -1502,6 +1513,12 @@ impl Drop for Session {
     }
 }
 pub fn init() {
+    DRM_TRACE.store(
+        crate::boot::cmdline()
+            .split_ascii_whitespace()
+            .any(|word| word == "drmtrace"),
+        Ordering::Relaxed,
+    );
     let Some(pci) = crate::pci::devices().iter().find(|d| {
         d.vendor_id == 0x1af4 && matches!(d.device_id, 0x1050 | 0x1040..=0x1040) && d.class == 3
     }) else {

@@ -452,7 +452,8 @@ impl Transport {
         self.poll();
     }
     pub fn wait(&self, request: &Request) -> Result<Vec<u8>, VfsError> {
-        let deadline = crate::time::uptime_micros().saturating_add(5_000_000);
+        let started = crate::time::uptime_micros();
+        let deadline = started.saturating_add(5_000_000);
         let mut iterations = 0usize;
         while !request.done.load(Ordering::Acquire) {
             self.poll();
@@ -461,7 +462,12 @@ impl Transport {
                 return Err(VfsError::TimedOut);
             }
             iterations += 1;
-            if crate::sched::current().is_some() {
+            // The host normally answers within tens of microseconds, but a
+            // sleep rounds up to a scheduler tick (~1 ms), which made every
+            // command cost a full tick. Spin briefly before sleeping.
+            if crate::time::uptime_micros().saturating_sub(started) < 400 {
+                core::hint::spin_loop();
+            } else if crate::sched::current().is_some() {
                 crate::sched::sleep_micros(100);
             } else {
                 core::hint::spin_loop();

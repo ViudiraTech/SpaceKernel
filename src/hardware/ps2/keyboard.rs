@@ -723,8 +723,11 @@ pub fn handle_byte(byte: u8) {
         // Enqueue event
         QUEUE.lock().push(event);
 
-        // Forward to Foreground TTY if key is pressed
-        if event.state == KeyState::Pressed {
+        crate::input::ps2::key_event(event.code, event.state);
+
+        // Forward to the foreground TTY unless a display server took the
+        // keyboard away with KDSKBMODE(K_OFF).
+        if event.state == KeyState::Pressed && crate::tty::vt::keyboard_to_tty() {
             if let Some(seq) = event.ansi_sequence() {
                 for &b in seq {
                     tty::receive(TtyDevice::Foreground, b);

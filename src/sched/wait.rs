@@ -12,6 +12,7 @@ use super::{Disposition, rbtree::RBTree};
 use crate::{arch, smp, sync::SpinLock};
 use alloc::sync::Arc;
 
+#[derive(Clone)]
 pub struct WaitQueue {
     state: Arc<State>,
 }

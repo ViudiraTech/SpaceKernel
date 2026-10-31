@@ -56,6 +56,10 @@ pub enum VfsError {
     TooManyReferences,
     NoProtocolOption,
     DestinationRequired,
+    CrossDevice,
+    TooManyLinks,
+    MessageNotSupported,
+    NoBuffers,
 }
 
 impl VfsError {
@@ -102,6 +106,10 @@ impl VfsError {
             Self::TooManyReferences => -abi::ETOOMANYREFS,
             Self::NoProtocolOption => -abi::ENOPROTOOPT,
             Self::DestinationRequired => -abi::EDESTADDRREQ,
+            Self::CrossDevice => -18,
+            Self::TooManyLinks => -31,
+            Self::MessageNotSupported => -abi::EOPNOTSUPP,
+            Self::NoBuffers => -105,
         }
     }
 }
@@ -131,6 +139,11 @@ pub struct Stat {
     pub blksize: u64,
     pub blocks: u64,
     pub mtime: i64,
+    pub mtime_nsec: i64,
+    pub atime: i64,
+    pub atime_nsec: i64,
+    pub ctime: i64,
+    pub ctime_nsec: i64,
 }
 
 impl Stat {
@@ -148,6 +161,11 @@ impl Stat {
             blksize: 4096,
             blocks: size.div_ceil(512),
             mtime: 0,
+            mtime_nsec: 0,
+            atime: 0,
+            atime_nsec: 0,
+            ctime: 0,
+            ctime_nsec: 0,
         }
     }
 }
@@ -186,11 +204,29 @@ pub trait Inode: Send + Sync + core::any::Any {
         1 | 4
     }
 
+    /// Sequence of new readable activity for edge-triggered poll consumers.
+    fn poll_read_generation(&self) -> u64 {
+        0
+    }
+
     fn mmap(
         &self,
         _space: &mut crate::user::UserAddressSpace,
         _address: u64,
         _length: u64,
+        _offset: u64,
+        _prot: u32,
+    ) -> Result<(), VfsError> {
+        Err(VfsError::NoDevice)
+    }
+
+    /// Map the page at file `offset` into `space` at `page` after a fault on a
+    /// shared lazy mapping. Called with the address-space lock held, so it must
+    /// not sleep. Implemented by page-backed inodes such as memfd.
+    fn mmap_page(
+        &self,
+        _space: &mut crate::user::UserAddressSpace,
+        _page: u64,
         _offset: u64,
         _prot: u32,
     ) -> Result<(), VfsError> {
@@ -253,6 +289,43 @@ pub trait Inode: Send + Sync + core::any::Any {
         Err(VfsError::NotSupported)
     }
 
+    /// Create a persistent device node. Implemented by on-disk filesystems.
+    fn mknod_device(
+        &self,
+        _name: &str,
+        _kind: InodeKind,
+        _mode: u32,
+        _rdev: u64,
+    ) -> Result<Arc<dyn Inode>, VfsError> {
+        Err(VfsError::NotSupported)
+    }
+
+    /// Add a hard link named `name` in this directory to `target`.
+    fn link(&self, _name: &str, _target: &Arc<dyn Inode>) -> Result<(), VfsError> {
+        Err(VfsError::NotPermitted)
+    }
+
+    /// Move `old_name` from this directory to `new_name` in `new_parent`.
+    /// Fails with `CrossDevice` when `new_parent` lives on another filesystem.
+    fn rename(
+        &self,
+        _old_name: &str,
+        _new_parent: &Arc<dyn Inode>,
+        _new_name: &str,
+        _no_replace: bool,
+    ) -> Result<(), VfsError> {
+        Err(VfsError::NotSupported)
+    }
+
+    /// `None` leaves that timestamp untouched; values are `(seconds, nanoseconds)`.
+    fn set_times(
+        &self,
+        _atime: Option<(i64, i64)>,
+        _mtime: Option<(i64, i64)>,
+    ) -> Result<(), VfsError> {
+        Ok(())
+    }
+
     fn readlink(&self) -> Result<String, VfsError> {
         Err(VfsError::InvalidArgument)
     }
@@ -263,6 +336,12 @@ pub trait Inode: Send + Sync + core::any::Any {
 
     fn ioctl(&self, _cmd: u64, _arg: u64) -> Result<u64, VfsError> {
         Err(VfsError::NotATty)
+    }
+
+    /// The VT this node names when it is part of the kernel console: `Some(0)`
+    /// for "the foreground terminal", `Some(n)` for `/dev/ttyn`.
+    fn console_vt(&self) -> Option<usize> {
+        None
     }
 
     /// Status-flag propagation for `fcntl(F_SETFL)`.

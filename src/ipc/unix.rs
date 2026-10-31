@@ -230,6 +230,7 @@ struct State {
     listening: bool,
     backlog: usize,
     pending: VecDeque<Arc<UnixSocket>>,
+    read_generation: u64,
     stream: StreamQueue,
     packets: VecDeque<Packet>,
     packet_bytes: usize,
@@ -270,6 +271,7 @@ impl UnixSocket {
                 listening: false,
                 backlog: 0,
                 pending: VecDeque::new(),
+                read_generation: 0,
                 stream: StreamQueue::default(),
                 packets: VecDeque::new(),
                 packet_bytes: 0,
@@ -343,6 +345,16 @@ impl UnixSocket {
             return Err(VfsError::AddressInUse);
         }
         register(self, &address)?;
+        if let UnixAddress::Pathname(path) = &address
+            && let Err(error) = vfs::create_socket_abs(path)
+        {
+            unregister(&address, self.ino);
+            return Err(if error == VfsError::AlreadyExists {
+                VfsError::AddressInUse
+            } else {
+                error
+            });
+        }
         let mut state = self.state.lock();
         state.bound = Some(address.clone());
         *self.address.lock() = Some(address);
@@ -396,7 +408,7 @@ impl UnixSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            sched::sleep_micros(1000);
+            crate::ipc::wait_pollers(None);
         }
     }
 
@@ -469,6 +481,7 @@ impl UnixSocket {
                 }
                 if listener.pending.len() < listener.backlog {
                     listener.pending.push_back(server);
+                    listener.read_generation = listener.read_generation.wrapping_add(1);
                     return Ok(());
                 }
             }
@@ -478,7 +491,7 @@ impl UnixSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            sched::sleep_micros(1000);
+            crate::ipc::wait_pollers(None);
         }
     }
 
@@ -561,10 +574,14 @@ impl UnixSocket {
                 if target.read_shutdown || target.peer_gone {
                     return Err(VfsError::BrokenPipe);
                 }
-                if target.stream.data.len() + bytes.len() <= STREAM_CAPACITY {
-                    target.stream.data.extend(bytes.iter().copied());
-                    target.stream.produced =
-                        target.stream.produced.saturating_add(bytes.len() as u64);
+                // Streams have no message-size atomicity requirement. A
+                // request larger than the queue must make partial progress,
+                // otherwise even an empty queue can never satisfy it.
+                let count = bytes.len().min(STREAM_CAPACITY - target.stream.data.len());
+                if count != 0 {
+                    target.stream.data.extend(bytes[..count].iter().copied());
+                    target.read_generation = target.read_generation.wrapping_add(1);
+                    target.stream.produced = target.stream.produced.saturating_add(count as u64);
                     if !descriptors.is_empty() || credentials.is_some() {
                         let offset = target.stream.produced;
                         // With SO_PASSCRED the receiver wants credentials on
@@ -581,7 +598,7 @@ impl UnixSocket {
                             credentials,
                         });
                     }
-                    return Ok(bytes.len());
+                    return Ok(count);
                 }
             }
             if self.nonblocking(dontwait) {
@@ -590,7 +607,7 @@ impl UnixSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            sched::sleep_micros(1000);
+            crate::ipc::wait_pollers(None);
         }
     }
 
@@ -624,6 +641,7 @@ impl UnixSocket {
                             credentials,
                             descriptors: descriptors.to_vec(),
                         });
+                        state.read_generation = state.read_generation.wrapping_add(1);
                         return Ok(());
                     }
                 } else {
@@ -636,7 +654,7 @@ impl UnixSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            sched::sleep_micros(1000);
+            crate::ipc::wait_pollers(None);
         }
     }
 
@@ -747,7 +765,7 @@ impl UnixSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            sched::sleep_micros(1000);
+            crate::ipc::wait_pollers(None);
         }
     }
 
@@ -807,7 +825,7 @@ impl UnixSocket {
             if crate::signal::pending_for_current() {
                 return Err(VfsError::Interrupted);
             }
-            sched::sleep_micros(1000);
+            crate::ipc::wait_pollers(None);
         }
     }
 
@@ -1000,6 +1018,10 @@ impl Inode for UnixSocket {
             events |= POLLRDHUP | POLLIN;
         }
         events
+    }
+
+    fn poll_read_generation(&self) -> u64 {
+        self.state.lock().read_generation
     }
 
     fn ioctl(&self, cmd: u64, _arg: u64) -> Result<u64, VfsError> {

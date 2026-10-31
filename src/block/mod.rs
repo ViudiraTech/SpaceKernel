@@ -241,6 +241,18 @@ fn ensure_disk_partitioned(dev: &Arc<dyn BlockDevice>) {
     let _ = partition::write_mbr_single_partition(dev, 0x0C, start_lba, part_sectors);
 }
 
+/// Whether boot may write partition tables and filesystems to hardware disks.
+///
+/// Never on by default: an unpartitioned disk may hold a whole-disk filesystem
+/// such as the ext4 root. Self-test builds use throwaway blank images, and the
+/// `block.autoformat` command-line word enables it explicitly.
+fn autoformat_allowed() -> bool {
+    cfg!(feature = "boot-self-test")
+        || crate::boot::cmdline()
+            .split_ascii_whitespace()
+            .any(|word| word == "block.autoformat")
+}
+
 /// Initialize all storage controllers (IDE, AHCI, NVMe, and boot RAMDisk) and probe partitions.
 pub fn init() {
     // 1. Create and format the built-in 2 MiB RAMDisk (`ram0` -> `ram0p1` with FAT32)
@@ -253,11 +265,15 @@ pub fn init() {
 
     // 2. Discover PCI IDE (PATA) drives
     for disk in ide::init() {
-        ensure_disk_partitioned(&disk);
+        if autoformat_allowed() {
+            ensure_disk_partitioned(&disk);
+        }
         let name = disk.info().name;
         register_device(disk);
         let part_name = alloc::format!("{}1", name);
-        if let Some((_, part)) = find_device(&part_name) {
+        if autoformat_allowed()
+            && let Some((_, part)) = find_device(&part_name)
+        {
             let mut boot_sec = [0u8; SECTOR_SIZE];
             if part.read_blocks(0, 1, &mut boot_sec).is_ok() && boot_sec[510] != 0x55 {
                 let _ = crate::vfs::fat32::format_fat32(&part, "IDEDISK");
@@ -267,11 +283,15 @@ pub fn init() {
 
     // 3. Discover PCI AHCI (SATA) drives
     for disk in ahci::init() {
-        ensure_disk_partitioned(&disk);
+        if autoformat_allowed() {
+            ensure_disk_partitioned(&disk);
+        }
         let name = disk.info().name;
         register_device(disk);
         let part_name = alloc::format!("{}1", name);
-        if let Some((_, part)) = find_device(&part_name) {
+        if autoformat_allowed()
+            && let Some((_, part)) = find_device(&part_name)
+        {
             let mut boot_sec = [0u8; SECTOR_SIZE];
             if part.read_blocks(0, 1, &mut boot_sec).is_ok() && boot_sec[510] != 0x55 {
                 let _ = crate::vfs::fat32::format_fat32(&part, "SATADISK");
@@ -281,11 +301,15 @@ pub fn init() {
 
     // 4. Discover PCIe NVMe namespaces
     for disk in nvme::init() {
-        ensure_disk_partitioned(&disk);
+        if autoformat_allowed() {
+            ensure_disk_partitioned(&disk);
+        }
         let name = disk.info().name;
         register_device(disk);
         let part_name = alloc::format!("{}p1", name);
-        if let Some((_, part)) = find_device(&part_name) {
+        if autoformat_allowed()
+            && let Some((_, part)) = find_device(&part_name)
+        {
             let mut boot_sec = [0u8; SECTOR_SIZE];
             if part.read_blocks(0, 1, &mut boot_sec).is_ok() && boot_sec[510] != 0x55 {
                 let _ = crate::vfs::fat32::format_fat32(&part, "NVMEDISK");

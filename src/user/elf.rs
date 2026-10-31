@@ -32,9 +32,26 @@ fn map_plan(
     plan: &Plan,
     allocated: &mut Vec<u64>,
 ) -> Result<u64, &'static str> {
+    // Map runs of contiguous pages with equal protection in one call instead
+    // of one `map_zeroed` (and overlap check) per 4 KiB page.
+    let mut run: Option<(u64, u64, u32)> = None;
     for (&address, &prot) in &plan.pages {
-        space.map_zeroed(address, 4096, prot)?;
+        match &mut run {
+            Some((start, end, run_prot)) if *end == address && *run_prot == prot => {
+                let _ = start;
+                *end += 4096;
+            }
+            _ => {
+                if let Some((start, end, run_prot)) = run.take() {
+                    space.map_zeroed(start, end - start, run_prot)?;
+                }
+                run = Some((address, address + 4096, prot));
+            }
+        }
         allocated.push(address);
+    }
+    if let Some((start, end, run_prot)) = run {
+        space.map_zeroed(start, end - start, run_prot)?;
     }
     for s in &plan.segments {
         if s.kind == PT_LOAD && s.filesz != 0 {

@@ -286,6 +286,19 @@ impl TaskRef {
     pub fn set_child_subreaper(&self, enabled: bool) {
         self.lock().child_subreaper = enabled;
     }
+    pub fn robust_list(&self) -> u64 {
+        self.lock().robust_list
+    }
+
+    pub fn set_robust_list(&self, head: u64) {
+        self.lock().robust_list = head;
+    }
+
+    /// Record the POSIX nice value that `getpriority` and procfs report.
+    pub fn set_nice(&self, nice: i32) {
+        self.lock().nice = nice;
+    }
+
     pub fn clear_child_tid(&self) -> u64 {
         self.lock().clear_child_tid
     }
@@ -459,6 +472,7 @@ pub(crate) struct Task {
     pub user: bool,
     pub exit_signal: u32,
     pub clear_child_tid: u64,
+    pub robust_list: u64,
     pub stop_signal: u32,
     pub stop_reported: bool,
     pub continue_pending: bool,
@@ -597,6 +611,7 @@ impl Task {
             user: false,
             exit_signal: 0,
             clear_child_tid: 0,
+            robust_list: 0,
             stop_signal: 0,
             stop_reported: false,
             continue_pending: false,
@@ -676,6 +691,7 @@ impl Task {
             user: true,
             exit_signal: spec.exit_signal,
             clear_child_tid: spec.clear_child_tid,
+            robust_list: 0,
             stop_signal: 0,
             stop_reported: false,
             continue_pending: false,

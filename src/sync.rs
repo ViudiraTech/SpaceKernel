@@ -126,3 +126,126 @@ impl<T> Guard<'_, T> {
         core::mem::forget(self);
     }
 }
+
+/// Sleeping mutual exclusion for long critical sections such as filesystem I/O.
+///
+/// Only task context may contend on it, and no `SpinLock` may be held across
+/// `lock()`: the waiter blocks on a scheduler wait queue. An uncontended lock
+/// never touches the scheduler, so early-boot single-CPU callers are safe.
+pub struct Mutex<T> {
+    locked: AtomicBool,
+    waiters: spin_once::Lazy<crate::sched::WaitQueue>,
+    value: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Sync for Mutex<T> {}
+unsafe impl<T: Send> Send for Mutex<T> {}
+
+pub struct MutexGuard<'a, T> {
+    lock: &'a Mutex<T>,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl<T> Mutex<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            waiters: spin_once::Lazy::new(),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        loop {
+            if self
+                .locked
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return MutexGuard {
+                    lock: self,
+                    _not_send: PhantomData,
+                };
+            }
+            self.waiters
+                .get(crate::sched::WaitQueue::new)
+                .wait_until(|| !self.locked.load(Ordering::Acquire));
+        }
+    }
+}
+
+impl<T> Deref for MutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: the guard is the sole owner while the mutex is held.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: the guard is the sole owner while the mutex is held.
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+        if let Some(queue) = self.lock.waiters.try_get() {
+            queue.wake_one();
+        }
+    }
+}
+
+/// One-time initialization without a dependency on the allocator being ready
+/// at construction, so `Mutex::new` stays `const`.
+mod spin_once {
+    use core::{
+        cell::UnsafeCell,
+        sync::atomic::{AtomicU8, Ordering},
+    };
+
+    pub struct Lazy<T> {
+        state: AtomicU8,
+        value: UnsafeCell<Option<T>>,
+    }
+
+    unsafe impl<T: Send + Sync> Sync for Lazy<T> {}
+    unsafe impl<T: Send> Send for Lazy<T> {}
+
+    impl<T> Lazy<T> {
+        pub const fn new() -> Self {
+            Self {
+                state: AtomicU8::new(0),
+                value: UnsafeCell::new(None),
+            }
+        }
+
+        pub fn get(&self, init: impl FnOnce() -> T) -> &T {
+            if self
+                .state
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // SAFETY: the 0->1 transition grants exclusive initialization.
+                unsafe { *self.value.get() = Some(init()) };
+                self.state.store(2, Ordering::Release);
+            }
+            while self.state.load(Ordering::Acquire) != 2 {
+                core::hint::spin_loop();
+            }
+            // SAFETY: state 2 publishes an initialized, never-mutated value.
+            unsafe { (*self.value.get()).as_ref().unwrap() }
+        }
+
+        pub fn try_get(&self) -> Option<&T> {
+            if self.state.load(Ordering::Acquire) == 2 {
+                // SAFETY: as in `get`.
+                unsafe { (*self.value.get()).as_ref() }
+            } else {
+                None
+            }
+        }
+    }
+}

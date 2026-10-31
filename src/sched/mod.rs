@@ -323,6 +323,15 @@ pub fn tasks() -> Vec<TaskRef> {
     task::all()
 }
 
+/// Every live task; a snapshot, so targets can exit concurrently.
+pub fn all_tasks() -> Vec<TaskRef> {
+    task::all()
+}
+
+pub fn all_tasks_count() -> usize {
+    task::all().len()
+}
+
 /// Live threads of a thread group (zombies are not signal targets).
 pub fn tasks_in_group(tgid: u64) -> Vec<TaskRef> {
     task::all()

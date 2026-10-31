@@ -93,7 +93,7 @@ ROOTFS_SELFTEST ?= 0
 ROOTFS_IMG := build/rootfs/fat32.img
 ROOTFS_MODULE := $(if $(filter 1,$(WITH_ROOTFS)),module_path: boot():/rootfs.img,)
 
-.PHONY: all kernel iso rootfs-image busybox run debug test test-single test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
+.PHONY: desktop desktop-iso desktop-spui desktop-rootfs desktop-run all kernel iso rootfs-image busybox run debug test test-single test-host test-sched-model test-subsystem-model test-drm-abi check fmt menuconfig defconfig olddefconfig deps limine clean help
 all: iso
 
 defconfig:
@@ -155,6 +155,24 @@ iso: kernel limine $(if $(filter 1,$(WITH_ROOTFS)),rootfs-image)
 	xorriso -as mkisofs -R -r -J $(if $(filter x86_64,$(ARCH)),-b boot/limine/limine-bios-cd.bin -no-emul-boot -boot-load-size 4 -boot-info-table,) -hfsplus -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin -efi-boot-part --efi-boot-image --protective-msdos-label -o $(ISO) $(ISO_ROOT)
 	$(if $(filter x86_64,$(ARCH)),$(LIMINE_DIR)/limine bios-install $(ISO),true)
 	@printf 'ISO ready: %s\n' '$(ISO)'
+
+DESKTOP_CMDLINE ?= console=tty0 console=ttyS0 root=/dev/nvme0n1 init=/sbin/systemg
+DESKTOP_IMAGE := build/rootfs/ext4.img
+
+desktop-iso:
+	$(MAKE) iso CMDLINE="$(DESKTOP_CMDLINE)" WITH_ROOTFS=0
+
+desktop-spui:
+	cd /tmp && RUSTUP_TOOLCHAIN=nightly-2026-05-24 cargo build --manifest-path "$(CURDIR)/user/desktop/Cargo.toml" --target x86_64-unknown-linux-musl --target-dir "$(CURDIR)/target" --release
+
+desktop-rootfs: desktop-spui
+	tools/build_userland.sh
+	python3 tools/build_desktop_rootfs.py
+
+desktop: desktop-iso desktop-rootfs
+
+desktop-run: desktop
+	qemu-system-x86_64 -enable-kvm -cpu host -machine q35 -m 4096 -smp $(CPUS) -serial stdio -monitor none -no-reboot -vga none -display gtk,zoom-to-fit=off -device virtio-gpu-pci,xres=1280,yres=800 -device virtio-tablet-pci -device virtio-keyboard-pci -drive file=$(DESKTOP_IMAGE),if=none,id=root,format=raw -device nvme,serial=SPROOT,drive=root -drive if=pflash,format=raw,readonly=on,file=$(FIRMWARE) -cdrom $(ISO)
 
 DISK_DIR := build/disks
 QEMU_STORAGE_FLAGS := -drive file=$(DISK_DIR)/nvme.img,if=none,id=nvme0,format=raw -device nvme,serial=SKNVME01,drive=nvme0 -device ich9-ahci,id=ahci0 -drive file=$(DISK_DIR)/sata.img,if=none,id=sata0,format=raw -device ide-hd,drive=sata0,bus=ahci0.0 $(if $(filter x86_64,$(ARCH)),-device piix3-ide,id=ide0 -drive file=$(DISK_DIR)/ide.img,if=none,id=pata0,format=raw -device ide-hd,drive=pata0,bus=ide0.0,)

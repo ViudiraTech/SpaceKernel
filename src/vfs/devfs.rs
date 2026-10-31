@@ -146,8 +146,13 @@ impl Inode for DevRootInode {
                 rdev: (1 << 8) | 9,
             })),
             "console" => Ok(Arc::new(ConsoleInode::with_ino(15))),
-            "tty" => Ok(Arc::new(ConsoleInode::with_ino(16))),
-            "tty0" => Ok(Arc::new(ConsoleInode::with_ino(17))),
+            "tty" => Ok(Arc::new(super::fd::ControllingTty)),
+            "tty0" => Ok(Arc::new(ConsoleInode::for_vt(17, 0))),
+            "ptmx" => Ok(Arc::new(crate::tty::pty::PtmxNode)),
+            "tty1" | "tty2" | "tty3" | "tty4" | "tty5" | "tty6" | "tty7" | "tty8" => {
+                let vt = usize::from(name.as_bytes()[3] - b'0');
+                Ok(Arc::new(ConsoleInode::for_vt(30 + vt as u64, vt)))
+            }
             "ttyS0" => Ok(Arc::new(ConsoleInode::with_ino(18))),
             _ => {
                 if let Some((dev_id, dev)) = block::find_device(name) {
@@ -172,7 +177,8 @@ impl Inode for DevRootInode {
             kind: InodeKind::Directory,
         });
         for (idx, name) in [
-            "null", "zero", "full", "random", "urandom", "console", "tty", "tty0", "ttyS0",
+            "null", "zero", "full", "random", "urandom", "console", "tty", "tty0", "ttyS0", "ptmx",
+            "tty1", "tty2", "tty3", "tty4", "tty5", "tty6", "tty7", "tty8",
         ]
         .iter()
         .enumerate()

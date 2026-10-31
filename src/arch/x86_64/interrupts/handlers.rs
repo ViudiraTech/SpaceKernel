@@ -181,14 +181,29 @@ pub(super) extern "x86-interrupt" fn page_fault(
         // Interrupt entry from user mode does not perform SWAPGS.
         unsafe { core::arch::asm!("swapgs", "lfence", options(nostack)) };
         let address = Cr2::read().map(|address| address.as_u64()).unwrap_or(0);
-        if code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
-            let handled = crate::sched::current()
-                .and_then(|task| task.address_space())
-                .is_some_and(|space| space.lock().cow_break(address).unwrap_or(false));
-            if handled {
-                unsafe { core::arch::asm!("swapgs", options(nostack)) };
-                return;
+        // File-backed pages may sleep on filesystem locks, so this path follows
+        // the same FPU ownership and interrupt rules as a syscall.
+        crate::fpu::disable_current();
+        arch::enable_interrupts();
+        let handled = crate::sched::current()
+            .and_then(|task| task.address_space())
+            .is_some_and(|space| {
+                crate::user::uaccess::resolve_fault(
+                    &space,
+                    address,
+                    code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
+                    code.contains(PageFaultErrorCode::INSTRUCTION_FETCH),
+                )
+                .unwrap_or(false)
+            });
+        arch::disable_interrupts();
+        if handled {
+            // SAFETY: this task is current and returns to user mode below.
+            unsafe {
+                let _ = crate::fpu::enable_user();
+                core::arch::asm!("swapgs", options(nostack));
             }
+            return;
         }
         crate::fpu::disable_current();
         crate::kwarn!(
